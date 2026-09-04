@@ -21,7 +21,13 @@ import contextlib
 import logging
 from typing import TYPE_CHECKING
 
+from lerobot.datasets.sensor_stream import (
+    SensorQueueOverflowError,
+    SensorRecorderError,
+)
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
+from lerobot.robots import SensorizedRobot
+from lerobot.sensors import SensorDataUnavailableError
 from lerobot.utils.action_interpolator import ActionInterpolator
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.cycle_timer import CycleTimer
@@ -36,6 +42,12 @@ if TYPE_CHECKING:
     from ..context import HardwareContext, ProcessorContext, RolloutContext, RuntimeContext
 
 logger = logging.getLogger(__name__)
+
+SENSOR_FATAL_ERRORS = (
+    SensorDataUnavailableError,
+    SensorQueueOverflowError,
+    SensorRecorderError,
+)
 
 
 class RolloutStrategy(abc.ABC):
@@ -78,6 +90,7 @@ class RolloutStrategy(abc.ABC):
         initialisation without duplicating code.
         """
         self._interpolator = ActionInterpolator(multiplier=ctx.runtime.cfg.interpolation_multiplier)
+        ctx.runtime.active_strategy = self
         self._engine = ctx.policy.inference
         logger.info("Starting inference engine...")
         self.reset_control_state()
@@ -148,16 +161,67 @@ class RolloutStrategy(abc.ABC):
             engine.resume()
         return False
 
-    def _teardown_hardware(self, hw: HardwareContext, return_to_initial_position: bool = True) -> None:
+    def _handle_sensor_failure(self, ctx: RolloutContext, exc: BaseException) -> None:
+        """Latch safe-stop state, drop pending actions, and abort recording."""
+        logger.error("Fatal required-sensor failure; stopping rollout: %s", exc)
+        if self._engine is not None:
+            try:
+                self._engine.pause()
+            except Exception:
+                logger.exception("Inference engine pause failed during sensor safe-stop")
+            try:
+                self._engine.reset()
+            except Exception:
+                logger.exception("Inference engine reset failed during sensor safe-stop")
+        if self._interpolator is not None:
+            self._interpolator.reset()
+        self._cached_obs_processed = None
+        robot = ctx.hardware.robot_wrapper.inner
+        if isinstance(robot, SensorizedRobot):
+            robot.latch_fatal_error(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+        recorder = getattr(ctx.data, "sensor_recorder", None)
+        dataset = ctx.data.dataset
+        if dataset is not None:
+            try:
+                dataset.clear_episode_buffer()
+            except Exception:
+                logger.exception("Failed to clear main episode buffer during sensor safe-stop")
+        if recorder is not None:
+            try:
+                if recorder.is_active:
+                    recorder.abort_episode(str(exc))
+                elif recorder.has_prepared_episode:
+                    recorder.abort_prepared(str(exc))
+            except Exception:
+                logger.exception("Failed to abort sensor sidecar after fatal sensor error")
+        ctx.runtime.shutdown_event.set()
+
+    def _teardown_hardware(
+        self,
+        hw: HardwareContext,
+        return_to_initial_position: bool = True,
+        sensor_recorder=None,
+    ) -> None:
         """Stop the inference engine, optionally return robot to initial position, and disconnect hardware."""
         if self._engine is not None:
             logger.info("Stopping inference engine...")
             self._engine.stop()
+        if sensor_recorder is not None:
+            try:
+                sensor_recorder.close()
+            except Exception:
+                logger.exception("Sensor recorder cleanup failed during hardware teardown")
         robot = hw.robot_wrapper.inner
-        if robot.is_connected:
-            if return_to_initial_position and hw.initial_position:
+        sensor_fatal = isinstance(robot, SensorizedRobot) and robot.has_fatal_error
+        robot_hardware_connected = (
+            robot.inner.is_connected if isinstance(robot, SensorizedRobot) else robot.is_connected
+        )
+        if robot_hardware_connected:
+            if return_to_initial_position and hw.initial_position and not sensor_fatal:
                 logger.info("Returning robot to initial position before shutdown...")
                 self.return_to_initial_position(hw)
+            elif sensor_fatal:
+                logger.error("Skipping return-to-initial-position after fatal sensor failure")
             elif not return_to_initial_position:
                 logger.info(
                     "Skipping return-to-initial-position (disabled by config); leaving robot in final pose."
@@ -348,6 +412,17 @@ def send_next_action(
     # ``timer.section`` verbatim when no timer was passed.
     section = timer.section if timer is not None else contextlib.nullcontext
 
+    try:
+        ctx.hardware.robot_wrapper.check_health()
+        recorder = getattr(ctx.data, "sensor_recorder", None)
+        if recorder is not None:
+            recorder.check_health()
+    except SENSOR_FATAL_ERRORS as exc:
+        strategy = getattr(ctx.runtime, "active_strategy", None)
+        if strategy is not None:
+            strategy._handle_sensor_failure(ctx, exc)
+        raise
+
     if interpolator.needs_new_action():
         with section("infer"):
             obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
@@ -366,5 +441,103 @@ def send_next_action(
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     with section("send"):
         processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
-        ctx.hardware.robot_wrapper.send_action(processed)
+        send_sensor_safe_action(ctx, processed)
     return action_dict
+
+
+def sensor_safe_observation(ctx: RolloutContext) -> dict:
+    """Start sidecar capture before observation and safe-stop on sensor failure."""
+    recorder = getattr(ctx.data, "sensor_recorder", None)
+    dataset = ctx.data.dataset
+    if (
+        recorder is not None
+        and getattr(ctx.data, "sensor_recording_enabled", True)
+        and not recorder.is_active
+        and not recorder.has_prepared_episode
+    ):
+        try:
+            recorder.start_episode(dataset.num_episodes)
+        except SENSOR_FATAL_ERRORS as exc:
+            strategy = getattr(ctx.runtime, "active_strategy", None)
+            if strategy is not None:
+                strategy._handle_sensor_failure(ctx, exc)
+            raise
+    check_sensor_health(ctx)
+    try:
+        return ctx.hardware.robot_wrapper.get_observation()
+    except SENSOR_FATAL_ERRORS as exc:
+        strategy = getattr(ctx.runtime, "active_strategy", None)
+        if strategy is not None:
+            strategy._handle_sensor_failure(ctx, exc)
+        raise
+
+
+def check_sensor_health(ctx: RolloutContext) -> None:
+    """Run robot and recorder fatal checks before any direct action path."""
+    try:
+        ctx.hardware.robot_wrapper.check_health()
+        recorder = getattr(ctx.data, "sensor_recorder", None)
+        if recorder is not None and recorder.is_active:
+            recorder.check_health()
+    except SENSOR_FATAL_ERRORS as exc:
+        strategy = getattr(ctx.runtime, "active_strategy", None)
+        if strategy is not None:
+            strategy._handle_sensor_failure(ctx, exc)
+        raise
+
+
+def send_sensor_safe_action(ctx: RolloutContext, action) -> None:
+    """Check and send one action, applying the full sensor safe-stop on failure."""
+    check_sensor_health(ctx)
+    try:
+        ctx.hardware.robot_wrapper.send_action(action)
+    except SENSOR_FATAL_ERRORS as exc:
+        strategy = getattr(ctx.runtime, "active_strategy", None)
+        if strategy is not None:
+            strategy._handle_sensor_failure(ctx, exc)
+        raise
+
+
+def add_dataset_frame(ctx: RolloutContext, frame: dict, capture_metadata: dict | None = None) -> None:
+    """Add one main frame and its matching Sync row."""
+    dataset = ctx.data.dataset
+    dataset.add_frame(frame)
+    recorder = getattr(ctx.data, "sensor_recorder", None)
+    if recorder is None:
+        return
+    robot = ctx.hardware.robot_wrapper.inner
+    metadata = capture_metadata
+    if metadata is None and isinstance(robot, SensorizedRobot):
+        metadata = robot.last_capture_metadata
+    if metadata is None:
+        raise SensorRecorderError("A sensorized Dataset frame is missing capture metadata.")
+    try:
+        recorder.record_sync(None, metadata)
+    except SENSOR_FATAL_ERRORS as exc:
+        strategy = getattr(ctx.runtime, "active_strategy", None)
+        if strategy is not None:
+            strategy._handle_sensor_failure(ctx, exc)
+        raise
+
+
+def save_dataset_episode(ctx: RolloutContext) -> None:
+    """Commit the current main episode and sensor sidecars atomically."""
+    recorder = getattr(ctx.data, "sensor_recorder", None)
+    if recorder is None:
+        ctx.data.dataset.save_episode()
+        return
+    if recorder.is_active:
+        recorder.prepare_episode(task_info=[ctx.runtime.cfg.dataset.single_task])
+    recorder.commit_prepared(ctx.data.dataset)
+
+
+def discard_dataset_episode(ctx: RolloutContext, reason: str) -> None:
+    """Clear the main buffer and persist an ABORTED sensor transaction."""
+    ctx.data.dataset.clear_episode_buffer()
+    recorder = getattr(ctx.data, "sensor_recorder", None)
+    if recorder is None:
+        return
+    if recorder.is_active:
+        recorder.abort_episode(reason)
+    elif recorder.has_prepared_episode:
+        recorder.abort_prepared(reason)

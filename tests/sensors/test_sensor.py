@@ -20,11 +20,11 @@ from dataclasses import FrozenInstanceError, dataclass
 import pytest
 
 import lerobot.sensors.utils as sensor_utils
-from lerobot.sensors import Sensor, SensorConfig, SensorSample, make_sensors_from_configs
+from lerobot.sensors import Sensor, SensorConfig, SensorFeature, SensorSample, make_sensors_from_configs
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-FEATURE_NAME = "tactile.gripper.left_finger.normal_force"
+FEATURE_NAME = "left_finger.normal_force"
 
 
 @SensorConfig.register_subclass("dummy")
@@ -47,13 +47,12 @@ class DummySensor(Sensor):
         super().__init__(config)
         self.config = config
         self._is_connected = False
-        self._sequence = 0
         self._latest_sample: SensorSample | None = None
 
     @property
-    def features(self) -> dict[str, type]:
+    def features(self) -> dict[str, SensorFeature]:
         """声明 Dummy 会输出一个以牛顿为 SI 单位的左指法向力标量。"""
-        return {FEATURE_NAME: float}
+        return {FEATURE_NAME: SensorFeature("float32", "N")}
 
     @property
     def is_connected(self) -> bool:
@@ -67,12 +66,12 @@ class DummySensor(Sensor):
 
     def _new_sample(self) -> SensorSample:
         """生成新样本、递增序号，并把该样本保存为当前最新值。"""
-        sample = SensorSample(
-            timestamp_ns=time.monotonic_ns(),
-            sequence=self._sequence,
-            values={FEATURE_NAME: self.config.value},
+        timestamp_ns = time.perf_counter_ns()
+        sample = self._publish_sample(
+            {FEATURE_NAME: self.config.value},
+            timestamp_ns,
+            arrival_timestamp_ns=timestamp_ns,
         )
-        self._sequence += 1
         self._latest_sample = sample
         return sample
 
@@ -92,7 +91,7 @@ class DummySensor(Sensor):
         if self._latest_sample is None:
             raise RuntimeError("No sensor sample is available yet.")
 
-        age_ms = (time.monotonic_ns() - self._latest_sample.timestamp_ns) / 1e6
+        age_ms = (time.perf_counter_ns() - self._latest_sample.timestamp_ns) / 1e6
         if age_ms > max_age_ms:
             raise TimeoutError(f"Latest sensor sample is {age_ms:.1f}ms old.")
 
@@ -121,7 +120,14 @@ def test_sensor_config_registration() -> None:
 
 def test_sensor_sample_value_object() -> None:
     """验证样本字段能够保存数据，并且冻结字段不能被重新赋值。"""
-    sample = SensorSample(timestamp_ns=123, sequence=4, values={FEATURE_NAME: 2.5}, is_valid=False)
+    sample = SensorSample(
+        timestamp_ns=123,
+        sequence=4,
+        values={FEATURE_NAME: 2.5},
+        is_valid=False,
+        status="read_error",
+        error="simulated failure",
+    )
 
     assert sample.timestamp_ns == 123
     assert sample.sequence == 4
@@ -130,12 +136,38 @@ def test_sensor_sample_value_object() -> None:
     with pytest.raises(FrozenInstanceError):
         sample.sequence = 5  # type: ignore[misc]
 
+    with pytest.raises(ValueError, match="invalid SensorSample"):
+        SensorSample(timestamp_ns=123, sequence=5, is_valid=False)
+
+
+def test_invalid_publication_is_auditable_and_consumes_framework_sequence() -> None:
+    sensor = DummySensor(DummySensorConfig())
+    sensor.connect()
+    invalid = sensor._publish_sample(
+        None,
+        100,
+        arrival_timestamp_ns=101,
+        is_valid=False,
+        status="read_error",
+        error="simulated read failure",
+    )
+    valid = sensor._publish_sample(
+        {FEATURE_NAME: 1.0},
+        102,
+        arrival_timestamp_ns=103,
+    )
+
+    assert invalid.sequence == 0
+    assert invalid.values == {}
+    assert invalid.error == "simulated read failure"
+    assert valid.sequence == 1
+
 
 def test_feature_and_read_contract() -> None:
     """验证 feature、连接状态以及三种读取接口之间的基本契约。"""
     sensor = DummySensor(DummySensorConfig(sample_rate_hz=200))
 
-    assert sensor.features == {FEATURE_NAME: float}
+    assert sensor.features == {FEATURE_NAME: SensorFeature("float32", "N")}
     assert not sensor.is_connected
     with pytest.raises(DeviceNotConnectedError):
         sensor.read()

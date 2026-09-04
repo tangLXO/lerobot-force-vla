@@ -13,8 +13,17 @@
 # limitations under the License.
 
 from .configs import SensorConfig
-from .sensor import Sensor, SensorSample
+from .sensor import Sensor, SensorFeature, SensorSample, SensorSubscription
+from .synchronization import SensorDataUnavailableError
 from .utils import make_sensors_from_configs
 
 # 顶层包只导出通用接口；具体硬件类应从各自的子包导入，避免加载硬件依赖。
-__all__ = ["Sensor", "SensorConfig", "SensorSample", "make_sensors_from_configs"]
+__all__ = [
+    "Sensor",
+    "SensorConfig",
+    "SensorDataUnavailableError",
+    "SensorFeature",
+    "SensorSample",
+    "SensorSubscription",
+    "make_sensors_from_configs",
+]

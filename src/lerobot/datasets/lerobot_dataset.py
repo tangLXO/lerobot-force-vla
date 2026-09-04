@@ -506,6 +506,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._require_writer("save_episode")
         self.writer.save_episode(episode_data, parallel_encoding)
 
+    def seal_episode_artifacts(self) -> None:
+        """Close the latest main episode artifacts for transaction verification."""
+        self._require_writer("seal_episode_artifacts")
+        self.writer.seal_episode_artifacts()
+
     def clear_episode_buffer(self, delete_images: bool = True) -> None:
         """Discard the current episode buffer without saving.
 
@@ -655,7 +660,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 f"push_to_hub is not supported for storage_format={self.meta.storage_format!r}: "
                 "the data files are not managed by LeRobotDataset."
             )
-        ignore_patterns = ["images/"]
+        ignore_patterns = [
+            "images/",
+            ".sensor-staging/**",
+            ".sensor-quarantine/**",
+            ".sensor-writer.lock",
+        ]
         if not push_videos:
             ignore_patterns.append("videos/")
 

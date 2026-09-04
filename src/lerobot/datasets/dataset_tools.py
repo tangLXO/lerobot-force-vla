@@ -82,6 +82,16 @@ from .video_utils import (
 )
 
 
+def reject_sensor_sidecar_mutation(dataset: LeRobotDataset) -> None:
+    """Refuse phase-one edits that would invalidate committed sensor sidecars."""
+    manifest = Path(dataset.root) / "meta" / "sensor_streams.json"
+    if manifest.exists():
+        raise ValueError(
+            "Dataset contains Sensor Sidecars; phase one does not support mutating "
+            "episode, index, task, video, statistics, or feature edits."
+        )
+
+
 def _load_episode_with_stats(src_dataset: LeRobotDataset, episode_idx: int) -> dict:
     """Load a single episode's metadata including stats from parquet file.
 
@@ -123,6 +133,7 @@ def delete_episodes(
         output_dir: Root directory where the edited dataset will be stored. If not specified, defaults to $HF_LEROBOT_HOME/repo_id. Equivalent to new_root in EditDatasetConfig.
         repo_id: Edited dataset identifier. Equivalent to new_repo_id in EditDatasetConfig.
     """
+    reject_sensor_sidecar_mutation(dataset)
     if not episode_indices:
         raise ValueError("No episodes to delete")
 
@@ -199,6 +210,7 @@ def split_dataset(
         splits = {"train": 0.8, "val": 0.2}
         datasets = split_dataset(dataset, splits)
     """
+    reject_sensor_sidecar_mutation(dataset)
     if not splits:
         raise ValueError("No splits provided")
 
@@ -286,6 +298,8 @@ def merge_datasets(
         concatenate_videos: When False, keep one mp4 per source file instead of packing into shards.
         concatenate_data: When False, keep one parquet per source file instead of packing into shards.
     """
+    for dataset in datasets:
+        reject_sensor_sidecar_mutation(dataset)
     if not datasets:
         raise ValueError("No datasets to merge")
 
@@ -346,6 +360,7 @@ def modify_features(
             output_dir="./output",
         )
     """
+    reject_sensor_sidecar_mutation(dataset)
     if add_features is None and remove_features is None:
         raise ValueError("Must specify at least one of add_features or remove_features")
 
@@ -449,6 +464,7 @@ def add_features(
     if not features:
         raise ValueError("No features provided")
 
+    reject_sensor_sidecar_mutation(dataset)
     return modify_features(
         dataset=dataset,
         add_features=features,
@@ -1513,6 +1529,7 @@ def modify_tasks(
                 task_replacements={"Pick up the cube": "Lift the cube"}
             )
     """
+    reject_sensor_sidecar_mutation(dataset)
     if not new_task and not episode_tasks and not task_replacements:
         raise ValueError("Must specify at least one of new_task, episode_tasks, or task_replacements")
 
@@ -1634,6 +1651,7 @@ def recompute_stats(
     Returns:
         The same dataset with updated stats.
     """
+    reject_sensor_sidecar_mutation(dataset)
     features = dataset.meta.features
     meta_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
     numeric_features = {
@@ -1754,6 +1772,7 @@ def convert_image_to_video_dataset(
     Returns:
         A new :class:`LeRobotDataset` with images encoded as videos.
     """
+    reject_sensor_sidecar_mutation(dataset)
     if rgb_encoder is None:
         rgb_encoder = rgb_encoder_defaults()
     if depth_encoder is None:
@@ -2006,6 +2025,7 @@ def reencode_dataset(
         The same :class:`LeRobotDataset` instance with its metadata updated
         on disk.
     """
+    reject_sensor_sidecar_mutation(dataset)
     meta = dataset.meta
     video_keys_encoders_dict = {}
     video_keys_paths_dict = {}

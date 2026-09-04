@@ -72,9 +72,13 @@ from ..configs import DAggerKeyboardConfig, DAggerPedalConfig, DAggerStrategyCon
 from ..context import RolloutContext
 from .core import (
     RolloutStrategy,
+    add_dataset_frame,
     estimate_max_episode_seconds,
     safe_push_to_hub,
+    save_dataset_episode,
     send_next_action,
+    send_sensor_safe_action,
+    sensor_safe_observation,
 )
 
 logger = logging.getLogger(__name__)
@@ -315,6 +319,7 @@ class DAggerStrategy(RolloutStrategy):
         self._teardown_hardware(
             ctx.hardware,
             return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            sensor_recorder=getattr(ctx.data, "sensor_recorder", None),
         )
         logger.info("DAgger strategy teardown complete")
 
@@ -332,7 +337,6 @@ class DAggerStrategy(RolloutStrategy):
         """
         engine = self._engine
         cfg = ctx.runtime.cfg
-        robot = ctx.hardware.robot_wrapper
         teleop = ctx.hardware.teleop
         dataset = ctx.data.dataset
         events = self._events
@@ -392,7 +396,7 @@ class DAggerStrategy(RolloutStrategy):
 
                     phase = events.phase
                     with timer.section("observe"):
-                        obs = robot.get_observation()
+                        obs = sensor_safe_observation(ctx)
 
                     # --- CORRECTING: human teleop control ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
@@ -408,7 +412,7 @@ class DAggerStrategy(RolloutStrategy):
                                 (processed_teleop, obs)
                             )
                         with timer.section("send"):
-                            robot.send_action(robot_action_to_send)
+                            send_sensor_safe_action(ctx, robot_action_to_send)
                         last_action = robot_action_to_send
                         with timer.section("telemetry"):
                             self._log_telemetry(obs_processed, processed_teleop, ctx.runtime)
@@ -422,14 +426,14 @@ class DAggerStrategy(RolloutStrategy):
                                     "task": task_str,
                                     "intervention": np.array([True], dtype=bool),
                                 }
-                                dataset.add_frame(frame)
+                                add_dataset_frame(ctx, frame)
                         correction_tick += 1
 
                     # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
                             with timer.section("send"):
-                                robot.send_action(last_action)
+                                send_sensor_safe_action(ctx, last_action)
 
                     # --- AUTONOMOUS: policy control ---
                     else:
@@ -454,7 +458,7 @@ class DAggerStrategy(RolloutStrategy):
                                         "task": task_str,
                                         "intervention": np.array([False], dtype=bool),
                                     }
-                                    dataset.add_frame(frame)
+                                    add_dataset_frame(ctx, frame)
 
                     # Episode rotation derived from the video file-size target.
                     # Saving is deferred while a correction is ongoing so the
@@ -462,7 +466,7 @@ class DAggerStrategy(RolloutStrategy):
                     elapsed = time.perf_counter() - episode_start
                     if elapsed >= episode_duration_s and phase != DAggerPhase.CORRECTING:
                         with self._episode_lock:
-                            dataset.save_episode()
+                            save_dataset_episode(ctx)
                         episodes_since_push += 1
                         self._needs_push.set()
                         logger.info(
@@ -489,11 +493,13 @@ class DAggerStrategy(RolloutStrategy):
                 logger.info("DAgger continuous control loop ended — pausing engine")
                 timer.log_run_summary()
                 engine.pause()
-                with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                if getattr(ctx.hardware.robot_wrapper.inner, "has_fatal_error", False) is not True:
+                    with contextlib.suppress(Exception):
+                        with self._episode_lock:
+                            if dataset.has_pending_frames():
+                                save_dataset_episode(ctx)
+                        self._needs_push.set()
+                        logger.info("Final in-progress episode saved")
 
     # ------------------------------------------------------------------
     # Corrections-only mode (record_autonomous=False)
@@ -509,7 +515,6 @@ class DAggerStrategy(RolloutStrategy):
         """
         engine = self._engine
         cfg = ctx.runtime.cfg
-        robot = ctx.hardware.robot_wrapper
         teleop = ctx.hardware.teleop
         dataset = ctx.data.dataset
         events = self._events
@@ -530,6 +535,7 @@ class DAggerStrategy(RolloutStrategy):
         start_time = time.perf_counter()
         correction_tick = 0
         recorded = 0
+        ctx.data.sensor_recording_enabled = False
         logger.info(
             "DAgger corrections-only recording started (target: %d episodes)", self.config.num_episodes
         )
@@ -568,11 +574,13 @@ class DAggerStrategy(RolloutStrategy):
                             # correction episode holds ``fps`` frames per second
                             # whatever the phase the autonomous run left behind.
                             correction_tick = 0
+                            ctx.data.sensor_recording_enabled = True
 
                         # Correction ended -> save episode (blocking if not streaming)
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
                             with self._episode_lock:
-                                dataset.save_episode()
+                                save_dataset_episode(ctx)
+                            ctx.data.sensor_recording_enabled = False
                             recorded += 1
                             self._needs_push.set()
                             logger.info(
@@ -595,7 +603,7 @@ class DAggerStrategy(RolloutStrategy):
 
                     phase = events.phase
                     with timer.section("observe"):
-                        obs = robot.get_observation()
+                        obs = sensor_safe_observation(ctx)
 
                     # --- CORRECTING: human teleop control + recording ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
@@ -611,7 +619,7 @@ class DAggerStrategy(RolloutStrategy):
                                 (processed_teleop, obs)
                             )
                         with timer.section("send"):
-                            robot.send_action(robot_action_to_send)
+                            send_sensor_safe_action(ctx, robot_action_to_send)
                         last_action = robot_action_to_send
                         with timer.section("telemetry"):
                             self._log_telemetry(obs_processed, processed_teleop, ctx.runtime)
@@ -620,13 +628,14 @@ class DAggerStrategy(RolloutStrategy):
                             with timer.section("record"):
                                 obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                                 action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
-                                dataset.add_frame(
+                                add_dataset_frame(
+                                    ctx,
                                     {
                                         **obs_frame,
                                         **action_frame,
                                         "task": task_str,
                                         "intervention": np.array([True], dtype=bool),
-                                    }
+                                    },
                                 )
                         correction_tick += 1
 
@@ -634,7 +643,7 @@ class DAggerStrategy(RolloutStrategy):
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
                             with timer.section("send"):
-                                robot.send_action(last_action)
+                                send_sensor_safe_action(ctx, last_action)
 
                     # --- AUTONOMOUS: policy control (no recording) ---
                     else:
@@ -656,11 +665,13 @@ class DAggerStrategy(RolloutStrategy):
                 logger.info("DAgger corrections-only loop ended — pausing engine")
                 timer.log_run_summary()
                 engine.pause()
-                with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                if getattr(ctx.hardware.robot_wrapper.inner, "has_fatal_error", False) is not True:
+                    with contextlib.suppress(Exception):
+                        with self._episode_lock:
+                            if dataset.has_pending_frames():
+                                save_dataset_episode(ctx)
+                        self._needs_push.set()
+                        logger.info("Final in-progress episode saved")
 
     # ------------------------------------------------------------------
     # State-machine transition side-effects
@@ -722,7 +733,7 @@ class DAggerStrategy(RolloutStrategy):
                 and prev_action is not None
             ):
                 logger.info("Smooth handover: sliding follower to teleop position")
-                obs = robot.get_observation()
+                obs = sensor_safe_observation(ctx)
                 teleop_action = teleop.get_action()
                 processed = ctx.processors.teleop_action_processor((teleop_action, obs))
                 target = ctx.processors.robot_action_processor((processed, obs))

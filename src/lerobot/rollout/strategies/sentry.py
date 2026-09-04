@@ -32,9 +32,12 @@ from ..configs import SentryStrategyConfig
 from ..context import RolloutContext
 from .core import (
     RolloutStrategy,
+    add_dataset_frame,
     estimate_max_episode_seconds,
     safe_push_to_hub,
+    save_dataset_episode,
     send_next_action,
+    sensor_safe_observation,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,7 +106,6 @@ class SentryStrategy(RolloutStrategy):
             )
         engine = self._engine
         cfg = ctx.runtime.cfg
-        robot = ctx.hardware.robot_wrapper
         dataset = ctx.data.dataset
         interpolator = self._interpolator
         features = ctx.data.dataset_features
@@ -127,7 +129,7 @@ class SentryStrategy(RolloutStrategy):
                     break
 
                 with timer.section("observe"):
-                    obs = robot.get_observation()
+                    obs = sensor_safe_observation(ctx)
                 with timer.section("process_obs"):
                     obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -155,7 +157,7 @@ class SentryStrategy(RolloutStrategy):
                             # background pusher only ever touches *finalised* episode
                             # artifacts on disk.  The two operate on disjoint state, so
                             # ``add_frame`` does not need ``_episode_lock``.
-                            dataset.add_frame(frame)
+                            add_dataset_frame(ctx, frame)
 
                 # Episode rotation derived from video file-size target.
                 # The duration is a conservative estimate so the actual
@@ -163,7 +165,7 @@ class SentryStrategy(RolloutStrategy):
                 # keeping push_to_hub efficient (uploads complete files).
                 elapsed = time.perf_counter() - episode_start
                 if elapsed >= episode_duration_s:
-                    self._checked_save_episode(dataset)
+                    self._checked_save_episode(dataset, ctx)
                     logger.info(
                         "Episode saved (total: %d, elapsed: %.1fs)",
                         dataset.num_episodes,
@@ -192,9 +194,9 @@ class SentryStrategy(RolloutStrategy):
             logger.info("Sentry control loop ended")
             # Report before the tail save, which re-raises on a broken save.
             timer.log_run_summary()
-            self._save_tail_episode(dataset, cfg)
+            self._save_tail_episode(dataset, cfg, ctx)
 
-    def _checked_save_episode(self, dataset) -> None:
+    def _checked_save_episode(self, dataset, ctx: RolloutContext | None = None) -> None:
         """``save_episode`` under the push lock; a failure poisons the dataset and re-raises.
 
         A failed ``save_episode`` is *not* recoverable by discarding the buffer:
@@ -205,14 +207,17 @@ class SentryStrategy(RolloutStrategy):
         self._warn_if_push_in_flight()
         try:
             with self._episode_lock:
-                dataset.save_episode()
+                if ctx is None:
+                    dataset.save_episode()
+                else:
+                    save_dataset_episode(ctx)
         except Exception:
             self._dataset_poisoned = True
             with contextlib.suppress(Exception):
                 dataset.clear_episode_buffer(delete_images=False)
             raise
 
-    def _save_tail_episode(self, dataset, cfg) -> None:
+    def _save_tail_episode(self, dataset, cfg, ctx: RolloutContext | None = None) -> None:
         """Commit the segment's partial tail episode; fail loudly on real errors.
 
         Runs in ``run()``'s ``finally``.  Returns early on an already-poisoned
@@ -221,11 +226,13 @@ class SentryStrategy(RolloutStrategy):
         """
         if self._dataset_poisoned:
             return
+        if ctx is not None and getattr(ctx.hardware.robot_wrapper.inner, "has_fatal_error", False) is True:
+            return
         if not dataset.has_pending_frames():
             logger.info("No frames pending at segment end — nothing to save")
             return
         logger.info("Saving the segment's final (partial) episode")
-        self._checked_save_episode(dataset)
+        self._checked_save_episode(dataset, ctx)
         self._register_saved_episode(dataset, cfg)
 
     def _register_saved_episode(self, dataset, cfg) -> None:
@@ -291,6 +298,7 @@ class SentryStrategy(RolloutStrategy):
         self._teardown_hardware(
             ctx.hardware,
             return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            sensor_recorder=getattr(ctx.data, "sensor_recorder", None),
         )
         logger.info("Sentry strategy teardown complete")
 

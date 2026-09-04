@@ -20,6 +20,7 @@ import contextlib
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from threading import Event as ThreadingEvent, Lock
 
 from lerobot.datasets import VideoEncodingManager
@@ -32,7 +33,14 @@ from lerobot.utils.utils import log_say
 from ..configs import HighlightStrategyConfig
 from ..context import RolloutContext
 from ..ring_buffer import RolloutRingBuffer
-from .core import RolloutStrategy, safe_push_to_hub, send_next_action
+from .core import (
+    RolloutStrategy,
+    add_dataset_frame,
+    safe_push_to_hub,
+    save_dataset_episode,
+    send_next_action,
+    sensor_safe_observation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +101,6 @@ class HighlightStrategy(RolloutStrategy):
         """Run the autonomous loop, buffering frames and recording on demand."""
         engine = self._engine
         cfg = ctx.runtime.cfg
-        robot = ctx.hardware.robot_wrapper
         dataset = ctx.data.dataset
         ring = self._ring
         interpolator = self._interpolator
@@ -118,7 +125,7 @@ class HighlightStrategy(RolloutStrategy):
                         break
 
                     with timer.section("observe"):
-                        obs = robot.get_observation()
+                        obs = sensor_safe_observation(ctx)
                     with timer.section("process_obs"):
                         obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -162,13 +169,37 @@ class HighlightStrategy(RolloutStrategy):
                                             "Flushing ring buffer (%d frames) + starting live recording",
                                             len(ring),
                                         )
-                                        for buffered_frame in ring.drain():
-                                            dataset.add_frame(buffered_frame)
+                                        buffered_frames = ring.drain()
+                                        sensor_recorder = getattr(ctx.data, "sensor_recorder", None)
+                                        if sensor_recorder is not None and buffered_frames:
+                                            first_capture = buffered_frames[0]["__sensor_capture_metadata__"]
+                                            selected_timestamps = [
+                                                selection["timestamp_ns"]
+                                                for selection in first_capture.get("sensors", {}).values()
+                                                if selection.get("timestamp_ns") is not None
+                                            ]
+                                            sensor_recorder.trim_before(
+                                                min(
+                                                    [
+                                                        first_capture["observation_start_ns"],
+                                                        *selected_timestamps,
+                                                    ]
+                                                )
+                                            )
+                                        for buffered_frame in buffered_frames:
+                                            if sensor_recorder is None:
+                                                add_dataset_frame(ctx, buffered_frame)
+                                            else:
+                                                add_dataset_frame(
+                                                    ctx,
+                                                    buffered_frame["__dataset_frame__"],
+                                                    buffered_frame["__sensor_capture_metadata__"],
+                                                )
                                         self._recording_live.set()
                                     else:
-                                        dataset.add_frame(frame)
+                                        add_dataset_frame(ctx, frame)
                                         with self._episode_lock:
-                                            dataset.save_episode()
+                                            save_dataset_episode(ctx)
                                         logger.info("Episode saved (total: %d)", dataset.num_episodes)
                                         log_say(
                                             f"Episode {dataset.num_episodes} saved",
@@ -179,9 +210,19 @@ class HighlightStrategy(RolloutStrategy):
 
                                 if not frame_consumed:
                                     if self._recording_live.is_set():
-                                        dataset.add_frame(frame)
+                                        add_dataset_frame(ctx, frame)
                                     else:
-                                        ring.append(frame)
+                                        if getattr(ctx.data, "sensor_recorder", None) is None:
+                                            ring.append(frame)
+                                        else:
+                                            ring.append(
+                                                {
+                                                    "__dataset_frame__": frame,
+                                                    "__sensor_capture_metadata__": deepcopy(
+                                                        ctx.hardware.robot_wrapper.inner.last_capture_metadata
+                                                    ),
+                                                }
+                                            )
 
                             # Draining the ring buffer and finalising an episode both
                             # block for a good fraction of a second inside the timed
@@ -197,10 +238,13 @@ class HighlightStrategy(RolloutStrategy):
             finally:
                 logger.info("Highlight control loop ended")
                 timer.log_run_summary()
-                if self._recording_live.is_set():
+                if (
+                    self._recording_live.is_set()
+                    and getattr(ctx.hardware.robot_wrapper.inner, "has_fatal_error", False) is not True
+                ):
                     logger.info("Saving in-progress live episode")
                     with contextlib.suppress(Exception), self._episode_lock:
-                        dataset.save_episode()
+                        save_dataset_episode(ctx)
 
     def teardown(self, ctx: RolloutContext) -> None:
         """Stop listeners, finalise the dataset, and disconnect hardware."""
@@ -233,6 +277,7 @@ class HighlightStrategy(RolloutStrategy):
         self._teardown_hardware(
             ctx.hardware,
             return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            sensor_recorder=getattr(ctx.data, "sensor_recorder", None),
         )
         logger.info("Highlight strategy teardown complete")
 

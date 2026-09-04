@@ -28,13 +28,11 @@ from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
 from lerobot.sensors.x518.protocol import _ModbusTCPClient, _X518DeviceSettings
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-_LEFT_FINGER_FORCE = "tactile.gripper.left_finger.normal_force"
-_RIGHT_FINGER_FORCE = "tactile.gripper.right_finger.normal_force"
+_LEFT_FINGER_FORCE = "left.normal_force"
+_RIGHT_FINGER_FORCE = "right.normal_force"
 
 
-def _gripper_channels(
-    *, left_channel: int = 1, right_channel: int = 2
-) -> dict[str, X518ChannelConfig]:
+def _gripper_channels(*, left_channel: int = 1, right_channel: int = 2) -> dict[str, X518ChannelConfig]:
     return {
         _LEFT_FINGER_FORCE: X518ChannelConfig(channel=left_channel),
         _RIGHT_FINGER_FORCE: X518ChannelConfig(channel=right_channel),
@@ -179,9 +177,7 @@ def test_x518_config_decodes_from_registered_choice_payload() -> None:
 
 
 def test_x518_channel_mapping_can_be_swapped() -> None:
-    config = X518SensorConfig(
-        channels=_gripper_channels(left_channel=2, right_channel=1)
-    )
+    config = X518SensorConfig(channels=_gripper_channels(left_channel=2, right_channel=1))
     sensor = X518Sensor(config)
     sensor._device_settings = _settings(unit="N")
     sensor._client = _FakeClient(raw_reader=lambda _word_swap: (3, 7))
@@ -199,9 +195,7 @@ def test_x518_channel_rejects_invalid_device_identifier(channel) -> None:
 
 def test_x518_config_rejects_duplicate_channel_mapping() -> None:
     with pytest.raises(ValueError, match="at most one semantic feature"):
-        X518SensorConfig(
-            channels=_gripper_channels(left_channel=1, right_channel=1)
-        )
+        X518SensorConfig(channels=_gripper_channels(left_channel=1, right_channel=1))
 
 
 @pytest.mark.parametrize(
@@ -396,9 +390,7 @@ def test_sensor_read_interfaces_distinguish_fresh_consumed_and_latest_samples() 
         with pytest.raises(RuntimeError, match="has not produced"):
             sensor.read_latest()
 
-        sensor._publish_sample(
-            {_LEFT_FINGER_FORCE: 1.0, _RIGHT_FINGER_FORCE: 2.0}, time.perf_counter_ns()
-        )
+        sensor._publish_sample({_LEFT_FINGER_FORCE: 1.0, _RIGHT_FINGER_FORCE: 2.0}, time.perf_counter_ns())
         first = sensor.async_read(timeout_ms=0)
         assert first.sequence == 0
         assert sensor.read_latest() is first
@@ -466,6 +458,8 @@ def test_sensor_connection_starts_sampling_and_disconnect_stops_it() -> None:
     assert sample.sequence == 0
     assert sample.values[_LEFT_FINGER_FORCE] == pytest.approx(9.80665)
     assert sample.values[_RIGHT_FINGER_FORCE] == pytest.approx(-9.80665)
+    assert sample.native_values == {"channel_1.register": 1, "channel_2.register": -1}
+    assert sample.native_payload is None
     with pytest.raises(DeviceAlreadyConnectedError):
         sensor.connect()
 
@@ -475,6 +469,18 @@ def test_sensor_connection_starts_sampling_and_disconnect_stops_it() -> None:
     with pytest.raises(DeviceNotConnectedError):
         sensor.read_latest()
     with pytest.raises(DeviceNotConnectedError):
+        sensor.disconnect()
+
+
+def test_sensor_can_publish_opt_in_native_payload() -> None:
+    sensor = X518Sensor(_x518_config(sample_rate_hz=100, expected_unit="N", record_native_payload=True))
+    sensor._client = _FakeClient(settings=[_settings(unit="N", sample_rate_hz=200)])
+
+    try:
+        sensor.connect()
+        sample = sensor.async_read(timeout_ms=500)
+        assert sample.native_payload == struct.pack(">ii", 1, -1)
+    finally:
         sensor.disconnect()
 
 
@@ -513,6 +519,8 @@ def test_sensor_reconnects_and_refreshes_device_settings() -> None:
 
         assert fake_client.connect_calls >= 2
         assert fake_client.settings_calls >= 2
+        assert sample.sequence == 1  # the invalid acquisition attempt consumed sequence 0
+        assert sample.hardware_sequence is None
         assert sample.values[_LEFT_FINGER_FORCE] == 1.0
         assert sample.values[_RIGHT_FINGER_FORCE] == 2.0
     finally:
@@ -527,9 +535,7 @@ def test_sensor_rejects_unit_mismatch_and_excessive_poll_rate() -> None:
     assert not wrong_unit.is_connected
     assert wrong_unit._client.socket is None
 
-    excessive_rate = X518Sensor(
-        _x518_config(sample_rate_hz=200, expected_unit=None, connect_retries=0)
-    )
+    excessive_rate = X518Sensor(_x518_config(sample_rate_hz=200, expected_unit=None, connect_retries=0))
     excessive_rate._client = _FakeClient(settings=[_settings(sample_rate_hz=100)])
     with pytest.raises(ValueError, match="exceeds the device rate"):
         excessive_rate.connect()
@@ -549,9 +555,7 @@ def test_sensor_rejects_non_modbus_ethernet_mode() -> None:
 
 
 def test_sensor_cleans_up_after_initial_connection_failure() -> None:
-    sensor = X518Sensor(
-        _x518_config(connect_retries=1, connect_backoff_s=0, expected_unit=None)
-    )
+    sensor = X518Sensor(_x518_config(connect_retries=1, connect_backoff_s=0, expected_unit=None))
     sensor._client = _FakeClient(connect_error=OSError("unreachable"))
 
     with pytest.raises(OSError, match="unreachable"):

@@ -15,6 +15,7 @@
 # limitations under the License.
 """Tests for dataset tools utilities."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -34,6 +35,7 @@ from lerobot.datasets.dataset_tools import (
     modify_features,
     modify_tasks,
     reencode_dataset,
+    reject_sensor_sidecar_mutation,
     remove_feature,
     split_dataset,
 )
@@ -70,6 +72,16 @@ def sample_dataset(tmp_path, empty_lerobot_dataset_factory):
 
     dataset.finalize()
     return dataset
+
+
+def test_mutating_tools_reject_sensor_sidecar_dataset(tmp_path) -> None:
+    root = tmp_path / "sensor_dataset"
+    manifest = root / "meta" / "sensor_streams.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Sensor Sidecars"):
+        reject_sensor_sidecar_mutation(SimpleNamespace(root=root))
 
 
 def test_delete_single_episode(sample_dataset, tmp_path):
