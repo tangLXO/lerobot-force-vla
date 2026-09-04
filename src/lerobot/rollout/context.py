@@ -36,6 +36,7 @@ from lerobot.datasets import (
     aggregate_pipeline_dataset_features,
     create_initial_features,
 )
+from lerobot.datasets.sensor_stream import SensorStreamRecorder
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
@@ -47,7 +48,7 @@ from lerobot.processor import (
     rename_stats,
 )
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
-from lerobot.robots import make_robot_from_config
+from lerobot.robots import SensorizedRobot, attach_sensors, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.import_utils import _peft_available, require_package
@@ -200,6 +201,7 @@ class RuntimeContext:
     # must forward it to the timer it builds in ``run()``, since a session mutes
     # everything below ERROR.
     cadence_report: Callable[[str], None] | None = None
+    active_strategy: object | None = None
 
 
 @dataclass
@@ -247,6 +249,8 @@ class DatasetContext:
     dataset_features: dict = field(default_factory=dict)
     hw_features: dict = field(default_factory=dict)
     ordered_action_keys: list[str] = field(default_factory=list)
+    sensor_recorder: SensorStreamRecorder | None = None
+    sensor_recording_enabled: bool = True
 
 
 @dataclass
@@ -371,12 +375,20 @@ def build_rollout_context(
 
     # --- 3. Hardware (heaviest side-effect, deferred) -----------------
     logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
-    robot = make_robot_from_config(cfg.robot)
+    robot = attach_sensors(make_robot_from_config(cfg.robot), cfg.sensors)
+    if isinstance(robot, SensorizedRobot) and cfg.dataset is not None:
+        for sensor in robot.sensors.values():
+            sensor.config.resolve_recorder_queue_capacity()
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
     # Store the initial joint positions so we can return to a safe pose on shutdown.
-    initial_obs = robot.get_observation()
+    try:
+        initial_obs = robot.get_observation()
+    except Exception:
+        if robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected):
+            robot.disconnect()
+        raise
     initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
     logger.info("Captured initial robot position (%d keys)", len(initial_position))
 
@@ -421,7 +433,7 @@ def build_rollout_context(
     observation_features_hw = {
         k: v
         for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith((".pos", ".vel")))
+        if isinstance(v, tuple) or (v is float and (k.endswith((".pos", ".vel")) or k.startswith("sensor.")))
     }
     policy_action_names = getattr(policy_config, "action_feature_names", None)
     observation_features_hw = _align_state_feature_order(
@@ -527,7 +539,6 @@ def build_rollout_context(
 
     if dataset is not None:
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
-
     # --- 6. Policy pre/post processors (needs dataset stats if any) ---
     dataset_stats = None
     if dataset is not None:
@@ -584,6 +595,19 @@ def build_rollout_context(
         shutdown_event=shutdown_event,
     )
 
+    try:
+        sensor_recorder = (
+            SensorStreamRecorder(dataset.root, robot.sensors)
+            if dataset is not None and isinstance(robot, SensorizedRobot)
+            else None
+        )
+    except Exception:
+        if teleop is not None and teleop.is_connected:
+            teleop.disconnect()
+        if robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected):
+            robot.disconnect()
+        raise
+
     # --- 8. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")
     return RolloutContext(
@@ -604,6 +628,7 @@ def build_rollout_context(
         ),
         data=DatasetContext(
             dataset=dataset,
+            sensor_recorder=sensor_recorder,
             dataset_features=dataset_features,
             hw_features=hw_features,
             ordered_action_keys=ordered_action_keys,

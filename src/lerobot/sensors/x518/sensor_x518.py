@@ -21,12 +21,14 @@
 
 import logging
 import math
+import struct
 import threading
 import time
+from typing import Any
 
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
-from ..sensor import Sensor, SensorSample
+from ..sensor import Sensor, SensorFeature
 from .configuration_x518 import X518SensorConfig
 from .protocol import _ModbusTCPClient, _X518DeviceSettings
 
@@ -57,25 +59,50 @@ class X518Sensor(Sensor):
         )
 
         self._lifecycle_lock = threading.RLock()
-        self._sample_ready = threading.Condition(threading.RLock())
+        self._sample_ready = self._publication_condition
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lifecycle_active = False
 
         self._device_settings: _X518DeviceSettings | None = None
-        self._latest_sample: SensorSample | None = None
-        self._next_sequence = 0
-        self._last_consumed_sequence = -1
         self._last_error_log_ns = 0
         self._suppressed_error_logs = 0
 
     @property
-    def features(self) -> dict[str, type]:
+    def features(self) -> dict[str, SensorFeature]:
         """Describe configured semantic force outputs, each expressed in newtons.
 
         中文说明：返回配置中声明的语义特征，每个特征的数据类型都是 ``float``。
         """
-        return dict.fromkeys(self.config.channels, float)
+        return {name: SensorFeature(dtype="float32", unit="N") for name in self.config.channels}
+
+    @property
+    def native_features(self) -> dict[str, SensorFeature]:
+        """Describe the saved signed register values for configured channels."""
+        return {
+            f"channel_{channel}.register": SensorFeature(dtype="int32", unit="device_count")
+            for channel in sorted({mapping.channel for mapping in self.config.channels.values()})
+        }
+
+    @property
+    def provenance(self) -> dict[str, Any]:
+        """Report X518 identity, mapping, clock, and detected settings."""
+        provenance = super().provenance
+        provenance.update(
+            {
+                "hardware_model": "X518",
+                "device_id": f"{self.config.host}:{self.config.port}/{self.config.unit_id}",
+                "channel_mapping": {name: mapping.channel for name, mapping in self.config.channels.items()},
+                "timestamp_source": "time.perf_counter_ns_response_received",
+            }
+        )
+        if self._device_settings is not None:
+            provenance["device_settings"] = {
+                "unit": self._device_settings.unit,
+                "decimal": self._device_settings.decimal,
+                "sample_rate_hz": self._device_settings.sample_rate_hz,
+            }
+        return provenance
 
     @property
     def is_connected(self) -> bool:
@@ -97,7 +124,7 @@ class X518Sensor(Sensor):
 
             self._stop_event.clear()
             with self._sample_ready:
-                self._latest_sample = None
+                self._history.clear()
                 self._next_sequence = 0
                 self._last_consumed_sequence = -1
 
@@ -188,13 +215,27 @@ class X518Sensor(Sensor):
             try:
                 if self._client.socket is None and not self._reconnect_until_ready():
                     break
-                values, timestamp_ns = self._read_values()
+                values, native_values, native_payload, timestamp_ns = self._read_sample_components()
                 if self._stop_event.is_set():
                     break
-                self._publish_sample(values, timestamp_ns)
+                self._publish_sample(
+                    values,
+                    timestamp_ns,
+                    native_values=native_values if self.config.record_native_values else None,
+                    native_payload=native_payload,
+                )
             except Exception as exc:
                 if self._stop_event.is_set():
                     break
+                failed_at_ns = time.perf_counter_ns()
+                self._publish_sample(
+                    None,
+                    failed_at_ns,
+                    arrival_timestamp_ns=failed_at_ns,
+                    is_valid=False,
+                    status="read_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 self._client.close()
                 self._record_read_error(exc)
 
@@ -252,7 +293,9 @@ class X518Sensor(Sensor):
                     return False
         return False
 
-    def _read_values(self) -> tuple[dict[str, float], int]:
+    def _read_sample_components(
+        self,
+    ) -> tuple[dict[str, float], dict[str, int], bytes | None, int]:
         """Read raw channels and map scaled values to semantic features in newtons.
 
         中文说明：读取两路原始值，使用高分辨率 ``perf_counter_ns()`` 记录响应接收时刻，
@@ -271,23 +314,17 @@ class X518Sensor(Sensor):
         }
         if not all(math.isfinite(value) for value in values.values()):  # pragma: no cover - int32 is finite
             raise RuntimeError("X518 returned a non-finite force value.")
+        native_values = {
+            f"channel_{channel_config.channel}.register": channel_values[channel_config.channel - 1]
+            for channel_config in self.config.channels.values()
+        }
+        native_payload = struct.pack(">ii", *channel_values) if self.config.record_native_payload else None
+        return values, native_values, native_payload, timestamp_ns
+
+    def _read_values(self) -> tuple[dict[str, float], int]:
+        """Compatibility helper returning calibrated values and measurement time."""
+        values, _native_values, _native_payload, timestamp_ns = self._read_sample_components()
         return values, timestamp_ns
-
-    def _publish_sample(self, values: dict[str, float], timestamp_ns: int) -> None:
-        """Publish one valid sample and wake readers waiting for new data.
-
-        中文说明：为成功读数分配递增序号、保存为最新样本，并唤醒等待中的读取调用。
-        """
-        with self._sample_ready:
-            sample = SensorSample(
-                timestamp_ns=timestamp_ns,
-                sequence=self._next_sequence,
-                values=values,
-                is_valid=True,
-            )
-            self._next_sequence += 1
-            self._latest_sample = sample
-            self._sample_ready.notify_all()
 
     def _record_read_error(self, exc: Exception) -> None:
         """Rate-limit repeated acquisition warnings while retaining their count.
@@ -306,68 +343,6 @@ class X518Sensor(Sensor):
 
         suffix = f" ({suppressed} similar errors suppressed)" if suppressed else ""
         logger.warning("X518 acquisition failed: %s%s", exc, suffix)
-
-    def read(self) -> SensorSample:
-        """Wait indefinitely for a sample produced after this call begins.
-
-        中文说明：忽略调用前已有的样本，一直阻塞到后台线程发布一个更新的样本。
-        """
-        with self._sample_ready:
-            self._require_active()
-            baseline_sequence = self._latest_sample.sequence if self._latest_sample is not None else -1
-            while self._latest_sample is None or self._latest_sample.sequence <= baseline_sequence:
-                self._sample_ready.wait()
-                self._require_active()
-            sample = self._latest_sample
-            self._last_consumed_sequence = sample.sequence
-            return sample
-
-    def async_read(self, timeout_ms: float = 200) -> SensorSample:
-        """Return the newest unconsumed sample, waiting up to ``timeout_ms``.
-
-        中文说明：返回尚未被消费的最新样本；没有新样本时最多等待指定毫秒数。
-        """
-        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int | float):
-            raise ValueError(f"timeout_ms must be a finite non-negative number, got {timeout_ms!r}.")
-        if not math.isfinite(timeout_ms) or timeout_ms < 0:
-            raise ValueError(f"timeout_ms must be a finite non-negative number, got {timeout_ms!r}.")
-
-        deadline = time.perf_counter() + timeout_ms / 1000.0
-        with self._sample_ready:
-            self._require_active()
-            while self._latest_sample is None or self._latest_sample.sequence <= self._last_consumed_sequence:
-                remaining_s = deadline - time.perf_counter()
-                if remaining_s <= 0:
-                    raise TimeoutError(f"Timed out waiting for a new X518 sample after {timeout_ms:g} ms.")
-                self._sample_ready.wait(timeout=remaining_s)
-                self._require_active()
-
-            sample = self._latest_sample
-            self._last_consumed_sequence = sample.sequence
-            return sample
-
-    def read_latest(self, max_age_ms: int = 500) -> SensorSample:
-        """Peek at the latest sample, rejecting samples older than ``max_age_ms``.
-
-        中文说明：非消费式查看最新样本；没有样本或样本超过允许时效时会报错。
-        """
-        if isinstance(max_age_ms, bool) or not isinstance(max_age_ms, int | float):
-            raise ValueError(f"max_age_ms must be a finite number, got {max_age_ms!r}.")
-        if not math.isfinite(max_age_ms):
-            raise ValueError(f"max_age_ms must be a finite number, got {max_age_ms!r}.")
-
-        with self._sample_ready:
-            self._require_active()
-            sample = self._latest_sample
-
-        if sample is None:
-            raise RuntimeError("X518 has not produced a sample yet.")
-        age_ms = (time.perf_counter_ns() - sample.timestamp_ns) / 1e6
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"Latest X518 sample is {age_ms:.1f} ms old (maximum allowed: {max_age_ms:g} ms)."
-            )
-        return sample
 
     def _require_active(self) -> None:
         """Raise when the sensor lifecycle or background reader is not active.

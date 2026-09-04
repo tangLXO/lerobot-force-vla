@@ -28,6 +28,7 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFI
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
+from .sensor_window import SensorWindowDataset
 from .storage import DEFAULT_STORAGE_FORMAT, load_dataset_metadata
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices
@@ -114,6 +115,12 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    if cfg.dataset.sensor_windows and not getattr(cfg.trainable_config, "supports_sensor_windows", False):
+        raise ValueError(
+            f"Policy {cfg.trainable_config.type!r} does not declare temporal sensor-window support. "
+            "Phase one keeps ACT, pi0, and SmolVLA on observation.state."
+        )
+
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
@@ -192,6 +199,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    if cfg.dataset.sensor_windows:
+        dataset = SensorWindowDataset(dataset, cfg.dataset.sensor_windows)
     return dataset
 
 
@@ -267,6 +276,10 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
     )
+
+    if cfg.dataset.sensor_windows:
+        train_dataset = SensorWindowDataset(train_dataset, cfg.dataset.sensor_windows)
+        eval_dataset = SensorWindowDataset(eval_dataset, cfg.dataset.sensor_windows)
 
     if cfg.dataset.use_imagenet_stats:
         for ds in (train_dataset, eval_dataset):

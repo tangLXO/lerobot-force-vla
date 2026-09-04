@@ -1147,6 +1147,87 @@ def test_base_strategy_reports_the_run_summary_even_when_the_loop_raises(caplog)
     assert summary.startswith("Cadence summary —")
 
 
+def test_required_sensor_failure_safe_stops_before_any_action() -> None:
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.sensors import SensorDataUnavailableError
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=4)
+    ctx.hardware.robot_wrapper.get_observation.side_effect = SensorDataUnavailableError(
+        "required force sensor is stale"
+    )
+    recorder = MagicMock(is_active=True, has_prepared_episode=False)
+    ctx.data.sensor_recorder = recorder
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=1)
+    ctx.runtime.active_strategy = strategy
+
+    with pytest.raises(SensorDataUnavailableError, match="stale"):
+        strategy.run(ctx)
+
+    assert ctx.runtime.shutdown_event.is_set()
+    ctx.policy.inference.pause.assert_called_once()
+    ctx.policy.inference.reset.assert_called_once()
+    dataset.clear_episode_buffer.assert_called_once()
+    recorder.abort_episode.assert_called_once()
+    ctx.hardware.robot_wrapper.send_action.assert_not_called()
+
+
+def test_sensor_failure_during_direct_send_applies_full_safe_stop() -> None:
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.rollout.strategies.core import send_sensor_safe_action
+    from lerobot.sensors import SensorDataUnavailableError
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=1, num_ticks=1)
+    ctx.hardware.robot_wrapper.send_action.side_effect = SensorDataUnavailableError(
+        "required force sensor disconnected before send"
+    )
+    recorder = MagicMock(is_active=True, has_prepared_episode=False)
+    ctx.data.sensor_recorder = recorder
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=1)
+    ctx.runtime.active_strategy = strategy
+
+    with pytest.raises(SensorDataUnavailableError, match="before send"):
+        send_sensor_safe_action(ctx, {"joint.pos": 1.0})
+
+    assert ctx.runtime.shutdown_event.is_set()
+    ctx.policy.inference.pause.assert_called_once()
+    ctx.policy.inference.reset.assert_called_once()
+    dataset.clear_episode_buffer.assert_called_once()
+    recorder.abort_episode.assert_called_once()
+
+
+def test_sensor_fatal_teardown_skips_all_return_motion() -> None:
+    from lerobot.robots import SensorizedRobot
+    from lerobot.rollout import BaseStrategyConfig
+    from lerobot.rollout.strategies import BaseStrategy
+
+    inner_robot = MagicMock()
+    inner_robot.observation_features = {}
+    inner_robot.is_connected = True
+    robot = SensorizedRobot(inner_robot, {})
+    robot.latch_fatal_error(RuntimeError("sensor failed"))
+    hardware = SimpleNamespace(
+        robot_wrapper=SimpleNamespace(inner=robot),
+        teleop=None,
+        initial_position={"joint.pos": 0.0},
+    )
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy._engine = MagicMock()
+    strategy.return_to_initial_position = MagicMock()
+
+    strategy._teardown_hardware(hardware, return_to_initial_position=True)
+
+    strategy.return_to_initial_position.assert_not_called()
+    inner_robot.disconnect.assert_called_once()
+
+
 def test_starved_engine_is_counted_through_the_real_dispatch_path(caplog):
     from lerobot.rollout import BaseStrategyConfig
     from lerobot.rollout.strategies import BaseStrategy

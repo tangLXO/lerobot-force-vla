@@ -109,4 +109,6 @@ def _estimate_frame_bytes(frame: dict) -> int:
             total += 8
         elif isinstance(v, (str, bytes)):
             total += len(v)
+        elif isinstance(v, dict):
+            total += _estimate_frame_bytes(v)
     return max(total, 1)  # avoid zero-size frames

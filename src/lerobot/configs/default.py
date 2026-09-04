@@ -25,6 +25,41 @@ from .video import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SensorWindowConfig:
+    """One fixed-length training-time sensor window request."""
+
+    duration_ms: float
+    target_hz: float | None
+    max_age_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate finite positive duration/rate/age settings."""
+        import math
+
+        if (
+            isinstance(self.duration_ms, bool)
+            or not isinstance(self.duration_ms, int | float)
+            or not math.isfinite(self.duration_ms)
+            or self.duration_ms <= 0
+        ):
+            raise ValueError("SensorWindowConfig.duration_ms must be positive and finite.")
+        if self.target_hz is not None and (
+            isinstance(self.target_hz, bool)
+            or not isinstance(self.target_hz, int | float)
+            or not math.isfinite(self.target_hz)
+            or self.target_hz <= 0
+        ):
+            raise ValueError("SensorWindowConfig.target_hz must be positive and finite.")
+        if self.max_age_ms is not None and (
+            isinstance(self.max_age_ms, bool)
+            or not isinstance(self.max_age_ms, int | float)
+            or not math.isfinite(self.max_age_ms)
+            or self.max_age_ms <= 0
+        ):
+            raise ValueError("SensorWindowConfig.max_age_ms must be positive and finite.")
+
+
 @dataclass
 class DatasetConfig:
     # You may provide a list of datasets here. `train.py` creates them all and concatenates them. Note: only data
@@ -55,6 +90,7 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    sensor_windows: dict[str, SensorWindowConfig] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):

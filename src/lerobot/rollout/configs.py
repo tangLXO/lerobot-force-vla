@@ -26,6 +26,8 @@ import draccus
 from lerobot.configs import PreTrainedConfig, parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.sensors import SensorConfig
+from lerobot.sensors.x518 import X518SensorConfig  # noqa: F401
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
@@ -280,6 +282,7 @@ class RolloutConfig:
     # Hardware
     robot: RobotConfig | None = None
     teleop: TeleoperatorConfig | None = None
+    sensors: dict[str, SensorConfig] = field(default_factory=dict)
 
     # Policy (loaded from --policy.path via __post_init__)
     policy: PreTrainedConfig | None = None

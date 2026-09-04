@@ -196,6 +196,12 @@ class LeRobotDatasetMetadata:
             writer.close()
             self._pq_writer = None
 
+    def seal_episode_artifacts(self) -> None:
+        """Durably close episode metadata and rotate before the next episode."""
+        self._close_writer()
+        self.episodes = load_episodes(self.root)
+        self.latest_episode = None
+
     def finalize(self) -> None:
         """Flush metadata buffer and close the parquet writer.
 

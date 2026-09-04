@@ -49,7 +49,16 @@ from lerobot.utils.visualization_utils import log_visualization_data
 
 from ..configs import EpisodicStrategyConfig
 from ..context import RolloutContext
-from .core import RolloutStrategy, safe_push_to_hub, send_next_action
+from .core import (
+    RolloutStrategy,
+    add_dataset_frame,
+    discard_dataset_episode,
+    safe_push_to_hub,
+    save_dataset_episode,
+    send_next_action,
+    send_sensor_safe_action,
+    sensor_safe_observation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +150,9 @@ class EpisodicStrategy(RolloutStrategy):
                         dataset=dataset,
                         single_task=single_task,
                     )
+                    sensor_recorder = getattr(ctx.data, "sensor_recorder", None)
+                    if sensor_recorder is not None and sensor_recorder.is_active:
+                        sensor_recorder.prepare_episode(task_info=[single_task])
 
                     # Reset phase, skip after the last episode (but run when re-recording)
                     if not events["stop_recording"] and (
@@ -158,7 +170,7 @@ class EpisodicStrategy(RolloutStrategy):
                             # clutch-style teleops that re-reference at the current robot pose on
                             # engage).
                             if self.config.smooth_handover:
-                                obs = robot.get_observation()
+                                obs = sensor_safe_observation(ctx)
                                 current_pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
                                 if (
                                     teleop_supports_feedback(teleop)
@@ -194,7 +206,7 @@ class EpisodicStrategy(RolloutStrategy):
                         log_say("Re-record episode", play_sounds)
                         events["rerecord_episode"] = False
                         events["exit_early"] = False
-                        dataset.clear_episode_buffer()
+                        discard_dataset_episode(ctx, "Episode was explicitly re-recorded.")
                         timer.log_episode_summary("discarded episode")
 
                         # returns to its initial joint positions captured at startup
@@ -203,7 +215,7 @@ class EpisodicStrategy(RolloutStrategy):
 
                         continue
 
-                    dataset.save_episode()
+                    save_dataset_episode(ctx)
                     recorded_episodes += 1
                     timer.log_episode_summary(f"episode {dataset.num_episodes}")
             finally:
@@ -212,8 +224,10 @@ class EpisodicStrategy(RolloutStrategy):
                 # suppress: save_episode raises if the buffer is empty (nothing to lose).
                 logger.info("Episodic control loop ended — saving any in-progress episode")
                 timer.log_run_summary()
-                with contextlib.suppress(Exception):
-                    dataset.save_episode()
+                if getattr(ctx.hardware.robot_wrapper.inner, "has_fatal_error", False) is not True:
+                    with contextlib.suppress(Exception):
+                        if dataset.has_pending_frames():
+                            save_dataset_episode(ctx)
 
     def _policy_loop(
         self,
@@ -247,7 +261,7 @@ class EpisodicStrategy(RolloutStrategy):
                 break
 
             with timer.section("observe"):
-                obs = robot.get_observation()
+                obs = sensor_safe_observation(ctx)
             with timer.section("process_obs"):
                 obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -266,7 +280,7 @@ class EpisodicStrategy(RolloutStrategy):
                     with timer.section("record"):
                         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                         action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                        dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
+                        add_dataset_frame(ctx, {**obs_frame, **action_frame, "task": single_task})
 
             timer.wait()
             timestamp = time.perf_counter() - start_t
@@ -300,13 +314,13 @@ class EpisodicStrategy(RolloutStrategy):
             if ctx.runtime.shutdown_event.is_set():
                 break
 
-            obs = robot.get_observation()
+            obs = sensor_safe_observation(ctx)
 
             if teleop is not None:
                 act = teleop.get_action()
                 act_teleop = processors.teleop_action_processor((act, obs))
                 robot_action = processors.robot_action_processor((act_teleop, obs))
-                robot.send_action(robot_action)
+                send_sensor_safe_action(ctx, robot_action)
 
                 if display_data:
                     obs_processed = processors.robot_observation_processor(obs)
@@ -352,6 +366,7 @@ class EpisodicStrategy(RolloutStrategy):
         self._teardown_hardware(
             ctx.hardware,
             return_to_initial_position=cfg.return_to_initial_position,
+            sensor_recorder=getattr(ctx.data, "sensor_recorder", None),
         )
         log_say("Exiting", play_sounds)
         logger.info("Episodic strategy teardown complete")

@@ -47,6 +47,13 @@ class ThreadSafeRobot:
         with self._lock:
             return self._robot.send_action(action)
 
+    def check_health(self) -> None:
+        """Delegate an optional pre-action hardware health check under the I/O lock."""
+        with self._lock:
+            check = getattr(self._robot, "check_health", None)
+            if check is not None:
+                check()
+
     # -- Read-only proxies (no lock needed) -----------------------------------
 
     @property

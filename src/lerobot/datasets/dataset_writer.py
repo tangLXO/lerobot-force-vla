@@ -644,6 +644,15 @@ class DatasetWriter:
             self._pq_writer.close()
             self._pq_writer = None
 
+    def seal_episode_artifacts(self) -> None:
+        """Make the latest episode crash-durable and rotate append-only files."""
+        self.close_writer()
+        self._latest_episode = None
+        self._meta.seal_episode_artifacts()
+        if self._streaming_encoder is None and self._episodes_since_last_encoding > 0:
+            self.flush_pending_videos()
+            self._episodes_since_last_encoding = 0
+
     def flush_pending_videos(self) -> None:
         """Flush any pending video encoding (streaming or batch).
 

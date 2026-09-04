@@ -21,6 +21,7 @@
 """
 
 import abc
+import math
 from dataclasses import dataclass
 
 import draccus  # type: ignore  # TODO: add type stubs for draccus
@@ -35,8 +36,80 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
     ``ChoiceRegistry`` 使命令行和配置文件能够通过 ``type`` 选择具体配置类。
     """
 
-    # 传感器的目标采样频率；事件驱动或无需固定频率的设备可保持为 None。
     sample_rate_hz: float | None = None
+    expected_sample_rate_hz: float | None = None
+    max_age_ms: float | None = None
+    history_duration_s: float = 2.0
+    startup_timeout_s: float = 5.0
+    required: bool = True
+    state_features: list[str] | None = None
+    recorder_queue_duration_s: float = 2.0
+    recorder_queue_capacity: int | None = None
+    record_native_values: bool = True
+    record_native_payload: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate static timing, queue, and state-selection settings."""
+        for name in ("sample_rate_hz", "expected_sample_rate_hz"):
+            value = getattr(self, name)
+            if value is not None:
+                self._positive_number(name, value)
+        if self.max_age_ms is not None:
+            self._positive_number("max_age_ms", self.max_age_ms)
+        self._positive_number("history_duration_s", self.history_duration_s)
+        self._positive_number("startup_timeout_s", self.startup_timeout_s)
+        self._positive_number("recorder_queue_duration_s", self.recorder_queue_duration_s)
+        if self.recorder_queue_capacity is not None and (
+            type(self.recorder_queue_capacity) is not int or self.recorder_queue_capacity <= 0
+        ):
+            raise ValueError("recorder_queue_capacity must be a positive integer or None.")
+        if self.state_features is not None:
+            if any(not isinstance(name, str) or not name for name in self.state_features):
+                raise ValueError("state_features entries must be non-empty relative feature paths.")
+            if len(self.state_features) != len(set(self.state_features)):
+                raise ValueError("state_features must not contain duplicates.")
+            if self.state_features and not self.required:
+                raise ValueError("A sensor contributing state_features must be required.")
+        elif not self.required:
+            raise ValueError("state_features=None selects all features, so the sensor must be required.")
+
+    def static_sample_rate_hz(self) -> float | None:
+        """Return the pre-connection rate usable for static resolution."""
+        return self.expected_sample_rate_hz or self.sample_rate_hz
+
+    def resolve_max_age_ms(self, *, state_features_present: bool) -> float | None:
+        """Resolve the immutable current/window staleness threshold."""
+        if self.max_age_ms is not None:
+            return self.max_age_ms
+        rate_hz = self.static_sample_rate_hz()
+        if rate_hz is not None:
+            return float(math.ceil(3000.0 / rate_hz))
+        if state_features_present:
+            raise ValueError(
+                "A sensor contributing observation.state requires max_age_ms or a static sample rate."
+            )
+        return None
+
+    def resolve_recorder_queue_capacity(self) -> int:
+        """Resolve a bounded recorder queue before hardware connection."""
+        if self.recorder_queue_capacity is not None:
+            return self.recorder_queue_capacity
+        rate_hz = self.static_sample_rate_hz()
+        if rate_hz is None:
+            raise ValueError(
+                "Sensor recording requires recorder_queue_capacity or a static expected/sample rate."
+            )
+        return max(1, math.ceil(self.recorder_queue_duration_s * rate_hz))
+
+    @staticmethod
+    def _positive_number(name: str, value: float) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be a finite number greater than zero.")
 
     @property
     def type(self) -> str:

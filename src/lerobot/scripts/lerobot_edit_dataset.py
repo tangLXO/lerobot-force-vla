@@ -842,9 +842,33 @@ def _validate_config(cfg: EditDatasetConfig) -> None:
             )
 
 
+def _reject_local_sensor_sidecar_edits(cfg: EditDatasetConfig) -> None:
+    """Fail before copying or rewriting a local phase-one Sensor Dataset."""
+    if isinstance(cfg.operation, InfoConfig):
+        return
+    if isinstance(cfg.operation, MergeConfig):
+        repo_ids = cfg.operation.repo_ids or []
+        roots = cfg.operation.roots or [None] * len(repo_ids)
+        input_roots = [
+            (Path(root) if root else HF_LEROBOT_HOME / repo_id).resolve()
+            for repo_id, root in zip(repo_ids, roots, strict=True)
+        ]
+    elif cfg.repo_id is not None:
+        input_roots = [(Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()]
+    else:
+        input_roots = []
+    sidecar_roots = [root for root in input_roots if (root / "meta" / "sensor_streams.json").exists()]
+    if sidecar_roots:
+        raise ValueError(
+            "Dataset edit refused: phase one does not maintain Sensor Sidecars for mutating "
+            f"operations ({sidecar_roots}). Read-only info remains supported."
+        )
+
+
 @parser.wrap()
 def edit_dataset(cfg: EditDatasetConfig) -> None:
     _validate_config(cfg)
+    _reject_local_sensor_sidecar_edits(cfg)
     operation_type = cfg.operation.type
 
     if operation_type == "delete_episodes":

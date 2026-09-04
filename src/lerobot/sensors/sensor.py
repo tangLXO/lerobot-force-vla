@@ -1,97 +1,119 @@
 #!/usr/bin/env python
 
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""Core contracts for non-visual physical sensors.
+"""Core contracts and publication machinery for non-visual sensors."""
 
-本模块定义“传感器硬件到标准化样本”的边界，不包含机器人控制、策略、
-数据集写入或任何具体硬件协议。
-"""
+from __future__ import annotations
 
 import abc
-from dataclasses import dataclass
+import math
+import queue
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
+from lerobot.utils.errors import DeviceNotConnectedError
+
+from .buffer import HistoryBuffer
 from .configs import SensorConfig
 
 
 @dataclass(frozen=True)
+class SensorFeature:
+    """Schema for one scalar semantic or native sensor value."""
+
+    dtype: str | np.dtype
+    unit: str
+    shape: tuple[()] = ()
+
+    def __post_init__(self) -> None:
+        """Normalize and validate the phase-one scalar schema."""
+        dtype = np.dtype(self.dtype)
+        if dtype.kind not in "biuf":
+            raise ValueError(f"SensorFeature dtype must be a numeric NumPy dtype, got {dtype}.")
+        if self.shape != ():
+            raise ValueError("Phase-one SensorFeature values must be scalar (shape=()).")
+        if not isinstance(self.unit, str) or not self.unit:
+            raise ValueError("SensorFeature unit must be a non-empty string.")
+        object.__setattr__(self, "dtype", dtype.name)
+
+
+@dataclass(frozen=True)
 class SensorSample:
-    """A timestamped, ordered sample produced by a sensor.
+    """One acquisition attempt in the canonical host-monotonic clock domain."""
 
-    The keys in ``values`` must match the keys exposed by the sensor's
-    :attr:`Sensor.features` property.
-
-    中文说明：一个 ``SensorSample`` 表示传感器的一次完整采样。它与
-    ``RobotObservation`` 不同：前者保留传感器自己的采样时间和顺序，后者
-    是机器人主循环在某个时刻组装出的整帧观测。冻结 dataclass 可以避免
-    样本进入缓冲区后被意外替换时间戳、序号或有效性标志。
-    """
-
-    # 时间戳和序号属于单个传感器的采样域，供后续缓冲与时间对齐使用。
     timestamp_ns: int
     sequence: int
-    # values 使用硬件无关的语义键；硬件型号和通道号只保留在配置或溯源信息中。
-    values: dict[str, Any]
+    values: dict[str, Any] = field(default_factory=dict)
+    arrival_timestamp_ns: int | None = None
+    native_values: dict[str, Any] | None = None
+    native_payload: bytes | None = None
+    hardware_timestamp_ns: int | None = None
+    hardware_sequence: int | None = None
     is_valid: bool = True
+    status: str = "ok"
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize arrival time and enforce auditable invalid-sample status."""
+        if self.arrival_timestamp_ns is None:
+            object.__setattr__(self, "arrival_timestamp_ns", self.timestamp_ns)
+        if not isinstance(self.status, str) or not self.status:
+            raise ValueError("SensorSample status must be a non-empty string.")
+        if self.is_valid and self.error is not None:
+            raise ValueError("A valid SensorSample cannot contain an error.")
+        if not self.is_valid and (self.status == "ok" or not isinstance(self.error, str) or not self.error):
+            raise ValueError("An invalid SensorSample must retain a non-ok status and error message.")
+
+
+@dataclass
+class SensorSubscription:
+    """Independent bounded queue for one native-rate sample consumer."""
+
+    id: str
+    queue: queue.Queue[SensorSample]
+    overflowed: bool = False
+    overflow_count: int = 0
+    closed: bool = False
+
+    def get(self, timeout: float | None = None) -> SensorSample:
+        """Get the next queued native-rate sample."""
+        return self.queue.get(timeout=timeout)
+
+    def get_nowait(self) -> SensorSample:
+        """Get the next sample without blocking."""
+        return self.queue.get_nowait()
 
 
 class Sensor(abc.ABC):
-    """Base class for non-visual physical sensor implementations.
-
-    Concrete sensors own hardware communication and any background acquisition
-    resources. They start those resources in :meth:`connect` and stop them in
-    :meth:`disconnect`.
-
-    中文说明：这是所有非视觉传感器必须实现的最小接口。基类只规定行为，
-    不创建串口、线程或缓冲区。具体驱动负责连接硬件、采样、单位转换，
-    并把结果包装成 ``SensorSample``。
-    """
+    """Base sensor with causal history and decoupled recorder subscriptions."""
 
     def __init__(self, config: SensorConfig):
-        """Initialize common sensor settings from ``config``.
-
-        中文说明：只保存所有传感器共有的目标采样频率。串口、设备地址、
-        校准参数等硬件专属配置应由具体传感器子类自行保存和处理。
-        """
+        """Initialize framework state without touching sensor hardware."""
+        self.config = config
         self.sample_rate_hz = config.sample_rate_hz
+        self._history = HistoryBuffer(config.history_duration_s)
+        self._publication_condition = threading.Condition(threading.RLock())
+        self._next_sequence = 0
+        self._last_consumed_sequence = -1
+        self._subscribers: dict[str, SensorSubscription] = {}
 
     def __enter__(self):
-        """Connect the sensor when entering a context manager.
-
-        中文说明：支持 ``with sensor:`` 用法。进入代码块时自动调用
-        ``connect()``，并返回当前传感器实例。
-        """
+        """Connect the sensor for context-manager use."""
         self.connect()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
-        """Disconnect the sensor when leaving a context manager.
-
-        中文说明：离开 ``with`` 代码块时自动断开设备，即使代码块内部发生
-        异常也会执行资源清理；该方法不吞掉原始异常。
-        """
+        """Disconnect the sensor on context-manager exit."""
         self.disconnect()
 
     def __del__(self) -> None:
-        """Attempt to release connected hardware during garbage collection.
-
-        中文说明：这是忘记显式断开设备时的最后一道安全网。析构时不能保证
-        其他对象仍然可用，所以这里忽略清理异常；正常代码仍应主动调用
-        ``disconnect()`` 或使用上下文管理器。
-        """
+        """Best-effort cleanup when explicit disconnect was omitted."""
         try:
             if self.is_connected:
                 self.disconnect()
@@ -100,78 +122,234 @@ class Sensor(abc.ABC):
 
     @property
     @abc.abstractmethod
-    def features(self) -> dict[str, type]:
-        """Describe the semantic scalar values produced by this sensor.
+    def features(self) -> dict[str, SensorFeature]:
+        """Disconnected-safe relative semantic feature schema."""
 
-        Keys follow ``<modality>.<location_path>.<quantity>`` and must not
-        contain hardware model, transport, or unit names. Physical values use
-        SI units. This property must be available while disconnected.
+    @property
+    def native_features(self) -> dict[str, SensorFeature]:
+        """Return the optional device-native value schema."""
+        return {}
 
-        中文说明：返回“语义名称到 Python 标量类型”的映射，例如
-        ``{"tactile.gripper.left_finger.normal_force": float}``。这里描述的是
-        传感器将产生什么数据，而不是读取数据，因此断连时也必须可用。
-        """
-        # feature 描述不能依赖连接状态，以便录制流程在连接硬件前构建数据结构。
-        pass
+    @property
+    def provenance(self) -> dict[str, Any]:
+        """Return episode-level driver provenance."""
+        return {"driver": f"{type(self).__module__}.{type(self).__name__}"}
 
     @property
     @abc.abstractmethod
     def is_connected(self) -> bool:
-        """Return whether the sensor is connected and ready to acquire data.
-
-        中文说明：具体驱动应根据真实硬件资源判断连接状态，而不是仅记录
-        用户是否调用过 ``connect()``。读取方法可据此抛出标准的未连接异常。
-        """
-        pass
+        """Whether hardware acquisition is active."""
 
     @abc.abstractmethod
     def connect(self) -> None:
-        """Connect to the sensor and start any background acquisition resources.
-
-        中文说明：负责打开硬件连接、应用必要配置，并启动具体驱动所需的
-        后台采样线程。连接过程部分失败时，驱动也应清理已经创建的资源。
-        """
-        # 如具体驱动需要后台采样线程，由 connect() 创建并由 disconnect() 回收。
-        pass
-
-    @abc.abstractmethod
-    def read(self) -> SensorSample:
-        """Wait for and return a fresh sensor sample.
-
-        中文说明：同步等待一个新样本，适合调用方希望采样节奏跟随传感器的
-        场景。返回完整 ``SensorSample``，而不是只返回数值字典。
-        """
-        pass
-
-    @abc.abstractmethod
-    def async_read(self, timeout_ms: float = 200) -> SensorSample:
-        """Return the newest unconsumed sample, waiting up to ``timeout_ms``.
-
-        中文说明：名称与 Camera API 保持一致；它是普通阻塞函数，不是
-        ``async def`` 协程。方法从后台采样结果中取得最新的“未消费”样本；
-        在超时时间内没有新样本时应抛出 ``TimeoutError``。
-        """
-        # 该接口等待“新样本”，与下面非消费式读取当前缓存的 read_latest() 不同。
-        pass
-
-    @abc.abstractmethod
-    def read_latest(self, max_age_ms: int = 500) -> SensorSample:
-        """Return the latest sample without consuming it.
-
-        Implementations raise :class:`TimeoutError` when the latest sample is
-        older than ``max_age_ms``.
-
-        中文说明：立即查看缓存中最新的样本，不等待新数据，也不把样本标记
-        为已消费，适合传感器频率高于机器人主循环的场景。尚无样本时应抛出
-        ``RuntimeError``；样本超过允许年龄时应抛出 ``TimeoutError``。
-        """
-        pass
+        """Connect hardware and start its background acquisition reader."""
 
     @abc.abstractmethod
     def disconnect(self) -> None:
-        """Stop acquisition and release sensor resources.
+        """Stop acquisition and release hardware resources."""
 
-        中文说明：先通知后台采样停止并等待其退出，再关闭串口或其他硬件
-        句柄，使 ``is_connected`` 恢复为 ``False``。
-        """
-        pass
+    def _publish_sample(
+        self,
+        values: dict[str, Any] | None,
+        timestamp_ns: int,
+        *,
+        arrival_timestamp_ns: int | None = None,
+        native_values: dict[str, Any] | None = None,
+        native_payload: bytes | None = None,
+        hardware_timestamp_ns: int | None = None,
+        hardware_sequence: int | None = None,
+        is_valid: bool = True,
+        status: str = "ok",
+        error: str | None = None,
+    ) -> SensorSample:
+        """Validate, sequence, retain, and fan out one acquisition attempt."""
+        if arrival_timestamp_ns is None:
+            arrival_timestamp_ns = time.perf_counter_ns()
+        semantic_values = {} if values is None else dict(values)
+        if is_valid:
+            expected = set(self.features)
+            actual = set(semantic_values)
+            if actual != expected:
+                raise ValueError(
+                    f"Valid sample values must exactly match semantic schema; missing={sorted(expected - actual)}, "
+                    f"unexpected={sorted(actual - expected)}."
+                )
+            self._validate_values(semantic_values, self.features, "semantic")
+            if error is not None:
+                raise ValueError("A valid SensorSample cannot contain an error.")
+        else:
+            unexpected = set(semantic_values) - set(self.features)
+            if unexpected:
+                raise ValueError(f"Unknown semantic sensor values: {sorted(unexpected)}.")
+            self._validate_values(semantic_values, self.features, "semantic")
+        if native_values is not None:
+            unexpected_native = set(native_values) - set(self.native_features)
+            if unexpected_native:
+                raise ValueError(f"Unknown native sensor values: {sorted(unexpected_native)}.")
+            self._validate_values(native_values, self.native_features, "native")
+        if native_payload is not None and not isinstance(native_payload, bytes):
+            raise TypeError("native_payload must be bytes or None.")
+
+        with self._publication_condition:
+            sample = SensorSample(
+                timestamp_ns=int(timestamp_ns),
+                arrival_timestamp_ns=int(arrival_timestamp_ns),
+                sequence=self._next_sequence,
+                hardware_timestamp_ns=hardware_timestamp_ns,
+                hardware_sequence=hardware_sequence,
+                values=semantic_values,
+                native_values=dict(native_values) if native_values is not None else None,
+                native_payload=native_payload,
+                is_valid=is_valid,
+                status=status,
+                error=error,
+            )
+            self._next_sequence += 1
+            self._history.append(sample)
+            for subscription in tuple(self._subscribers.values()):
+                if subscription.closed:
+                    continue
+                try:
+                    subscription.queue.put_nowait(sample)
+                except queue.Full:
+                    subscription.overflowed = True
+                    subscription.overflow_count += 1
+            self._publication_condition.notify_all()
+        return sample
+
+    @staticmethod
+    def _validate_values(values: dict[str, Any], schema: dict[str, SensorFeature], label: str) -> None:
+        for key, value in values.items():
+            if isinstance(value, np.ndarray) and value.shape != ():
+                raise ValueError(f"{label} value {key!r} must be scalar.")
+            try:
+                converted = np.asarray(value, dtype=np.dtype(schema[key].dtype))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"{label} value {key!r} is incompatible with dtype {schema[key].dtype}."
+                ) from exc
+            if converted.shape != ():
+                raise ValueError(f"{label} value {key!r} must be scalar.")
+
+    def subscribe(self, capacity: int) -> SensorSubscription:
+        """Create an independent bounded native-rate subscriber queue."""
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("Sensor subscription capacity must be a positive integer.")
+        subscription = SensorSubscription(id=str(uuid.uuid4()), queue=queue.Queue(maxsize=capacity))
+        with self._publication_condition:
+            self._subscribers[subscription.id] = subscription
+        return subscription
+
+    def unsubscribe(self, subscription: SensorSubscription) -> None:
+        """Remove a subscriber reference and mark it closed."""
+        with self._publication_condition:
+            removed = self._subscribers.pop(subscription.id, None)
+            if removed is not None:
+                removed.closed = True
+
+    @property
+    def subscriber_count(self) -> int:
+        """Return the number of active subscriber queues."""
+        with self._publication_condition:
+            return len(self._subscribers)
+
+    @property
+    def has_subscriber_overflow(self) -> bool:
+        """Whether any active subscriber has irrecoverably lost a sample."""
+        with self._publication_condition:
+            return any(subscription.overflowed for subscription in self._subscribers.values())
+
+    def read(self) -> SensorSample:
+        """Wait indefinitely for the next valid sample."""
+        with self._publication_condition:
+            self._require_active()
+            samples = self._history.snapshot()
+            baseline = samples[-1].sequence if samples else -1
+            while True:
+                self._publication_condition.wait()
+                self._require_active()
+                samples = self._history.snapshot()
+                if samples and samples[-1].sequence > baseline:
+                    self._last_consumed_sequence = samples[-1].sequence
+                    if samples[-1].is_valid:
+                        return samples[-1]
+                    baseline = samples[-1].sequence
+
+    def async_read(self, timeout_ms: float = 200) -> SensorSample:
+        """Return the newest unconsumed valid sample within a timeout."""
+        self._validate_finite_number("timeout_ms", timeout_ms, allow_zero=True)
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        with self._publication_condition:
+            self._require_active()
+            while True:
+                samples = self._history.snapshot()
+                if samples and samples[-1].sequence > self._last_consumed_sequence:
+                    sample = samples[-1]
+                    self._last_consumed_sequence = sample.sequence
+                    if sample.is_valid:
+                        return sample
+                remaining_s = deadline - time.perf_counter()
+                if remaining_s <= 0:
+                    label = type(self).__name__.removesuffix("Sensor")
+                    raise TimeoutError(f"Timed out waiting for a new {label} sample.")
+                self._publication_condition.wait(timeout=remaining_s)
+                self._require_active()
+
+    def read_latest(self, max_age_ms: float | None = 500) -> SensorSample:
+        """Return the current valid sample using the caller's current time."""
+        from .synchronization import SensorDataUnavailableError
+
+        label = type(self).__name__.removesuffix("Sensor")
+        if max_age_ms is not None:
+            if (
+                isinstance(max_age_ms, bool)
+                or not isinstance(max_age_ms, int | float)
+                or not math.isfinite(max_age_ms)
+            ):
+                raise ValueError("max_age_ms must be a finite number or None.")
+            if max_age_ms < 0:
+                raise TimeoutError(f"Latest {label} sample exceeds max_age_ms={max_age_ms:g}.")
+        try:
+            return self.read_latest_before(time.perf_counter_ns(), max_age_ms=max_age_ms)
+        except SensorDataUnavailableError as exc:
+            raise TimeoutError(f"Latest {label} sample is unavailable or stale.") from exc
+
+    def read_latest_before(self, target_timestamp_ns: int, max_age_ms: float | None = None) -> SensorSample:
+        """Select the newest causal valid sample at a fixed target time."""
+        from .synchronization import SensorDataUnavailableError, latest_causal_sample
+
+        self._require_active()
+        samples = self._history.snapshot()
+        if not samples:
+            raise RuntimeError(f"{type(self).__name__} has not produced a sample yet.")
+        if max_age_ms is None:
+            selected = self.features if self.config.state_features is None else self.config.state_features
+            max_age_ms = self.config.resolve_max_age_ms(state_features_present=bool(selected))
+        else:
+            self._validate_finite_number("max_age_ms", max_age_ms, allow_zero=True)
+        sample = latest_causal_sample(samples, target_timestamp_ns, max_age_ms)
+        if sample is None:
+            raise SensorDataUnavailableError(
+                f"{type(self).__name__} has no valid causal sample at {target_timestamp_ns}."
+            )
+        return sample
+
+    def read_window(self, start_timestamp_ns: int, end_timestamp_ns: int) -> tuple[SensorSample, ...]:
+        """Return raw causal records in ``(start, end]`` from short history."""
+        from .synchronization import causal_samples_in_interval
+
+        self._require_active()
+        if start_timestamp_ns > end_timestamp_ns:
+            raise ValueError("Window start_timestamp_ns must not exceed end_timestamp_ns.")
+        return causal_samples_in_interval(self._history.snapshot(), start_timestamp_ns, end_timestamp_ns)
+
+    def _require_active(self) -> None:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{type(self).__name__} is not connected.")
+
+    @staticmethod
+    def _validate_finite_number(name: str, value: float, *, allow_zero: bool) -> None:
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number.")
+        if value < 0 or (not allow_zero and value == 0):
+            raise ValueError(f"{name} must be {'non-negative' if allow_zero else 'positive'}.")

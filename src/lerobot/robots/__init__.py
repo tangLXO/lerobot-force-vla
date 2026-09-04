@@ -16,6 +16,7 @@
 
 from .config import RobotConfig
 from .robot import Robot
+from .sensorized_robot import SensorizedRobot, attach_sensors
 from .utils import make_robot_from_config
 
-__all__ = ["Robot", "RobotConfig", "make_robot_from_config"]
+__all__ = ["Robot", "RobotConfig", "SensorizedRobot", "attach_sensors", "make_robot_from_config"]

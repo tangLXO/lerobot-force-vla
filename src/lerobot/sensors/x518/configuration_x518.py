@@ -25,9 +25,10 @@ from dataclasses import dataclass
 
 from ..configs import SensorConfig
 
-_FEATURE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){2,}$")
+_FEATURE_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _HARDWARE_FEATURE_TOKEN_PATTERN = re.compile(r"(?:x518|ch_?\d+|channel_?\d+)")
 _UNIT_BEARING_QUANTITIES = frozenset({"force_n", "torque_nm", "distance_mm"})
+_QUALIFIED_FEATURE_PREFIXES = frozenset({"sensor", "tactile"})
 _SUPPORTED_UNITS = frozenset({"t", "kg", "g", "kN", "N", "lb"})
 
 
@@ -74,6 +75,7 @@ class X518SensorConfig(SensorConfig):
 
         中文说明：在联网前一次性检查全部配置，避免后台线程启动后才暴露参数错误。
         """
+        super().__post_init__()
         if not isinstance(self.host, str) or not self.host.strip():
             raise ValueError("X518 host must be a non-empty string.")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
@@ -110,12 +112,13 @@ class X518SensorConfig(SensorConfig):
                 isinstance(feature_name, str)
                 and _FEATURE_NAME_PATTERN.fullmatch(feature_name) is not None
                 and not any(_HARDWARE_FEATURE_TOKEN_PATTERN.fullmatch(token) for token in tokens)
+                and tokens[0] not in _QUALIFIED_FEATURE_PREFIXES
                 and tokens[-1] not in _UNIT_BEARING_QUANTITIES
             )
             if not is_semantic_name:
                 raise ValueError(
-                    "X518 feature names must follow "
-                    f"'<modality>.<location_path>.<quantity>' using lowercase snake_case; got {feature_name!r}."
+                    "X518 feature names must follow relative semantic paths with at least two "
+                    f"lowercase snake_case components; got {feature_name!r}."
                 )
             if not isinstance(channel_config, X518ChannelConfig):
                 raise TypeError(

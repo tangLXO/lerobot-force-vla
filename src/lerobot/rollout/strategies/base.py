@@ -22,7 +22,7 @@ import time
 from lerobot.utils.cycle_timer import CycleTimer
 
 from ..context import RolloutContext
-from .core import RolloutStrategy, send_next_action
+from .core import RolloutStrategy, send_next_action, sensor_safe_observation
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,6 @@ class BaseStrategy(RolloutStrategy):
         """Run the autonomous control loop until shutdown or duration expires."""
         engine = self._engine
         cfg = ctx.runtime.cfg
-        robot = ctx.hardware.robot_wrapper
         interpolator = self._interpolator
 
         timer = CycleTimer(
@@ -66,7 +65,7 @@ class BaseStrategy(RolloutStrategy):
                     break
 
                 with timer.section("observe"):
-                    obs = robot.get_observation()
+                    obs = sensor_safe_observation(ctx)
                 with timer.section("process_obs"):
                     obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -92,5 +91,6 @@ class BaseStrategy(RolloutStrategy):
         self._teardown_hardware(
             ctx.hardware,
             return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            sensor_recorder=getattr(ctx.data, "sensor_recorder", None),
         )
         logger.info("Base strategy teardown complete")

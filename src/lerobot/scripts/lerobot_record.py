@@ -91,7 +91,7 @@ lerobot-record \\
 
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pprint import pformat
 
 from lerobot.cameras import CameraConfig  # noqa: F401
@@ -109,6 +109,7 @@ from lerobot.datasets import (
     create_initial_features,
     safe_stop_image_writer,
 )
+from lerobot.datasets.sensor_stream import SensorStreamRecorder
 from lerobot.processor import (
     RobotAction,
     RobotObservation,
@@ -118,6 +119,8 @@ from lerobot.processor import (
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    SensorizedRobot,
+    attach_sensors,
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
@@ -132,6 +135,8 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
+from lerobot.sensors import SensorConfig
+from lerobot.sensors.x518 import X518SensorConfig  # noqa: F401
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -171,6 +176,7 @@ from lerobot.utils.visualization_utils import (
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
+    sensors: dict[str, SensorConfig] = field(default_factory=dict)
     # Teleoperator to control the robot (required)
     teleop: TeleoperatorConfig | None = None
     # Display all cameras on screen
@@ -239,6 +245,7 @@ def record_loop(
         RobotObservation, RobotObservation
     ],  # runs after robot
     dataset: LeRobotDataset | None = None,
+    sensor_recorder: SensorStreamRecorder | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
@@ -362,6 +369,10 @@ def record_loop(
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
                 dataset.add_frame(frame)
+                if sensor_recorder is not None:
+                    if not isinstance(robot, SensorizedRobot) or robot.last_capture_metadata is None:
+                        raise RuntimeError("Sensor recorder requires SensorizedRobot capture metadata.")
+                    sensor_recorder.record_sync(None, robot.last_capture_metadata)
 
         if display_data:
             with timer.section("telemetry"):
@@ -396,7 +407,7 @@ def record(
         else cfg.display_compressed_images
     )
 
-    robot = make_robot_from_config(cfg.robot)
+    robot = attach_sensors(make_robot_from_config(cfg.robot), cfg.sensors)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
@@ -426,6 +437,7 @@ def record(
     )
 
     dataset = None
+    sensor_recorder = None
     listener = None
     # One timer for the whole session, so its statistics describe the recording rather
     # than one episode's slice of it.  The reset phases below deliberately run on their
@@ -477,6 +489,9 @@ def record(
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
+        if isinstance(robot, SensorizedRobot):
+            sensor_recorder = SensorStreamRecorder(dataset.root, robot.sensors)
+
         # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
         # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
         if teleop is not None:
@@ -495,22 +510,33 @@ def record(
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    teleop=teleop,
-                    dataset=dataset,
-                    control_time_s=cfg.dataset.episode_time_s,
-                    single_task=cfg.dataset.single_task,
-                    display_data=cfg.display_data,
-                    display_mode=cfg.display_mode,
-                    display_compressed_images=display_compressed_images,
-                    timer=timer,
-                )
+                if sensor_recorder is not None:
+                    sensor_recorder.start_episode(episode_index)
+                try:
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=cfg.dataset.fps,
+                        teleop_action_processor=teleop_action_processor,
+                        robot_action_processor=robot_action_processor,
+                        robot_observation_processor=robot_observation_processor,
+                        teleop=teleop,
+                        dataset=dataset,
+                        sensor_recorder=sensor_recorder,
+                        control_time_s=cfg.dataset.episode_time_s,
+                        single_task=cfg.dataset.single_task,
+                        display_data=cfg.display_data,
+                        display_mode=cfg.display_mode,
+                        display_compressed_images=display_compressed_images,
+                        timer=timer,
+                    )
+                    if sensor_recorder is not None:
+                        sensor_recorder.prepare_episode(task_info=[cfg.dataset.single_task])
+                except Exception:
+                    dataset.clear_episode_buffer()
+                    if sensor_recorder is not None:
+                        sensor_recorder.abort_episode("Recording failed before main save.")
+                    raise
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
@@ -539,11 +565,16 @@ def record(
                     events["rerecord_episode"] = False
                     events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    if sensor_recorder is not None:
+                        sensor_recorder.abort_prepared("Episode was explicitly re-recorded.")
                     timer.log_episode_summary("discarded episode")
                     timer.restart()
                     continue
 
-                dataset.save_episode()
+                if sensor_recorder is not None:
+                    sensor_recorder.commit_prepared(dataset)
+                else:
+                    dataset.save_episode()
                 recorded_episodes += 1
                 # Close the window on the episode just saved.  The digest is emitted on
                 # the next episode's first tick, so the reset phase, `save_episode` and
@@ -559,10 +590,16 @@ def record(
 
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
+        if sensor_recorder is not None:
+            sensor_recorder.close()
+
         if dataset:
             dataset.finalize()
 
-        if robot.is_connected:
+        if isinstance(robot, SensorizedRobot):
+            if robot.inner.is_connected or any(sensor.is_connected for sensor in robot.sensors.values()):
+                robot.disconnect()
+        elif robot.is_connected:
             robot.disconnect()
         if teleop and teleop.is_connected:
             teleop.disconnect()
