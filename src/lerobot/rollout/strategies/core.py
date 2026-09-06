@@ -456,7 +456,7 @@ def sensor_safe_observation(ctx: RolloutContext) -> dict:
         and not recorder.has_prepared_episode
     ):
         try:
-            recorder.start_episode(dataset.num_episodes)
+            recorder.start_episode(dataset.num_episodes, dataset=dataset)
             recorder.wait_until_ready()
         except SENSOR_FATAL_ERRORS as exc:
             strategy = getattr(ctx.runtime, "active_strategy", None)

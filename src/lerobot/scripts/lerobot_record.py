@@ -511,7 +511,7 @@ def record(
                 episode_index = dataset.num_episodes
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
                 if sensor_recorder is not None:
-                    sensor_recorder.start_episode(episode_index)
+                    sensor_recorder.start_episode(episode_index, dataset=dataset)
                 try:
                     if sensor_recorder is not None:
                         sensor_recorder.wait_until_ready()

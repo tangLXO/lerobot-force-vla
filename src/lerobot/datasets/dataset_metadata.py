@@ -171,6 +171,7 @@ class LeRobotDatasetMetadata:
 
         if not self._pq_writer:
             path = Path(self.root / DEFAULT_EPISODES_PATH.format(chunk_index=chunk_idx, file_index=file_idx))
+            self._register_sensor_artifact(path, "episode_metadata")
             path.parent.mkdir(parents=True, exist_ok=True)
             self._pq_writer = pq.ParquetWriter(
                 path, schema=table.schema, compression="snappy", use_dictionary=True
@@ -197,10 +198,16 @@ class LeRobotDatasetMetadata:
             self._pq_writer = None
 
     def seal_episode_artifacts(self) -> None:
-        """Durably close episode metadata and rotate before the next episode."""
+        """Close episode metadata and retain only its current write position."""
         self._close_writer()
-        self.episodes = load_episodes(self.root)
+        self._sealed_latest_episode = self.latest_episode
+        self.episodes = None  # Rebuild lazily only when a caller explicitly transitions to reading.
         self.latest_episode = None
+
+    def _register_sensor_artifact(self, path: Path, role: str) -> None:
+        transaction = getattr(self, "_sensor_transaction", None)
+        if transaction is not None:
+            transaction.register_artifact(path, role)
 
     def finalize(self) -> None:
         """Flush metadata buffer and close the parquet writer.
@@ -568,6 +575,7 @@ class LeRobotDatasetMetadata:
 
         if len(new_tasks) > 0:
             # Update on disk
+            self._register_sensor_artifact(self.root / "meta/tasks.parquet", "tasks")
             write_tasks(self.tasks, self.root)
 
     def _save_episode_metadata(self, episode_dict: dict) -> None:
@@ -589,12 +597,20 @@ class LeRobotDatasetMetadata:
         if self.latest_episode is None:
             # Initialize indices and frame count for a new dataset made of the first episode data
             chunk_idx, file_idx = 0, 0
-            if self.episodes is not None and len(self.episodes) > 0:
+            sealed = getattr(self, "_sealed_latest_episode", None)
+            previous = (
+                {key: value[0] for key, value in sealed.items()}
+                if sealed is not None
+                else self.episodes[-1]
+                if self.episodes is not None and len(self.episodes) > 0
+                else None
+            )
+            if previous is not None:
                 # It means we are resuming recording, so we need to load the latest episode
                 # Update the indices to avoid overwriting the latest episode
-                chunk_idx = self.episodes[-1]["meta/episodes/chunk_index"]
-                file_idx = self.episodes[-1]["meta/episodes/file_index"]
-                latest_num_frames = self.episodes[-1]["dataset_to_index"]
+                chunk_idx = previous["meta/episodes/chunk_index"]
+                file_idx = previous["meta/episodes/file_index"]
+                latest_num_frames = previous["dataset_to_index"]
                 episode_dict["dataset_from_index"] = [latest_num_frames]
                 episode_dict["dataset_to_index"] = [latest_num_frames + num_frames]
 
@@ -678,9 +694,11 @@ class LeRobotDatasetMetadata:
         self.info.total_tasks = len(self.tasks)
         self.info.splits = {"train": f"0:{self.info.total_episodes}"}
 
+        self._register_sensor_artifact(self.root / "meta/info.json", "info")
         write_info(self.info, self.root)
 
         self.stats = aggregate_stats([self.stats, episode_stats]) if self.stats is not None else episode_stats
+        self._register_sensor_artifact(self.root / "meta/stats.json", "stats")
         write_stats(self.stats, self.root)
 
     def update_video_info(

@@ -89,7 +89,7 @@ def test_raw_and_sync_buffers_are_bounded_independent_of_episode_length(tmp_path
     sync = tmp_path / ".sensor-staging" / uid / "raw/sync" / f"{uid}.parquet"
     assert pq.read_metadata(raw).num_rows == count
     assert pq.read_metadata(sync).num_rows == count
-    assert transaction.journal["journal_version"] == 1
+    assert transaction.journal["journal_version"] == 2
     recorder.abort_prepared("test finished")
     recorder.close()
 
