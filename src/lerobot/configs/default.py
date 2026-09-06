@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 from lerobot.transforms import ImageTransformsConfig
@@ -91,8 +92,16 @@ class DatasetConfig:
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
     sensor_windows: dict[str, SensorWindowConfig] = field(default_factory=dict)
+    sensor_window_cache_mb: float = 64
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.sensor_window_cache_mb, bool)
+            or not isinstance(self.sensor_window_cache_mb, int | float)
+            or not math.isfinite(self.sensor_window_cache_mb)
+            or self.sensor_window_cache_mb < 0
+        ):
+            raise ValueError("sensor_window_cache_mb must be finite and non-negative.")
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
         if self.eval_split != 0.0 and self.streaming:

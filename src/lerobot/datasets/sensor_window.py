@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from contextlib import closing
 from pathlib import Path
@@ -31,6 +32,7 @@ from .sensor_verification import (
     verify_main_readonly,
     verify_sidecar,
 )
+from .sensor_window_cache import SensorRowGroupCache
 from .sensor_window_selection import (
     SensorWindow as SensorWindow,
     candidate_row_groups,
@@ -53,8 +55,13 @@ class SensorStreamReader:
         episode_index: int | None = None,
         episodes: list[int] | None = None,
         verify: str = "fast",
+        cache_mb: float = 64,
     ):
         self.root = Path(root).resolve()
+        finite_number("sensor_window_cache_mb", cache_mb, allow_zero=True)
+        self._cache_limit_bytes = int(cache_mb * 1024 * 1024)
+        self._pid = None
+        self._row_group_cache = None
         if verify not in ("fast", "full"):
             raise ValueError("Sensor verify must be 'fast' or 'full'.")
         self.verify = verify
@@ -84,6 +91,7 @@ class SensorStreamReader:
         self._paths = {}
         self._read_stamps = {}
         self._anchor_cache = OrderedDict()
+        self._ensure_process()
         pending = [
             tx
             for tx in transactions
@@ -220,11 +228,23 @@ class SensorStreamReader:
         return name, uid
 
     def _check_episode_state(self, uid):
+        self._ensure_process()
         check_no_live_writer(self.root)
         if any(file_stamp(path) != stamp for path, stamp in self._read_stamps[uid].items()):
             raise SensorTransactionError(
                 "Dataset changed since Sensor Reader verification; reopen after explicit recovery."
             )
+
+    def _ensure_process(self):
+        if self._pid != os.getpid():
+            self._pid = os.getpid()
+            self._anchor_cache = OrderedDict()
+            self._row_group_cache = SensorRowGroupCache(self._cache_limit_bytes)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.update(_pid=None, _anchor_cache=OrderedDict(), _row_group_cache=None)
+        return state
 
     def _boundary(self, uid, instance):
         transaction = self._transactions[uid]
@@ -252,7 +272,7 @@ class SensorStreamReader:
                 parquet, lower, upper, self._boundary(uid, instance), valid_only=valid_only, ranges=ranges
             )
             for group in groups:
-                for batch in parquet.iter_batches(batch_size=4096, row_groups=[group]):
+                for batch in self._row_group_cache.batches(parquet, uid, instance, group):
                     if any(value != uid for value in batch.column("episode_uid").to_pylist()):
                         raise SensorTransactionError("Raw row belongs to a different episode UID.")
                     yield batch
@@ -400,12 +420,15 @@ class SensorWindowDataset:
         sensor_windows: dict[str, SensorWindowConfig],
         *,
         root: Path | None = None,
+        cache_mb: float = 64,
     ):
         for instance, config in sensor_windows.items():
             if config.target_hz is None:
                 raise ValueError(f"DataLoader sensor window {instance!r} requires a positive target_hz.")
         self.dataset, self.sensor_windows = dataset, sensor_windows
-        self.reader = SensorStreamReader(root or dataset.root, episodes=getattr(dataset, "episodes", None))
+        self.reader = SensorStreamReader(
+            root or dataset.root, episodes=getattr(dataset, "episodes", None), cache_mb=cache_mb
+        )
         for uid in self.reader._committed_uids:
             for instance, config in sensor_windows.items():
                 if instance not in self.reader.manifest["streams"]:
@@ -415,29 +438,44 @@ class SensorWindowDataset:
     def __len__(self):
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        """Attach windows ending at the frame's recorded observation anchor."""
-        item = self.dataset[index]
-        episode_index = int(_scalar(item["episode_index"]))
-        frame_index = int(_scalar(item["frame_index"]))
-        anchor = self.reader.frame_anchor(episode_index, frame_index)
-        item = dict(item)
-        item["sensor_windows"] = {
-            instance: self.reader.get_window(
-                anchor,
-                config.duration_ms,
-                config.target_hz,
-                config.max_age_ms,
-                instance=instance,
-                episode_index=episode_index,
-            ).as_dict()
-            for instance, config in self.sensor_windows.items()
-        }
-        return item
+    def __getitem__(self, index):
+        return self.__getitems__([index])[0]
+
+    def __getitems__(self, indices):
+        indices = list(indices)
+        if not indices:
+            return []
+        check_no_live_writer(self.reader.root)
+        fetch = getattr(self.dataset, "__getitems__", None)
+        base = fetch(indices) if fetch is not None else [self.dataset[index] for index in indices]
+        if len(base) != len(indices):
+            raise ValueError("Base Dataset batch length differs from requested indices.")
+        items = [dict(item, sensor_windows={}) for item in base]
+        grouped = {}
+        for position, item in enumerate(items):
+            episode, frame = int(_scalar(item["episode_index"])), int(_scalar(item["frame_index"]))
+            anchor = self.reader.frame_anchor(episode, frame)
+            grouped.setdefault(episode, []).append((position, anchor))
+        for episode, requests in grouped.items():
+            uid = self.reader._resolve_episode_uid(None, episode)
+            for instance, config in self.sensor_windows.items():
+                windows = self.reader._dense_windows(
+                    [anchor for _, anchor in requests],
+                    config.duration_ms,
+                    config.target_hz,
+                    config.max_age_ms,
+                    instance,
+                    uid,
+                )
+                for (position, _), window in zip(requests, windows, strict=True):
+                    items[position]["sensor_windows"][instance] = window.as_dict()
+        return items
 
     def __getattr__(self, name: str) -> Any:
-        """Delegate Dataset metadata and methods."""
-        return getattr(self.dataset, name)
+        dataset = self.__dict__.get("dataset")
+        if dataset is None:
+            raise AttributeError(name)
+        return getattr(dataset, name)
 
 
 def _scalar(value):

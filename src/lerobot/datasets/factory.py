@@ -103,6 +103,23 @@ def resolve_delta_timestamps(
     return delta_timestamps
 
 
+def _validate_sensor_window_support(cfg):
+    if not cfg.dataset.sensor_windows:
+        return
+    if not getattr(cfg.trainable_config, "supports_sensor_windows", False):
+        raise ValueError(
+            f"Policy {cfg.trainable_config.type!r} does not declare temporal sensor-window support. "
+            "Phase one keeps ACT, pi0, and SmolVLA on observation.state."
+        )
+    if cfg.dataset.streaming:
+        raise ValueError("Sensor windows require a local map-style Dataset; streaming is unsupported.")
+
+
+def _validate_sensor_window_storage(cfg, metadata):
+    if cfg.dataset.sensor_windows and metadata.storage_format != DEFAULT_STORAGE_FORMAT:
+        raise ValueError("Sensor windows require the default local Parquet storage format.")
+
+
 def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
@@ -115,11 +132,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
-    if cfg.dataset.sensor_windows and not getattr(cfg.trainable_config, "supports_sensor_windows", False):
-        raise ValueError(
-            f"Policy {cfg.trainable_config.type!r} does not declare temporal sensor-window support. "
-            "Phase one keeps ACT, pi0, and SmolVLA on observation.state."
-        )
+    _validate_sensor_window_support(cfg)
 
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -134,6 +147,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             revision=cfg.dataset.revision,
             repo_type=cfg.dataset.repo_type,
         )
+        _validate_sensor_window_storage(cfg, ds_meta)
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta, cfg.rename_map)
         episodes = resolve_episode_indices(
             cfg.dataset.episodes, ds_meta.total_episodes, cfg.dataset.exclude_episodes
@@ -200,7 +214,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
     if cfg.dataset.sensor_windows:
-        dataset = SensorWindowDataset(dataset, cfg.dataset.sensor_windows)
+        dataset = SensorWindowDataset(
+            dataset, cfg.dataset.sensor_windows, cache_mb=cfg.dataset.sensor_window_cache_mb
+        )
     return dataset
 
 
@@ -212,16 +228,27 @@ def make_train_eval_datasets(
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
-    full_dataset = make_dataset(cfg)
-
     if cfg.dataset.eval_split == 0.0:
-        return full_dataset, None
+        return make_dataset(cfg), None
 
-    base_episodes = (
-        full_dataset.episodes if full_dataset.episodes is not None else list(range(full_dataset.num_episodes))
+    _validate_sensor_window_support(cfg)
+    if not isinstance(cfg.dataset.repo_id, str):
+        raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")
+    metadata = load_dataset_metadata(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        revision=cfg.dataset.revision,
+        repo_type=cfg.dataset.repo_type,
     )
+    _validate_sensor_window_storage(cfg, metadata)
+    if cfg.dataset.repo_type == "bucket" and metadata.storage_format == DEFAULT_STORAGE_FORMAT:
+        raise ValueError("repo_type='bucket' is streaming-only for the default storage format.")
+    selected = resolve_episode_indices(
+        cfg.dataset.episodes, metadata.total_episodes, cfg.dataset.exclude_episodes
+    )
+    base_episodes = selected if selected is not None else list(range(metadata.total_episodes))
 
-    episode_tasks = full_dataset.meta.episodes["tasks"]
+    episode_tasks = metadata.episodes["tasks"]
     task_to_episodes: dict[str, list[int]] = {}
     for ep_idx in base_episodes:
         task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
@@ -243,7 +270,7 @@ def make_train_eval_datasets(
         f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
     )
 
-    delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta, cfg.rename_map)
+    delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, metadata, cfg.rename_map)
 
     train_image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -278,8 +305,12 @@ def make_train_eval_datasets(
     )
 
     if cfg.dataset.sensor_windows:
-        train_dataset = SensorWindowDataset(train_dataset, cfg.dataset.sensor_windows)
-        eval_dataset = SensorWindowDataset(eval_dataset, cfg.dataset.sensor_windows)
+        train_dataset = SensorWindowDataset(
+            train_dataset, cfg.dataset.sensor_windows, cache_mb=cfg.dataset.sensor_window_cache_mb
+        )
+        eval_dataset = SensorWindowDataset(
+            eval_dataset, cfg.dataset.sensor_windows, cache_mb=cfg.dataset.sensor_window_cache_mb
+        )
 
     if cfg.dataset.use_imagenet_stats:
         for ds in (train_dataset, eval_dataset):
