@@ -28,9 +28,14 @@ def committed_reader(tmp_path, samples):
             status="ok" if valid else "invalid",
             error=None if valid else "simulated failure",
         )
-    end = max(item[0] for item in samples) + 1_000_000
-    recorder.record_sync(0, capture(end, samples[-1][0], len(samples) - 1))
-    recorder.record_sync(1, capture(end, samples[-1][0], len(samples) - 1))
+    end = max(max(item[0], item[1]) for item in samples) + 1_000_000
+    sequence, sample = max(
+        ((i, row) for i, row in enumerate(samples) if row[2]), key=lambda item: (item[1][0], item[0])
+    )
+    metadata = capture(end, sample[0], sequence)
+    metadata["sensors"]["gripper_force"]["arrival_timestamp_ns"] = sample[1]
+    recorder.record_sync(0, metadata)
+    recorder.record_sync(1, metadata)
     recorder.save_episode(FakeDataset(tmp_path))
     recorder.close()
     return SensorStreamReader(tmp_path, instance="gripper_force", episode_index=0), end

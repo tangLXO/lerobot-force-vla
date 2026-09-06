@@ -7,10 +7,14 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import ctypes
 import json
+import math
 import os
 import queue
+import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -19,11 +23,12 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from lerobot.sensors import Sensor, SensorFeature, SensorSubscription
 from lerobot.sensors.sensor import SensorRecorderLease
+from lerobot.utils.errors import DeviceNotConnectedError
 
+from .sensor_spool import SensorParquetSpoolWriter
 from .sensor_transaction import (
     SensorTransaction,
     capture_main_dataset_state,
@@ -182,7 +187,9 @@ class SensorStreamRecorder:
         """Validate the Dataset contract and acquire its single-writer lock."""
         self.root = Path(root)
         self.sensors = sensors
-        for sensor in sensors.values():
+        for instance, sensor in sensors.items():
+            if re.fullmatch(r"[a-z][a-z0-9_]*", instance) is None:
+                raise ValueError(f"Invalid Sensor instance namespace: {instance!r}.")
             sensor.config.resolve_recorder_queue_capacity()
         self._writer_lock = SensorDatasetWriterLock(self.root)
         try:
@@ -200,9 +207,12 @@ class SensorStreamRecorder:
         self._recorder_leases: dict[str, SensorRecorderLease] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stop_event = threading.Event()
-        self._raw_rows: dict[str, list[dict[str, Any]]] = {}
+        self._spools: dict[str, SensorParquetSpoolWriter] = {}
+        self._sync_spool: SensorParquetSpoolWriter | None = None
+        self._sync_queue: queue.Queue = queue.Queue(maxsize=4096)
+        self._sync_count = 0
+        self._accept_sync = False
         self._rows_lock = threading.RLock()
-        self._sync_rows: list[dict[str, Any]] = []
         self._worker_errors: dict[str, BaseException] = {}
         self._transaction: SensorTransaction | None = None
         self._minimum_timestamp_ns: int | None = None
@@ -221,7 +231,7 @@ class SensorStreamRecorder:
     @property
     def has_prepared_episode(self) -> bool:
         """Whether a stopped episode is waiting for main Dataset commit."""
-        return self._transaction is not None
+        return self._transaction is not None and self._transaction.state == "PREPARED"
 
     @property
     def worker_threads(self) -> tuple[threading.Thread, ...]:
@@ -238,22 +248,50 @@ class SensorStreamRecorder:
             raise SensorRecorderError("A PREPARED sensor episode must be committed or aborted first.")
         replay_sensor_transactions(self.root)
         resolved_uid = validate_episode_uid(episode_uid or str(uuid.uuid4()))
-        self._active = True
+        if (self.root / "meta/sensor_transactions" / f"{resolved_uid}.json").exists():
+            raise SensorRecorderError("Sensor episode UID already has a transaction.")
         self._episode_uid = resolved_uid
         self._episode_index = episode_index
         self._episode_start_ns = time.perf_counter_ns()
-        self._main_precondition = capture_main_dataset_state(self.root)
         self._stop_event.clear()
-        self._raw_rows = {instance: [] for instance in self.sensors}
-        self._sync_rows = []
+        self._spools = {}
+        self._sync_spool = None
+        self._sync_count = 0
+        self._sync_queue = queue.Queue(maxsize=4096)
+        self._accept_sync = True
         self._worker_errors = {}
         self._transaction = None
         self._minimum_timestamp_ns = None
         try:
             for instance, sensor in self.sensors.items():
                 self._recorder_leases[instance] = sensor.acquire_recorder()
+            self._active = True
+            self._main_precondition = capture_main_dataset_state(self.root)
+            staging = self.root / ".sensor-staging" / resolved_uid
+            self._sync_spool = SensorParquetSpoolWriter(
+                staging / "spool" / "sync",
+                _sync_arrow_schema(self.sensors),
+                4096,
+                0.5,
+                episode_uid=resolved_uid,
+                instance="__sync__",
+            )
+            sync_thread = threading.Thread(
+                target=self._drain_sync, name="SensorStreamRecorder-Sync", daemon=True
+            )
+            self._threads["__sync__"] = sync_thread
+            sync_thread.start()
             for instance, sensor in self.sensors.items():
+                self._spools[instance] = SensorParquetSpoolWriter(
+                    staging / "spool" / instance,
+                    _raw_arrow_schema(sensor),
+                    sensor.config.recorder_flush_rows,
+                    sensor.config.recorder_flush_interval_s,
+                    episode_uid=resolved_uid,
+                    instance=instance,
+                )
                 subscription = sensor.subscribe(sensor.config.resolve_recorder_queue_capacity())
+                self._recorder_leases[instance].start_sequence = subscription.start_sequence
                 self._subscriptions[instance] = subscription
                 thread = threading.Thread(
                     target=self._drain,
@@ -263,27 +301,68 @@ class SensorStreamRecorder:
                 )
                 self._threads[instance] = thread
                 thread.start()
-        except Exception:
+        except Exception as exc:
             self._stop_workers()
-            self._reset_episode()
+            self._quarantine_failed_episode(exc)
             raise
         return self._episode_uid
 
     def _drain(self, instance: str, subscription: SensorSubscription) -> None:
+        spool = self._spools[instance]
         try:
             while not self._stop_event.is_set() or not subscription.queue.empty():
                 try:
                     sample = subscription.get(timeout=0.05)
                 except queue.Empty:
+                    spool.flush_due()
                     continue
-                with self._rows_lock:
-                    if (
-                        self._minimum_timestamp_ns is None
-                        or sample.timestamp_ns >= self._minimum_timestamp_ns
-                    ):
-                        self._raw_rows[instance].append(self._raw_row(instance, sample))
+                spool.append(self._raw_row(instance, sample))
         except BaseException as exc:  # worker failures must reach the control loop
             self._worker_errors[instance] = exc
+        finally:
+            try:
+                spool.close()
+            except BaseException as exc:
+                self._worker_errors[instance] = exc
+
+    def _drain_sync(self) -> None:
+        try:
+            while not self._stop_event.is_set() or not self._sync_queue.empty():
+                try:
+                    row = self._sync_queue.get(timeout=0.05)
+                except queue.Empty:
+                    self._sync_spool.flush_due()
+                    continue
+                self._sync_spool.append(row)
+        except BaseException as exc:
+            self._worker_errors["__sync__"] = exc
+        finally:
+            try:
+                self._sync_spool.close()
+            except BaseException as exc:
+                self._worker_errors["__sync__"] = exc
+
+    def wait_until_ready(self) -> None:
+        """Wait for a valid causal sample from this episode on every required stream."""
+        pending = {name for name, sensor in self.sensors.items() if sensor.config.required}
+        deadlines = {
+            name: time.perf_counter() + self.sensors[name].config.startup_timeout_s for name in pending
+        }
+        while pending:
+            self.check_health()
+            for name in tuple(pending):
+                sensor = self.sensors[name]
+                try:
+                    sensor.read_latest_before(time.perf_counter_ns())
+                except (RuntimeError, DeviceNotConnectedError):
+                    if time.perf_counter() >= deadlines[name]:
+                        raise SensorRecorderError(
+                            f"Required sensor {name!r} startup timeout for this episode."
+                        ) from None
+                else:
+                    pending.remove(name)
+            if pending:
+                self._stop_event.wait(0.005)
 
     def _raw_row(self, instance: str, sample) -> dict[str, Any]:
         sensor_config = self.sensors[instance].config
@@ -306,26 +385,33 @@ class SensorStreamRecorder:
     def record_sync(self, frame_index: int | None, capture_metadata: dict[str, Any]) -> None:
         """Record synchronization metadata only for a frame handed to add_frame."""
         self.check_health()
-        if not self._active:
+        if not self._active or not self._accept_sync:
             raise SensorRecorderError("No active sensor episode.")
-        expected_frame_index = len(self._sync_rows)
+        expected_frame_index = self._sync_count
         resolved_frame_index = expected_frame_index if frame_index is None else frame_index
         if resolved_frame_index != expected_frame_index:
             raise SensorRecorderError(
                 f"Sensor Sync frame_index must be contiguous: expected {expected_frame_index}, "
                 f"got {resolved_frame_index}."
             )
-        self._sync_rows.append(
-            {
-                "episode_uid": self._episode_uid,
-                "frame_index": resolved_frame_index,
-                "observation_start_ns": capture_metadata["observation_start_ns"],
-                "frame_anchor_ns": capture_metadata["frame_anchor_ns"],
-                "observation_complete_ns": capture_metadata["observation_complete_ns"],
-                "hardware_observation_timestamps": capture_metadata.get("hardware_observation_timestamps"),
-                "sensors": capture_metadata.get("sensors", {}),
-            }
-        )
+        row = {
+            "episode_uid": self._episode_uid,
+            "frame_index": resolved_frame_index,
+            "observation_start_ns": capture_metadata["observation_start_ns"],
+            "frame_anchor_ns": capture_metadata["frame_anchor_ns"],
+            "observation_complete_ns": capture_metadata["observation_complete_ns"],
+            "hardware_observation_timestamps": capture_metadata.get("hardware_observation_timestamps"),
+            "sensors": capture_metadata.get("sensors", {}),
+        }
+        with self._rows_lock:
+            if not self._accept_sync:
+                raise SensorRecorderError("Sensor Sync is stopping.")
+            try:
+                self._sync_queue.put_nowait(copy.deepcopy(row))
+            except queue.Full as exc:
+                self._worker_errors["__sync__"] = exc
+                raise SensorQueueOverflowError("Sensor Sync queue overflowed; episode is invalid.") from exc
+            self._sync_count += 1
 
     def check_health(self) -> None:
         """Raise immediately on worker failure or subscriber overflow."""
@@ -341,34 +427,58 @@ class SensorStreamRecorder:
                 f"Sensor recorder queue overflowed for streams {overflowed}; episode is invalid."
             )
 
-    def trim_before(self, timestamp_ns: int) -> None:
-        """Discard pre-roll raw rows older than a retained Highlight window."""
+    def trim_before(self, timestamp_ns: int, *, max_age_ms: float | None = None) -> None:
+        """Trim only with a known earliest grid and finite age; unknown windows retain Raw."""
         if not self._active:
             raise SensorRecorderError("Cannot trim a sensor recorder without an active episode.")
+        if max_age_ms is None:
+            return
+        if isinstance(max_age_ms, bool) or not math.isfinite(max_age_ms) or max_age_ms < 0:
+            raise ValueError("Safe trim requires finite non-negative max_age_ms.")
         with self._rows_lock:
-            self._minimum_timestamp_ns = timestamp_ns
-            for instance, rows in self._raw_rows.items():
-                self._raw_rows[instance] = [row for row in rows if row["timestamp_ns"] >= timestamp_ns]
+            if self._sync_count:
+                raise SensorRecorderError("Safe trim must precede retained Sync frames.")
+            self._minimum_timestamp_ns = int(timestamp_ns) - int(max_age_ms * 1_000_000)
 
     def prepare_episode(self, *, task_info: Any = None) -> SensorTransaction:
         """Stop workers, write staging artifacts, and persist PREPARED."""
         if not self._active or self._episode_uid is None or self._episode_index is None:
             raise SensorRecorderError("No active sensor episode.")
         self._stop_workers()
+        try:
+            return self._prepare_closed_episode(task_info=task_info)
+        except Exception as exc:
+            if self._episode_uid is not None:
+                self._quarantine_failed_episode(exc)
+            raise
+
+    def _quarantine_failed_episode(self, exc: Exception) -> None:
+        if self._transaction is None:
+            self._transaction = SensorTransaction.prepare(
+                self.root,
+                episode_uid=self._episode_uid,
+                episode_index=self._episode_index,
+                frame_count=self._sync_count,
+                dataset_from_index=int((self._main_precondition or {}).get("total_frames") or 0),
+                files=[],
+                task_info={"failure": str(exc)},
+                main_precondition=self._main_precondition,
+            )
+        self._transaction.quarantine(str(exc))
+        self._reset_episode()
+
+    def _prepare_closed_episode(self, *, task_info: Any) -> SensorTransaction:
         staging_root = self.root / ".sensor-staging" / self._episode_uid
-        if staging_root.exists():
-            raise SensorRecorderError(f"Sensor staging directory already exists: {staging_root}.")
+        self.check_health()
+        self._validate_spools()
         records: list[dict[str, Any]] = []
-        for instance, sensor in self.sensors.items():
+        for instance in self.sensors:
             staging = staging_root / "raw" / "sensors" / instance / f"{self._episode_uid}.parquet"
             final = self.root / self.manifest["storage_layout"]["raw_path_template"].format(
                 instance=instance, episode_uid=self._episode_uid
             )
             staging.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(
-                pa.Table.from_pylist(self._raw_rows[instance], schema=_raw_arrow_schema(sensor)),
-                staging,
-            )
+            self._spools[instance].merge(staging, minimum_timestamp_ns=self._minimum_timestamp_ns)
             records.append(parquet_file_record(self.root, staging, final))
 
         sync_staging = staging_root / "raw" / "sync" / f"{self._episode_uid}.parquet"
@@ -376,9 +486,7 @@ class SensorStreamRecorder:
             episode_uid=self._episode_uid
         )
         sync_staging.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(
-            pa.Table.from_pylist(self._sync_rows, schema=_sync_arrow_schema(self.sensors)), sync_staging
-        )
+        self._sync_spool.merge(sync_staging)
         records.append(parquet_file_record(self.root, sync_staging, sync_final))
 
         metadata = self._episode_metadata()
@@ -389,13 +497,12 @@ class SensorStreamRecorder:
         _atomic_json(metadata_staging, metadata)
         records.append(_generic_file_record(self.root, metadata_staging, metadata_final))
 
-        dataset_from_index = int((self._main_precondition or {}).get("total_frames") or 0)
         transaction = SensorTransaction.prepare(
             self.root,
             episode_uid=self._episode_uid,
             episode_index=self._episode_index,
-            frame_count=len(self._sync_rows),
-            dataset_from_index=dataset_from_index,
+            frame_count=self._sync_count,
+            dataset_from_index=int((self._main_precondition or {}).get("total_frames") or 0),
             files=records,
             task_info=task_info,
             main_precondition=self._main_precondition,
@@ -404,7 +511,10 @@ class SensorStreamRecorder:
         try:
             self.check_health()
         except Exception as exc:
-            transaction.quarantine(str(exc))
+            if any(lease.error is not None for lease in self._recorder_leases.values()):
+                transaction.quarantine(str(exc))
+            else:
+                transaction.abort(str(exc))
             self._reset_episode()
             raise
         self._active = False
@@ -474,6 +584,8 @@ class SensorStreamRecorder:
                 self._closed = True
 
     def _stop_workers(self) -> None:
+        with self._rows_lock:
+            self._accept_sync = False
         for instance, subscription in tuple(self._subscriptions.items()):
             self.sensors[instance].unsubscribe(subscription)
         self._stop_event.set()
@@ -487,6 +599,13 @@ class SensorStreamRecorder:
         for instance, subscription in self._subscriptions.items():
             if not subscription.closed:
                 raise SensorRecorderError(f"Sensor {instance!r} subscription was not removed.")
+        # Also close spools whose thread failed to start (or was replaced in failure tests).
+        for spool in (*self._spools.values(), self._sync_spool):
+            if spool is not None:
+                try:
+                    spool.close()
+                except Exception as exc:
+                    self._worker_errors[str(spool.root)] = exc
 
     def _reset_episode(self) -> None:
         if any(thread.is_alive() for thread in self._threads.values()):
@@ -505,13 +624,15 @@ class SensorStreamRecorder:
     def _episode_metadata(self) -> dict[str, Any]:
         streams: dict[str, Any] = {}
         for instance, sensor in self.sensors.items():
-            rows = self._raw_rows[instance]
-            sequences = [int(row["sequence"]) for row in rows]
-            sequence_gaps = sum(
-                max(0, right - left - 1) for left, right in zip(sequences, sequences[1:], strict=False)
-            )
-            duration_ns = rows[-1]["timestamp_ns"] - rows[0]["timestamp_ns"] if len(rows) > 1 else 0
-            actual_rate = (len(rows) - 1) * 1e9 / duration_ns if duration_ns > 0 else None
+            spool = self._spools[instance]
+            with contextlib.closing(sqlite3.connect(spool.index_path)) as db:
+                count, valid, first, last = db.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(is_valid), 0), MIN(arrival_timestamp_ns), "
+                    "MAX(arrival_timestamp_ns) FROM samples WHERE (? IS NULL OR timestamp_ns >= ?)",
+                    (self._minimum_timestamp_ns, self._minimum_timestamp_ns),
+                ).fetchone()
+            duration_ns = last - first if count > 1 else 0
+            actual_rate = (count - 1) * 1e9 / duration_ns if duration_ns > 0 else None
             streams[instance] = {
                 "provenance": sensor.provenance,
                 "resolved_max_age_ms": sensor.config.resolve_max_age_ms(
@@ -522,10 +643,10 @@ class SensorStreamRecorder:
                     )
                 ),
                 "resolved_recorder_queue_capacity": sensor.config.resolve_recorder_queue_capacity(),
-                "sample_count": len(rows),
-                "valid_count": sum(bool(row["is_valid"]) for row in rows),
-                "invalid_count": sum(not bool(row["is_valid"]) for row in rows),
-                "sequence_gaps": sequence_gaps,
+                "sample_count": count,
+                "valid_count": valid,
+                "invalid_count": count - valid,
+                "sequence_gaps": spool.sequence_gaps,
                 "queue_overflow_count": self._subscriptions[instance].overflow_count,
                 "actual_sample_rate_hz": actual_rate,
             }
@@ -533,9 +654,107 @@ class SensorStreamRecorder:
             "sidecar_schema_version": SIDECAR_SCHEMA_VERSION,
             "episode_uid": self._episode_uid,
             "episode_index": self._episode_index,
-            "frame_count": len(self._sync_rows),
+            "frame_count": self._sync_count,
             "streams": streams,
         }
+
+    def _validate_spools(self) -> None:
+        """Validate bounded batches and exact required Sync references before PREPARED."""
+        with contextlib.ExitStack() as stack:
+            indexes = {
+                name: stack.enter_context(contextlib.closing(sqlite3.connect(spool.index_path)))
+                for name, spool in self._spools.items()
+            }
+            for name, spool in self._spools.items():
+                subscription = self._subscriptions[name]
+                previous = subscription.start_sequence - 1
+                indexed = stack.enter_context(
+                    contextlib.closing(
+                        indexes[name].execute(
+                            "SELECT sequence, timestamp_ns, arrival_timestamp_ns, is_valid, hardware_sequence, status "
+                            "FROM samples ORDER BY sequence"
+                        )
+                    )
+                )
+                for batch in stack.enter_context(contextlib.closing(spool.iter_batches())):
+                    for row in batch.to_pylist():
+                        if row["episode_uid"] != self._episode_uid or row["sequence"] != previous + 1:
+                            raise SensorRecorderError(
+                                f"Sensor {name!r} UID or sequence completeness mismatch."
+                            )
+                        previous = row["sequence"]
+                        expected = tuple(
+                            row[key]
+                            for key in (
+                                "sequence",
+                                "timestamp_ns",
+                                "arrival_timestamp_ns",
+                                "is_valid",
+                                "hardware_sequence",
+                                "status",
+                            )
+                        )
+                        if next(indexed, None) != expected:
+                            raise SensorRecorderError(f"Sensor {name!r} Raw disk reference index mismatch.")
+                if next(indexed, None) is not None:
+                    raise SensorRecorderError(f"Sensor {name!r} Raw disk index contains extra rows.")
+                if not subscription.queue.empty() or previous + 1 != subscription.end_sequence:
+                    raise SensorRecorderError(f"Sensor {name!r} queue did not drain.")
+            frame_count = 0
+            for batch in stack.enter_context(contextlib.closing(self._sync_spool.iter_batches())):
+                for row in batch.to_pylist():
+                    if row["episode_uid"] != self._episode_uid or row["frame_index"] != frame_count:
+                        raise SensorRecorderError("Sensor Sync UID or contiguous frame index mismatch.")
+                    frame_count += 1
+                    anchor = row["frame_anchor_ns"]
+                    if not row["observation_start_ns"] <= anchor <= row["observation_complete_ns"]:
+                        raise SensorRecorderError("Sensor Sync capture timestamps are not ordered.")
+                    for name, sensor in self.sensors.items():
+                        ref = (row["sensors"] or {}).get(name)
+                        if not sensor.config.required:
+                            continue
+                        if ref is None or ref["sequence"] is None:
+                            raise SensorRecorderError(f"Required Sync reference missing for {name!r}.")
+                        raw = (
+                            indexes[name]
+                            .execute(
+                                "SELECT timestamp_ns, arrival_timestamp_ns, is_valid, hardware_sequence, status "
+                                "FROM samples WHERE sequence=?",
+                                (ref["sequence"],),
+                            )
+                            .fetchone()
+                        )
+                        if raw is None or tuple(raw[:2]) != (
+                            ref["timestamp_ns"],
+                            ref["arrival_timestamp_ns"],
+                        ):
+                            raise SensorRecorderError(
+                                f"Required Sync reference does not match episode Raw: {name!r}."
+                            )
+                        timestamp, arrival, valid, hardware_sequence, status = raw
+                        selected = (
+                            sensor.features
+                            if sensor.config.state_features is None
+                            else sensor.config.state_features
+                        )
+                        max_age = sensor.config.resolve_max_age_ms(state_features_present=bool(selected))
+                        if (
+                            not valid
+                            or ref["hardware_sequence"] != hardware_sequence
+                            or ref["status"] != status
+                            or max(timestamp, arrival) > anchor
+                            or (max_age is not None and anchor - timestamp > int(max_age * 1_000_000))
+                            or ref["age_ns"] != anchor - timestamp
+                            or (
+                                self._minimum_timestamp_ns is not None
+                                and timestamp < self._minimum_timestamp_ns
+                            )
+                        ):
+                            raise SensorRecorderError(
+                                f"Required Sync reference is invalid, stale, trimmed or noncausal: {name!r}."
+                            )
+            if frame_count != self._sync_count or not self._sync_queue.empty():
+                raise SensorRecorderError("Sensor Sync queue did not drain completely.")
 
 
 def _arrow_field(name: str, feature: SensorFeature) -> pa.Field:
@@ -544,8 +763,10 @@ def _arrow_field(name: str, feature: SensorFeature) -> pa.Field:
 
 def _raw_arrow_schema(sensor: Sensor) -> pa.Schema:
     values = pa.struct([_arrow_field(name, feature) for name, feature in sensor.features.items()])
-    native_values = pa.struct(
-        [_arrow_field(name, feature) for name, feature in sensor.native_features.items()]
+    native_values = (
+        pa.struct([_arrow_field(name, feature) for name, feature in sensor.native_features.items()])
+        if sensor.native_features
+        else pa.null()
     )
     return pa.schema(
         [

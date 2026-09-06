@@ -513,6 +513,8 @@ def record(
                 if sensor_recorder is not None:
                     sensor_recorder.start_episode(episode_index)
                 try:
+                    if sensor_recorder is not None:
+                        sensor_recorder.wait_until_ready()
                     record_loop(
                         robot=robot,
                         events=events,

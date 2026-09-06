@@ -47,6 +47,8 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
     recorder_queue_capacity: int | None = None
     record_native_values: bool = True
     record_native_payload: bool = False
+    recorder_flush_rows: int = 4096
+    recorder_flush_interval_s: float = 0.5
 
     def __post_init__(self) -> None:
         """Validate static timing, queue, and state-selection settings."""
@@ -59,6 +61,9 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
         self._positive_number("history_duration_s", self.history_duration_s)
         self._positive_number("startup_timeout_s", self.startup_timeout_s)
         self._positive_number("recorder_queue_duration_s", self.recorder_queue_duration_s)
+        self._positive_number("recorder_flush_interval_s", self.recorder_flush_interval_s)
+        if type(self.recorder_flush_rows) is not int or self.recorder_flush_rows <= 0:
+            raise ValueError("recorder_flush_rows must be a positive integer.")
         if self.recorder_queue_capacity is not None and (
             type(self.recorder_queue_capacity) is not int or self.recorder_queue_capacity <= 0
         ):
