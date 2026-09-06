@@ -32,9 +32,9 @@ from lerobot.utils.process import ProcessSignalHandler  # noqa: E402
 def reset_globals_and_handlers():
     # Store original signal handlers
     original_handlers = {
-        sig: signal.getsignal(sig)
-        for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT]
-        if hasattr(signal, sig.name)
+        getattr(signal, name): signal.getsignal(getattr(signal, name))
+        for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
+        if hasattr(signal, name)
     }
 
     yield
@@ -68,11 +68,11 @@ def test_setup_process_handlers_event_with_processes():
         signal.SIGTERM,
         # SIGHUP and SIGQUIT are not reliably available on all platforms (e.g. Windows)
         pytest.param(
-            signal.SIGHUP,
+            getattr(signal, "SIGHUP", None),
             marks=pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP not available"),
         ),
         pytest.param(
-            signal.SIGQUIT,
+            getattr(signal, "SIGQUIT", None),
             marks=pytest.mark.skipif(not hasattr(signal, "SIGQUIT"), reason="SIGQUIT not available"),
         ),
     ],
@@ -84,7 +84,7 @@ def test_signal_handler_sets_event(use_threads, sig):
 
     assert handler.counter == 0
 
-    os.kill(os.getpid(), sig)
+    _emit_signal(sig)
 
     # In some environments, the signal might take a moment to be handled.
     shutdown_event.wait(timeout=1.0)
@@ -101,14 +101,23 @@ def test_force_shutdown_on_second_signal(mock_sys_exit, use_threads):
     """Test that a second signal triggers a force shutdown."""
     handler = ProcessSignalHandler(use_threads=use_threads)
 
-    os.kill(os.getpid(), signal.SIGINT)
+    _emit_signal(signal.SIGINT)
     # Give a moment for the first signal to be processed
     import time
 
     time.sleep(0.1)
-    os.kill(os.getpid(), signal.SIGINT)
+    _emit_signal(signal.SIGINT)
 
     time.sleep(0.1)
 
     assert handler.counter == 2
     mock_sys_exit.assert_called_once_with(1)
+
+
+def _emit_signal(sig):
+    # Windows os.kill(SIGTERM) terminates the process rather than delivering a
+    # catchable POSIX signal. CRT raise_signal exercises the installed local handler.
+    if os.name == "nt":
+        signal.raise_signal(sig)
+    else:
+        os.kill(os.getpid(), sig)

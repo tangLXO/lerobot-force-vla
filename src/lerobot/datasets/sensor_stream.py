@@ -10,6 +10,7 @@ import contextlib
 import copy
 import ctypes
 import json
+import logging
 import math
 import os
 import queue
@@ -25,6 +26,7 @@ import numpy as np
 import pyarrow as pa
 
 from lerobot.sensors import Sensor, SensorFeature, SensorSubscription
+from lerobot.sensors.diagnostics import SensorQueueDiagnostics
 from lerobot.sensors.sensor import SensorRecorderLease
 from lerobot.utils.errors import DeviceNotConnectedError
 
@@ -38,6 +40,7 @@ from .sensor_transaction import (
 from .sensor_transaction_v2 import SensorTransactionV2, TransactionRecoveryManager
 
 SIDECAR_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
 
 
 class SensorQueueOverflowError(RuntimeError):
@@ -211,6 +214,9 @@ class SensorStreamRecorder:
         self._spools: dict[str, SensorParquetSpoolWriter] = {}
         self._sync_spool: SensorParquetSpoolWriter | None = None
         self._sync_queue: queue.Queue = queue.Queue(maxsize=4096)
+        self._sync_diagnostics = SensorQueueDiagnostics("Sensor Sync")
+        self._sync_overflow_count = 0
+        self._last_diagnostics = None
         self._sync_count = 0
         self._accept_sync = False
         self._rows_lock = threading.RLock()
@@ -240,6 +246,33 @@ class SensorStreamRecorder:
         """Expose worker identities for deterministic cleanup tests."""
         return tuple(self._threads.values())
 
+    @property
+    def diagnostics(self) -> dict:
+        """Constant-space runtime telemetry, retained for the last completed episode."""
+        if self._episode_uid is None and self._last_diagnostics is not None:
+            return copy.deepcopy(self._last_diagnostics)
+        streams = {}
+        for name, spool in self._spools.copy().items():
+            streams[name] = spool.diagnostics()
+            subscription = self._subscriptions.get(name)
+            if subscription is not None:
+                streams[name].update(
+                    subscription.diagnostics.snapshot(
+                        subscription.queue, overflow_count=subscription.overflow_count
+                    )
+                )
+        sync = self._sync_spool.diagnostics() if self._sync_spool else {}
+        sync.update(
+            self._sync_diagnostics.snapshot(self._sync_queue, overflow_count=self._sync_overflow_count)
+        )
+        return {
+            "episode_uid": self._episode_uid,
+            "streams": streams,
+            "sync": sync,
+            "state": self._transaction.state if self._transaction else None,
+            "worker_errors": {name: str(error) for name, error in self._worker_errors.copy().items()},
+        }
+
     def start_episode(self, episode_index: int, *, episode_uid: str | None = None, dataset=None) -> str:
         """Subscribe and start one native-rate worker per sensor."""
         if self._closed:
@@ -262,6 +295,8 @@ class SensorStreamRecorder:
         self._sync_spool = None
         self._sync_count = 0
         self._sync_queue = queue.Queue(maxsize=4096)
+        self._sync_diagnostics = SensorQueueDiagnostics("Sensor Sync")
+        self._sync_overflow_count = 0
         self._accept_sync = True
         self._worker_errors = {}
         self._transaction = None
@@ -298,6 +333,7 @@ class SensorStreamRecorder:
                     instance=instance,
                 )
                 subscription = sensor.subscribe(sensor.config.resolve_recorder_queue_capacity())
+                subscription.diagnostics.label = f"Sensor Raw {instance}"
                 self._recorder_leases[instance].start_sequence = subscription.start_sequence
                 self._subscriptions[instance] = subscription
                 thread = threading.Thread(
@@ -426,7 +462,9 @@ class SensorStreamRecorder:
                 raise SensorRecorderError("Sensor Sync is stopping.")
             try:
                 self._sync_queue.put_nowait(copy.deepcopy(row))
+                self._sync_diagnostics.observe(self._sync_queue)
             except queue.Full as exc:
+                self._sync_overflow_count += 1
                 self._worker_errors["__sync__"] = exc
                 raise SensorQueueOverflowError("Sensor Sync queue overflowed; episode is invalid.") from exc
             self._sync_count += 1
@@ -566,6 +604,17 @@ class SensorStreamRecorder:
                     return
             raise
         finally:
+            if transaction.state == "COMMITTED":
+                stats = self.diagnostics
+                all_streams = [*stats["streams"].values(), stats["sync"]]
+                logger.info(
+                    "Sensor COMMITTED %s: Raw=%s rows, Sync=%s frames, %.2f MiB written, %s fragments.",
+                    transaction.episode_uid,
+                    sum(item["rows"] for item in stats["streams"].values()),
+                    stats["sync"]["rows"],
+                    sum(item["spool_bytes"] + item["final_bytes"] for item in all_streams) / 1024**2,
+                    sum(item["fragments"] for item in all_streams),
+                )
             self._reset_episode()
 
     def abort_prepared(self, reason: str) -> None:
@@ -628,6 +677,8 @@ class SensorStreamRecorder:
     def _reset_episode(self) -> None:
         if any(thread.is_alive() for thread in self._threads.values()):
             return
+        if self._episode_uid is not None:
+            self._last_diagnostics = self.diagnostics
         if self._bound_dataset is not None:
             writer = getattr(self._bound_dataset, "writer", None)
             if writer is not None:
