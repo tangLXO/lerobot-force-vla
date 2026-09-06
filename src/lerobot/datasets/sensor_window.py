@@ -2,13 +2,13 @@
 
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 
-"""Committed sidecar reader and causal temporal-window Dataset adapter."""
+"""Read-only committed sidecars and bounded causal range windows."""
 
 from __future__ import annotations
 
 import json
-import math
-from dataclasses import dataclass
+from collections import OrderedDict
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -16,38 +16,33 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from lerobot.configs.default import SensorWindowConfig
-from lerobot.sensors import SensorSample
-from lerobot.sensors.synchronization import latest_causal_sample
 
-from .sensor_stream import SensorDatasetWriterLock
-from .sensor_transaction import TransactionState, replay_sensor_transactions
-
-
-@dataclass(frozen=True)
-class SensorWindow:
-    """Dense values and causal provenance for one stream window."""
-
-    values: np.ndarray
-    valid_mask: np.ndarray
-    target_timestamp_ns: np.ndarray
-    source_timestamp_ns: np.ndarray
-    sequence: np.ndarray
-    age_ns: np.ndarray
-
-    def as_dict(self) -> dict[str, np.ndarray]:
-        """Return the stable adapter payload keys."""
-        return {
-            "values": self.values,
-            "valid_mask": self.valid_mask,
-            "target_timestamp_ns": self.target_timestamp_ns,
-            "source_timestamp_ns": self.source_timestamp_ns,
-            "sequence": self.sequence,
-            "age_ns": self.age_ns,
-        }
+from .sensor_transaction import (
+    SensorTransaction,
+    SensorTransactionError,
+    TransactionState,
+    validate_episode_uid,
+)
+from .sensor_verification import (
+    check_no_live_writer,
+    file_stamp,
+    main_artifact_paths,
+    resolve_artifact,
+    verify_main_readonly,
+    verify_sidecar,
+)
+from .sensor_window_selection import (
+    SensorWindow as SensorWindow,
+    candidate_row_groups,
+    dense_grid,
+    empty_window,
+    finite_number,
+    reduce_candidates,
+)
 
 
 class SensorStreamReader:
-    """Read only COMMITTED episodes through manifest-provided layout templates."""
+    """Verify and read committed episodes without modifying Dataset or lock state."""
 
     def __init__(
         self,
@@ -56,169 +51,336 @@ class SensorStreamReader:
         instance: str | None = None,
         episode_uid: str | None = None,
         episode_index: int | None = None,
-    ) -> None:
-        """Replay journals and optionally bind one stream/episode selection."""
-        self.root = Path(root)
-        manifest_path = self.root / "meta" / "sensor_streams.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(f"Sensor sidecar manifest is missing: {manifest_path}.")
-        self.manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        episodes: list[int] | None = None,
+        verify: str = "fast",
+    ):
+        self.root = Path(root).resolve()
+        if verify not in ("fast", "full"):
+            raise ValueError("Sensor verify must be 'fast' or 'full'.")
+        self.verify = verify
+        check_no_live_writer(self.root)
+        self.manifest = json.loads((self.root / "meta/sensor_streams.json").read_text(encoding="utf-8"))
         layout = self.manifest.get("storage_layout", {})
         if layout.get("type") != "per_episode_parquet" or layout.get("version") != 1:
             raise ValueError(f"Unsupported sensor storage layout: {layout}.")
-        with SensorDatasetWriterLock(self.root):
-            transactions = replay_sensor_transactions(self.root)
-        self._committed_uids = {
-            tx.episode_uid for tx in transactions if tx.state == TransactionState.COMMITTED
-        }
-        self._episode_metadata: dict[str, dict[str, Any]] = {}
-        self._index_to_uid: dict[int, str] = {}
-        template = layout["episode_metadata_path_template"]
-        for uid in sorted(self._committed_uids):
-            path = self.root / template.format(episode_uid=uid)
-            if not path.exists():
-                raise FileNotFoundError(f"Committed sensor episode metadata is missing: {path}.")
-            metadata = json.loads(path.read_text(encoding="utf-8"))
-            if metadata.get("episode_uid") != uid:
-                raise ValueError(f"Sensor episode UID mismatch in {path}.")
-            index = int(metadata["episode_index"])
-            if index in self._index_to_uid:
-                raise ValueError(f"Duplicate committed sensor episode_index {index}.")
-            self._episode_metadata[uid] = metadata
-            self._index_to_uid[index] = uid
         self.instance = instance
+        if instance is not None and instance not in self.manifest["streams"]:
+            raise ValueError(f"Unknown sensor instance {instance!r}.")
+        if episode_index is not None and episodes is not None:
+            raise ValueError("Specify episode_index or episodes, not both.")
+        selected_indices = (
+            set(episodes)
+            if episodes is not None
+            else ({episode_index} if episode_index is not None else None)
+        )
+        if episode_uid is not None:
+            validate_episode_uid(episode_uid)
+        transactions = [
+            SensorTransaction.load(path) for path in (self.root / "meta/sensor_transactions").glob("*.json")
+        ]
+        self._transactions = {}
+        self._episode_metadata = {}
+        self._index_to_uid = {}
+        self._paths = {}
+        self._read_stamps = {}
+        self._anchor_cache = OrderedDict()
+        pending = [
+            tx
+            for tx in transactions
+            if tx.state not in (TransactionState.COMMITTED, TransactionState.ABORTED)
+        ]
+        selected = [
+            tx
+            for tx in transactions
+            if (episode_uid is None or tx.episode_uid == episode_uid)
+            and (selected_indices is None or tx.journal["expected_main"]["episode_index"] in selected_indices)
+        ]
+        for tx in selected:
+            if tx.state == TransactionState.ABORTED:
+                continue
+            if tx.state != TransactionState.COMMITTED:
+                raise SensorTransactionError(
+                    f"Sensor episode {tx.episode_uid} is {tx.state}; explicit recovery is required."
+                )
+            uid = tx.episode_uid
+            index = tx.journal["expected_main"]["episode_index"]
+            if index in self._index_to_uid:
+                raise SensorTransactionError(f"Duplicate committed sensor episode_index {index}.")
+            shared = self._has_shared_conflict(tx, pending)
+            verify_main_readonly(tx, shared_conflict=shared)
+            paths = self._verify_selected_sidecars(tx)
+            metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
+            if (
+                metadata.get("episode_uid") != uid
+                or metadata.get("episode_index") != index
+                or metadata.get("frame_count") != tx.journal["expected_main"]["frame_count"]
+            ):
+                raise SensorTransactionError("Sensor episode metadata identity mismatch.")
+            self._transactions[uid], self._episode_metadata[uid], self._paths[uid] = tx, metadata, paths
+            self._index_to_uid[index] = uid
+            checked_paths = (
+                main_artifact_paths(tx)
+                | set(paths["raw"].values())
+                | {paths["sync"], paths["metadata"], tx.journal_path}
+            )
+            self._read_stamps[uid] = {path: file_stamp(path) for path in checked_paths}
+        self._committed_uids = set(self._transactions)
+        if selected_indices is not None and selected_indices != set(self._index_to_uid):
+            raise SensorTransactionError("Requested sensor episodes are missing or not COMMITTED.")
         self.episode_uid = self._resolve_episode_uid(episode_uid, episode_index, required=False)
+        check_no_live_writer(self.root)
+
+    def _has_shared_conflict(self, transaction, unfinished):
+        if not unfinished:
+            return False
+        selected = main_artifact_paths(transaction)
+        shared = False
+        for other in unfinished:
+            if other.episode_uid == transaction.episode_uid:
+                continue
+            artifacts = other.journal.get("main_artifacts")
+            if artifacts is None:
+                raise SensorTransactionError(
+                    "Unfinished legacy transaction has no artifact locators; explicit recovery is required."
+                )
+            touched = {
+                resolve_artifact(self.root, item["path"]) for item in artifacts if item["role"] != "temporary"
+            }
+            if selected & touched:
+                # Logical rows prove data and episode metadata. Video time ranges,
+                # global metadata and diagnostic stamps cannot prove unchanged content.
+                if any(
+                    resolve_artifact(self.root, item["path"]) in selected
+                    and item["role"] not in ("data", "episode_metadata", "temporary")
+                    for item in artifacts
+                ):
+                    raise SensorTransactionError(
+                        "Cannot prove shared main artifact content is unchanged; explicit recovery is required."
+                    )
+                shared = True
+        return shared
+
+    def _verify_selected_sidecars(self, transaction):
+        layout, uid = self.manifest["storage_layout"], transaction.episode_uid
+        records = transaction.journal["files"]
+        paths = {"raw": {}}
+        for name in self.manifest["streams"]:
+            record = next(
+                (r for r in records if r.get("instance") == name or f"/sensors/{name}/" in r["final_path"]),
+                None,
+            )
+            if record is None:
+                raise SensorTransactionError(f"Missing committed Raw evidence for {name!r}.")
+            path = resolve_artifact(
+                self.root, layout["raw_path_template"].format(instance=name, episode_uid=uid)
+            )
+            verify_sidecar(
+                path,
+                record,
+                uid,
+                full=self.verify == "full",
+                frame_count=transaction.journal["expected_main"]["frame_count"],
+            )
+            paths["raw"][name] = path
+        for name, template, predicate in (
+            (
+                "sync",
+                "sync_path_template",
+                lambda r: r.get("kind") != "json" and "frame_index:" in r.get("schema", ""),
+            ),
+            ("metadata", "episode_metadata_path_template", lambda r: r.get("kind") == "json"),
+        ):
+            record = next((r for r in records if predicate(r)), None)
+            if record is None:
+                raise SensorTransactionError(f"Missing committed {name} evidence.")
+            path = resolve_artifact(self.root, layout[template].format(episode_uid=uid))
+            verify_sidecar(
+                path,
+                record,
+                uid,
+                full=self.verify == "full",
+                frame_count=transaction.journal["expected_main"]["frame_count"],
+            )
+            paths[name] = path
+        return paths
 
     @property
-    def committed_episode_indices(self) -> tuple[int, ...]:
-        """Return indices derived solely from committed episode metadata."""
+    def committed_episode_indices(self):
         return tuple(sorted(self._index_to_uid))
 
-    def read_raw(
-        self,
-        *,
-        instance: str | None = None,
-        episode_uid: str | None = None,
-        episode_index: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Read one stream's typed native-rate rows via the manifest adapter."""
-        selected_instance = instance or self.instance
-        if selected_instance is None or selected_instance not in self.manifest["streams"]:
-            raise ValueError(f"A known sensor instance is required, got {selected_instance!r}.")
-        uid = self._resolve_episode_uid(episode_uid or self.episode_uid, episode_index)
-        path = self.root / self.manifest["storage_layout"]["raw_path_template"].format(
-            instance=selected_instance, episode_uid=uid
+    def _selection(self, instance, episode_uid, episode_index):
+        check_no_live_writer(self.root)
+        name = instance or self.instance
+        if name not in self.manifest["streams"]:
+            raise ValueError(f"A known sensor instance is required, got {name!r}.")
+        uid = self._resolve_episode_uid(
+            episode_uid or (self.episode_uid if episode_index is None else None), episode_index
         )
-        if not path.exists():
-            raise FileNotFoundError(f"Committed raw sensor sidecar is missing: {path}.")
-        return pq.read_table(path).to_pylist()
+        self._check_episode_state(uid)
+        return name, uid
 
-    def read_sync(
-        self, *, episode_uid: str | None = None, episode_index: int | None = None
-    ) -> list[dict[str, Any]]:
-        """Read one episode's frame synchronization rows."""
-        uid = self._resolve_episode_uid(episode_uid or self.episode_uid, episode_index)
-        path = self.root / self.manifest["storage_layout"]["sync_path_template"].format(episode_uid=uid)
-        if not path.exists():
-            raise FileNotFoundError(f"Committed sync sidecar is missing: {path}.")
-        return pq.read_table(path).to_pylist()
+    def _check_episode_state(self, uid):
+        check_no_live_writer(self.root)
+        if any(file_stamp(path) != stamp for path, stamp in self._read_stamps[uid].items()):
+            raise SensorTransactionError(
+                "Dataset changed since Sensor Reader verification; reopen after explicit recovery."
+            )
+
+    def _boundary(self, uid, instance):
+        transaction = self._transactions[uid]
+        if transaction.journal["journal_version"] == 1:
+            return np.iinfo(np.int64).min
+        try:
+            return int(transaction.journal["episode_start_sequence"][instance])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SensorTransactionError("Missing v2 episode sequence boundary.") from exc
+
+    def resolve_max_age(self, uid, instance, requested):
+        age = (
+            self._episode_metadata[uid]["streams"][instance]["resolved_max_age_ms"]
+            if requested is None
+            else requested
+        )
+        finite_number("Dense sensor window max_age_ms", age, allow_zero=True)
+        return int(age * 1_000_000)
+
+    def _iter_raw_batches(self, instance, uid, lower, upper, *, valid_only, ranges=None):
+        check_no_live_writer(self.root)
+        path = self._paths[uid]["raw"][instance]
+        with path.open("rb") as handle, pq.ParquetFile(handle) as parquet:
+            groups = candidate_row_groups(
+                parquet, lower, upper, self._boundary(uid, instance), valid_only=valid_only, ranges=ranges
+            )
+            for group in groups:
+                for batch in parquet.iter_batches(batch_size=4096, row_groups=[group]):
+                    if any(value != uid for value in batch.column("episode_uid").to_pylist()):
+                        raise SensorTransactionError("Raw row belongs to a different episode UID.")
+                    yield batch
+        self._check_episode_state(uid)
+
+    def read_raw(self, *, instance=None, episode_uid=None, episode_index=None):
+        name, uid = self._selection(instance, episode_uid, episode_index)
+        return [
+            row
+            for batch in self._iter_raw_batches(
+                name, uid, np.iinfo(np.int64).min, np.iinfo(np.int64).max, valid_only=False
+            )
+            for row in batch.to_pylist()
+        ]
+
+    def read_sync(self, *, episode_uid=None, episode_index=None):
+        check_no_live_writer(self.root)
+        uid = self._resolve_episode_uid(
+            episode_uid or (self.episode_uid if episode_index is None else None), episode_index
+        )
+        self._check_episode_state(uid)
+        with self._paths[uid]["sync"].open("rb") as handle, pq.ParquetFile(handle) as parquet:
+            result = parquet.read().to_pylist()
+        check_no_live_writer(self.root)
+        return result
+
+    def frame_anchor(self, episode_index, frame_index):
+        check_no_live_writer(self.root)
+        uid = self._resolve_episode_uid(None, episode_index)
+        self._check_episode_state(uid)
+        if uid not in self._anchor_cache:
+            chunks = []
+            count = 0
+            with self._paths[uid]["sync"].open("rb") as handle, pq.ParquetFile(handle) as parquet:
+                for batch in parquet.iter_batches(
+                    batch_size=4096, columns=["episode_uid", "frame_index", "frame_anchor_ns"]
+                ):
+                    if any(value != uid for value in batch.column("episode_uid").to_pylist()) or batch.column(
+                        "frame_index"
+                    ).to_pylist() != list(range(count, count + batch.num_rows)):
+                        raise SensorTransactionError("Sync frame anchor identity mismatch.")
+                    chunks.append(batch.column("frame_anchor_ns").to_numpy(zero_copy_only=False))
+                    count += batch.num_rows
+            self._anchor_cache[uid] = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+            if len(self._anchor_cache) > 4:
+                self._anchor_cache.popitem(last=False)
+        self._anchor_cache.move_to_end(uid)
+        if not 0 <= frame_index < len(self._anchor_cache[uid]):
+            raise ValueError(f"No sensor Sync for episode {episode_index}, frame {frame_index}.")
+        return int(self._anchor_cache[uid][frame_index])
 
     def get_window(
         self,
-        end_timestamp_ns: int,
-        duration_ms: float,
-        target_hz: float | None = None,
-        max_age_ms: float | None = None,
+        end_timestamp_ns,
+        duration_ms,
+        target_hz=None,
+        max_age_ms=None,
         *,
-        instance: str | None = None,
-        episode_uid: str | None = None,
-        episode_index: int | None = None,
-    ) -> SensorWindow:
-        """Return raw records or a dense causal previous-hold window."""
-        if (
-            isinstance(duration_ms, bool)
-            or not isinstance(duration_ms, int | float)
-            or not math.isfinite(duration_ms)
-            or duration_ms <= 0
-        ):
-            raise ValueError("duration_ms must be positive and finite.")
-        if target_hz is not None and (
-            isinstance(target_hz, bool)
-            or not isinstance(target_hz, int | float)
-            or not math.isfinite(target_hz)
-            or target_hz <= 0
-        ):
-            raise ValueError("target_hz must be positive and finite.")
-        if max_age_ms is not None and (
-            isinstance(max_age_ms, bool)
-            or not isinstance(max_age_ms, int | float)
-            or not math.isfinite(max_age_ms)
-            or max_age_ms < 0
-        ):
-            raise ValueError("max_age_ms must be finite and non-negative or None.")
-        selected_instance = instance or self.instance
-        uid = self._resolve_episode_uid(episode_uid or self.episode_uid, episode_index)
-        rows = self.read_raw(instance=selected_instance, episode_uid=uid)
-        stream_schema = self.manifest["streams"][selected_instance]
-        feature_names = [feature["name"] for feature in stream_schema["semantic_features"]]
-        start_ns = end_timestamp_ns - int(duration_ms * 1_000_000)
-        samples = [_row_to_sample(row) for row in rows]
-
+        instance=None,
+        episode_uid=None,
+        episode_index=None,
+    ):
+        finite_number("duration_ms", duration_ms)
+        if max_age_ms is not None:
+            finite_number("max_age_ms", max_age_ms, allow_zero=True)
+        name, uid = self._selection(instance, episode_uid, episode_index)
+        features = [feature["name"] for feature in self.manifest["streams"][name]["semantic_features"]]
         if target_hz is None:
-            selected_rows = [
+            start = int(end_timestamp_ns) - int(duration_ms * 1_000_000)
+            rows = [
                 row
-                for row in rows
-                if start_ns < int(row["timestamp_ns"]) <= end_timestamp_ns
-                and int(row["arrival_timestamp_ns"]) <= end_timestamp_ns
+                for batch in self._iter_raw_batches(
+                    name, uid, start + 1, int(end_timestamp_ns), valid_only=False
+                )
+                for row in batch.to_pylist()
+                if start < row["timestamp_ns"] <= end_timestamp_ns
+                and row["arrival_timestamp_ns"] <= end_timestamp_ns
+                and row["sequence"] >= self._boundary(uid, name)
             ]
-            values = np.zeros((len(selected_rows), len(feature_names)), dtype=np.float32)
-            valid = np.zeros(len(selected_rows), dtype=bool)
-            targets = np.asarray([int(row["timestamp_ns"]) for row in selected_rows], dtype=np.int64)
-            sources = targets.copy()
-            sequences = np.asarray([int(row["sequence"]) for row in selected_rows], dtype=np.int64)
-            ages = np.zeros(len(selected_rows), dtype=np.int64)
-            for index, row in enumerate(selected_rows):
-                row_values = row.get("values") or {}
-                complete = all(row_values.get(name) is not None for name in feature_names)
-                valid[index] = bool(row["is_valid"] and complete)
+            targets = np.asarray([row["timestamp_ns"] for row in rows], dtype=np.int64)
+            window = empty_window(targets, len(features))
+            for index, row in enumerate(rows):
+                semantic = row["values"] or {}
+                complete = all(semantic.get(feature) is not None for feature in features)
                 if complete:
-                    values[index] = [row_values[name] for name in feature_names]
-            return SensorWindow(values, valid, targets, sources, sequences, ages)
+                    window.values[index] = [semantic[feature] for feature in features]
+                window.valid_mask[index] = bool(row["is_valid"] and complete)
+                window.source_timestamp_ns[index], window.sequence[index], window.age_ns[index] = (
+                    row["timestamp_ns"],
+                    row["sequence"],
+                    0,
+                )
+            return window
+        return self._dense_windows([end_timestamp_ns], duration_ms, target_hz, max_age_ms, name, uid)[0]
 
-        length = math.ceil(duration_ms * target_hz / 1000.0)
-        step_ns = 1_000_000_000 / target_hz
-        targets = np.asarray(
-            [round(end_timestamp_ns - (length - 1 - index) * step_ns) for index in range(length)],
-            dtype=np.int64,
-        )
-        values = np.zeros((length, len(feature_names)), dtype=np.float32)
-        valid = np.zeros(length, dtype=bool)
-        sources = np.full(length, -1, dtype=np.int64)
-        sequences = np.full(length, -1, dtype=np.int64)
-        ages = np.full(length, -1, dtype=np.int64)
-        if max_age_ms is None:
-            max_age_ms = self._episode_metadata[uid]["streams"][selected_instance]["resolved_max_age_ms"]
-        for index, target in enumerate(targets):
-            selected = latest_causal_sample(samples, int(target), max_age_ms)
-            if selected is None or any(name not in selected.values for name in feature_names):
-                continue
-            values[index] = [selected.values[name] for name in feature_names]
-            valid[index] = True
-            sources[index] = selected.timestamp_ns
-            sequences[index] = selected.sequence
-            ages[index] = int(target) - selected.timestamp_ns
-        return SensorWindow(values, valid, targets, sources, sequences, ages)
+    def _dense_windows(self, anchors, duration_ms, target_hz, max_age_ms, name, uid):
+        """Reduce a row-group union against packed grids, preserving request order."""
+        self._check_episode_state(uid)
+        if not anchors:
+            return []
+        grids = [dense_grid(int(anchor), duration_ms, target_hz) for anchor in anchors]
+        age = self.resolve_max_age(uid, name, max_age_ms)
+        features = [feature["name"] for feature in self.manifest["streams"][name]["semantic_features"]]
+        window = empty_window(np.concatenate(grids), len(features))
+        ranges = []
+        for lower, upper in sorted((int(grid[0]) - age, int(grid[-1])) for grid in grids):
+            if ranges and lower <= ranges[-1][1]:
+                ranges[-1] = (ranges[-1][0], max(ranges[-1][1], upper))
+            else:
+                ranges.append((lower, upper))
+        with closing(self._iter_raw_batches(name, uid, 0, 0, valid_only=True, ranges=ranges)) as batches:
+            for batch in batches:
+                reduce_candidates(window, batch, features, age, self._boundary(uid, name))
+        result, start = [], 0
+        for grid in grids:
+            end = start + len(grid)
+            result.append(
+                SensorWindow(**{key: value[start:end].copy() for key, value in window.as_dict().items()})
+            )
+            start = end
+        return result
 
-    def _resolve_episode_uid(
-        self,
-        episode_uid: str | None,
-        episode_index: int | None,
-        *,
-        required: bool = True,
-    ) -> str | None:
+    def _resolve_episode_uid(self, episode_uid, episode_index, *, required=True):
         if episode_uid is not None:
             if episode_uid not in self._committed_uids:
                 raise ValueError(f"Sensor episode {episode_uid!r} is not COMMITTED.")
+            if episode_index is not None and self._index_to_uid.get(episode_index) != episode_uid:
+                raise ValueError("Sensor episode UID and index disagree.")
             return episode_uid
         if episode_index is not None:
             if episode_index not in self._index_to_uid:
@@ -233,21 +395,24 @@ class SensorWindowDataset:
     """Map-style adapter adding dense sensor windows to existing frame items."""
 
     def __init__(
-        self, dataset, sensor_windows: dict[str, SensorWindowConfig], *, root: Path | None = None
-    ) -> None:
-        """Validate fixed-length requests and open the committed sidecar reader."""
+        self,
+        dataset,
+        sensor_windows: dict[str, SensorWindowConfig],
+        *,
+        root: Path | None = None,
+    ):
         for instance, config in sensor_windows.items():
-            if config.target_hz is None or config.target_hz <= 0:
-                raise ValueError(
-                    f"DataLoader sensor window {instance!r} requires a positive target_hz; "
-                    "ragged native-rate data is Reader-only."
-                )
-        self.dataset = dataset
-        self.sensor_windows = sensor_windows
-        self.reader = SensorStreamReader(root or dataset.root)
+            if config.target_hz is None:
+                raise ValueError(f"DataLoader sensor window {instance!r} requires a positive target_hz.")
+        self.dataset, self.sensor_windows = dataset, sensor_windows
+        self.reader = SensorStreamReader(root or dataset.root, episodes=getattr(dataset, "episodes", None))
+        for uid in self.reader._committed_uids:
+            for instance, config in sensor_windows.items():
+                if instance not in self.reader.manifest["streams"]:
+                    raise ValueError(f"Unknown sensor window instance {instance!r}.")
+                self.reader.resolve_max_age(uid, instance, config.max_age_ms)
 
-    def __len__(self) -> int:
-        """Return the base Dataset length."""
+    def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -255,14 +420,11 @@ class SensorWindowDataset:
         item = self.dataset[index]
         episode_index = int(_scalar(item["episode_index"]))
         frame_index = int(_scalar(item["frame_index"]))
-        sync_rows = self.reader.read_sync(episode_index=episode_index)
-        sync = next((row for row in sync_rows if int(row["frame_index"]) == frame_index), None)
-        if sync is None:
-            raise ValueError(f"No sensor sync row for episode {episode_index}, frame {frame_index}.")
+        anchor = self.reader.frame_anchor(episode_index, frame_index)
         item = dict(item)
         item["sensor_windows"] = {
             instance: self.reader.get_window(
-                int(sync["frame_anchor_ns"]),
+                anchor,
                 config.duration_ms,
                 config.target_hz,
                 config.max_age_ms,
@@ -278,23 +440,5 @@ class SensorWindowDataset:
         return getattr(self.dataset, name)
 
 
-def _row_to_sample(row: dict[str, Any]) -> SensorSample:
-    return SensorSample(
-        timestamp_ns=int(row["timestamp_ns"]),
-        arrival_timestamp_ns=int(row["arrival_timestamp_ns"]),
-        sequence=int(row["sequence"]),
-        hardware_timestamp_ns=row.get("hardware_timestamp_ns"),
-        hardware_sequence=row.get("hardware_sequence"),
-        values=row.get("values") or {},
-        native_values=row.get("native_values"),
-        native_payload=row.get("native_payload"),
-        is_valid=bool(row["is_valid"]),
-        status=row.get("status") or "unknown",
-        error=row.get("error"),
-    )
-
-
-def _scalar(value: Any) -> Any:
-    if hasattr(value, "item"):
-        return value.item()
-    return value
+def _scalar(value):
+    return value.item() if hasattr(value, "item") else value
