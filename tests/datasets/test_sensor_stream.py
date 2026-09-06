@@ -121,6 +121,13 @@ class FakeDataset:
         self.root = root
 
     def save_episode(self):
+        transaction = getattr(self, "_sensor_transaction", None)
+        if transaction is not None:
+            transaction.register_artifact(self.root / "data/chunk-000/file-000.parquet", "data")
+            transaction.register_artifact(
+                self.root / "meta/episodes/chunk-000/file-000.parquet", "episode_metadata"
+            )
+            transaction.register_artifact(self.root / "meta/info.json", "info")
         write_main_episode(self.root)
 
 
@@ -201,7 +208,9 @@ def test_transaction_commits_against_real_lerobot_dataset(tmp_path) -> None:
     recorder = SensorStreamRecorder(root, {"gripper_force": sensor})
     recorder.start_episode(0)
     timestamp = time.perf_counter_ns()
-    sensor._publish_sample({"left.normal_force": 1.0, "right.normal_force": 2.0}, timestamp)
+    sensor._publish_sample(
+        {"left.normal_force": 1.0, "right.normal_force": 2.0}, timestamp, arrival_timestamp_ns=timestamp + 1
+    )
     for frame_index in range(2):
         dataset.add_frame({"observation.state": np.asarray([frame_index], dtype=np.float32), "task": "test"})
         recorder.record_sync(frame_index, capture(timestamp + frame_index + 1, timestamp, 0))
@@ -210,7 +219,11 @@ def test_transaction_commits_against_real_lerobot_dataset(tmp_path) -> None:
     sensor.device_id = "fake-b"
     recorder.start_episode(1)
     second_timestamp = timestamp + 1_000_000
-    sensor._publish_sample({"left.normal_force": 3.0, "right.normal_force": 4.0}, second_timestamp)
+    sensor._publish_sample(
+        {"left.normal_force": 3.0, "right.normal_force": 4.0},
+        second_timestamp,
+        arrival_timestamp_ns=second_timestamp + 1,
+    )
     for frame_index in range(2):
         dataset.add_frame(
             {"observation.state": np.asarray([frame_index + 2], dtype=np.float32), "task": "test"}
@@ -268,6 +281,7 @@ def test_state_subset_does_not_drop_raw_semantic_or_opt_in_payload(tmp_path) -> 
     sensor._publish_sample(
         {"left.normal_force": 1.0, "right.normal_force": 2.0},
         timestamp,
+        arrival_timestamp_ns=timestamp + 1,
         native_values={"channel_1.register": 7},
         native_payload=b"native",
     )
@@ -385,7 +399,9 @@ def test_reader_uses_manifest_layout_templates(tmp_path) -> None:
     recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
     uid = recorder.start_episode(0)
     timestamp = time.perf_counter_ns()
-    sensor._publish_sample({"left.normal_force": 1.0, "right.normal_force": 2.0}, timestamp)
+    sensor._publish_sample(
+        {"left.normal_force": 1.0, "right.normal_force": 2.0}, timestamp, arrival_timestamp_ns=timestamp + 1
+    )
     recorder.record_sync(0, capture(timestamp + 1, timestamp, 0))
     recorder.record_sync(1, capture(timestamp + 2, timestamp, 0))
     recorder.save_episode(FakeDataset(tmp_path))

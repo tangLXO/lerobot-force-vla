@@ -243,6 +243,13 @@ class SensorizedRobot:
                 "SensorizedRobot is in a fatal sensor state."
             ) from self._fatal_error
         for instance, sensor in self.sensors.items():
+            try:
+                sensor._check_recorder_fault()
+            except RuntimeError as exc:
+                self._fatal_error = exc
+                raise SensorDataUnavailableError(
+                    f"Sensor {instance!r} has a recorder episode fault."
+                ) from exc
             if sensor.config.required and not sensor.is_connected:
                 error = SensorDataUnavailableError(f"Required sensor {instance!r} is disconnected.")
                 self._fatal_error = error
