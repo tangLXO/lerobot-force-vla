@@ -31,12 +31,11 @@ from lerobot.utils.errors import DeviceNotConnectedError
 from .sensor_spool import SensorParquetSpoolWriter
 from .sensor_transaction import (
     SensorTransaction,
-    capture_main_dataset_state,
     parquet_file_record,
-    replay_sensor_transactions,
     sha256_file,
     validate_episode_uid,
 )
+from .sensor_transaction_v2 import SensorTransactionV2, TransactionRecoveryManager
 
 SIDECAR_SCHEMA_VERSION = 1
 
@@ -193,7 +192,9 @@ class SensorStreamRecorder:
             sensor.config.resolve_recorder_queue_capacity()
         self._writer_lock = SensorDatasetWriterLock(self.root)
         try:
-            replay_sensor_transactions(self.root)
+            recovered = TransactionRecoveryManager(self.root).recover(writer_lock=self._writer_lock)
+            if recovered is not None and recovered.state == "QUARANTINED":
+                raise SensorRecorderError("Active transaction was quarantined during recovery.")
             self.manifest = ensure_sensor_stream_manifest(self.root, sensors)
         except Exception:
             self._writer_lock.release()
@@ -217,6 +218,7 @@ class SensorStreamRecorder:
         self._transaction: SensorTransaction | None = None
         self._minimum_timestamp_ns: int | None = None
         self._closed = False
+        self._bound_dataset = None
 
     @property
     def episode_uid(self) -> str | None:
@@ -238,7 +240,7 @@ class SensorStreamRecorder:
         """Expose worker identities for deterministic cleanup tests."""
         return tuple(self._threads.values())
 
-    def start_episode(self, episode_index: int, *, episode_uid: str | None = None) -> str:
+    def start_episode(self, episode_index: int, *, episode_uid: str | None = None, dataset=None) -> str:
         """Subscribe and start one native-rate worker per sensor."""
         if self._closed:
             raise SensorRecorderError("Sensor recorder is closed.")
@@ -246,7 +248,9 @@ class SensorStreamRecorder:
             raise SensorRecorderError("A sensor episode is already active.")
         if self._transaction is not None:
             raise SensorRecorderError("A PREPARED sensor episode must be committed or aborted first.")
-        replay_sensor_transactions(self.root)
+        recovered = TransactionRecoveryManager(self.root).recover(writer_lock=self._writer_lock)
+        if recovered is not None and recovered.state == "QUARANTINED":
+            raise SensorRecorderError("Active transaction was quarantined during recovery.")
         resolved_uid = validate_episode_uid(episode_uid or str(uuid.uuid4()))
         if (self.root / "meta/sensor_transactions" / f"{resolved_uid}.json").exists():
             raise SensorRecorderError("Sensor episode UID already has a transaction.")
@@ -266,7 +270,10 @@ class SensorStreamRecorder:
             for instance, sensor in self.sensors.items():
                 self._recorder_leases[instance] = sensor.acquire_recorder()
             self._active = True
-            self._main_precondition = capture_main_dataset_state(self.root)
+            self._transaction = SensorTransactionV2.begin(self.root, resolved_uid, episode_index)
+            self._main_precondition = self._transaction.journal["main_precondition"]
+            if dataset is not None:
+                self._bind_dataset(dataset)
             staging = self.root / ".sensor-staging" / resolved_uid
             self._sync_spool = SensorParquetSpoolWriter(
                 staging / "spool" / "sync",
@@ -303,9 +310,20 @@ class SensorStreamRecorder:
                 thread.start()
         except Exception as exc:
             self._stop_workers()
-            self._quarantine_failed_episode(exc)
+            if self._transaction is not None:
+                self._quarantine_failed_episode(exc)
+            else:
+                self._reset_episode()
             raise
         return self._episode_uid
+
+    def _bind_dataset(self, dataset) -> None:
+        writer = getattr(dataset, "writer", None)
+        if writer is not None:
+            writer.set_sensor_transaction(self._transaction)
+        else:
+            dataset._sensor_transaction = self._transaction
+        self._bound_dataset = dataset
 
     def _drain(self, instance: str, subscription: SensorSubscription) -> None:
         spool = self._spools[instance]
@@ -453,17 +471,6 @@ class SensorStreamRecorder:
             raise
 
     def _quarantine_failed_episode(self, exc: Exception) -> None:
-        if self._transaction is None:
-            self._transaction = SensorTransaction.prepare(
-                self.root,
-                episode_uid=self._episode_uid,
-                episode_index=self._episode_index,
-                frame_count=self._sync_count,
-                dataset_from_index=int((self._main_precondition or {}).get("total_frames") or 0),
-                files=[],
-                task_info={"failure": str(exc)},
-                main_precondition=self._main_precondition,
-            )
         self._transaction.quarantine(str(exc))
         self._reset_episode()
 
@@ -497,15 +504,14 @@ class SensorStreamRecorder:
         _atomic_json(metadata_staging, metadata)
         records.append(_generic_file_record(self.root, metadata_staging, metadata_final))
 
-        transaction = SensorTransaction.prepare(
-            self.root,
-            episode_uid=self._episode_uid,
-            episode_index=self._episode_index,
+        transaction = self._transaction.prepare_sidecars(
             frame_count=self._sync_count,
-            dataset_from_index=int((self._main_precondition or {}).get("total_frames") or 0),
             files=records,
             task_info=task_info,
-            main_precondition=self._main_precondition,
+            sequence_boundaries={
+                name: subscription.start_sequence for name, subscription in self._subscriptions.items()
+            },
+            required_streams=[name for name, sensor in self.sensors.items() if sensor.config.required],
         )
         self._transaction = transaction
         try:
@@ -537,15 +543,27 @@ class SensorStreamRecorder:
             self._reset_episode()
             raise
         try:
+            self._bind_dataset(dataset)
             dataset.save_episode(**save_kwargs)
             seal_episode_artifacts = getattr(dataset, "seal_episode_artifacts", None)
             if seal_episode_artifacts is not None:
                 seal_episode_artifacts()
+            self.check_health()
             transaction.mark_main_saved()
             transaction.promote_sidecars()
+            self.check_health()
             transaction.commit()
-        except Exception:
-            transaction.replay()
+            self.check_health()
+        except Exception as exc:
+            if any(lease.error is not None for lease in self._recorder_leases.values()):
+                transaction.quarantine(str(exc))
+            else:
+                transaction.replay()
+                if transaction.state == "COMMITTED":
+                    writer = getattr(dataset, "writer", None)
+                    if writer is not None:
+                        writer.synchronize_sensor_commit(transaction)
+                    return
             raise
         finally:
             self._reset_episode()
@@ -610,10 +628,17 @@ class SensorStreamRecorder:
     def _reset_episode(self) -> None:
         if any(thread.is_alive() for thread in self._threads.values()):
             return
+        if self._bound_dataset is not None:
+            writer = getattr(self._bound_dataset, "writer", None)
+            if writer is not None:
+                writer.set_sensor_transaction(None)
+            else:
+                self._bound_dataset._sensor_transaction = None
+            self._bound_dataset = None
+        self._active = False
         for instance, lease in self._recorder_leases.items():
             self.sensors[instance].release_recorder(lease)
         self._recorder_leases.clear()
-        self._active = False
         self._episode_uid = None
         self._episode_index = None
         self._subscriptions.clear()

@@ -26,6 +26,7 @@ class SensorTransactionError(RuntimeError):
 class TransactionState(StrEnum):
     """Persistent sidecar transaction states."""
 
+    RECORDING = "RECORDING"
     PREPARED = "PREPARED"
     MAIN_SAVED = "MAIN_SAVED"
     SIDECAR_PROMOTED = "SIDECAR_PROMOTED"
@@ -255,6 +256,12 @@ class SensorTransaction:
         episode_uid = validate_episode_uid(journal.get("episode_uid"))
         if path.stem != episode_uid:
             raise ValueError(f"Sensor transaction filename and episode_uid differ: {path}.")
+        if journal.get("journal_version") == 2:
+            from .sensor_transaction_v2 import SensorTransactionV2
+
+            return SensorTransactionV2(path.parents[2], journal)
+        if journal.get("journal_version") != 1:
+            raise SensorTransactionError("Unsupported sensor journal version.")
         return cls(path.parents[2], journal)
 
     def mark_main_saved(self, main_postcondition: dict[str, Any] | None = None) -> None:
@@ -328,6 +335,9 @@ class SensorTransaction:
 
     def replay(self) -> TransactionState:
         """Deterministically replay this transaction as far as evidence permits."""
+        from .sensor_transaction_v2 import _require_writer
+
+        _require_writer(self.root)
         try:
             if self.state == TransactionState.PREPARED:
                 current = capture_main_dataset_state(self.root)
@@ -427,15 +437,18 @@ class SensorTransaction:
             columns = ["episode_uid"]
             if "frame_index" in schema_names:
                 columns.append("frame_index")
-            table = pq.read_table(path, columns=columns)
-            uids = set(table["episode_uid"].to_pylist())
-            if uids and uids != {self.episode_uid}:
-                raise SensorTransactionError(f"Sidecar episode UID mismatch: {path}.")
-            if "frame_index" in schema_names:
-                frame_count = int(expected_main["frame_count"])
-                frame_indices = [int(value) for value in table["frame_index"].to_pylist()]
-                if int(record["row_count"]) != frame_count or frame_indices != list(range(frame_count)):
-                    raise SensorTransactionError(f"Sync frame indices mismatch: {path}.")
+            count = 0
+            with pq.ParquetFile(path) as parquet:
+                for batch in parquet.iter_batches(batch_size=4096, columns=columns):
+                    if any(uid != self.episode_uid for uid in batch.column("episode_uid").to_pylist()):
+                        raise SensorTransactionError(f"Sidecar episode UID mismatch: {path}.")
+                    if "frame_index" in schema_names:
+                        indices = batch.column("frame_index").to_pylist()
+                        if indices != list(range(count, count + batch.num_rows)):
+                            raise SensorTransactionError(f"Sync frame indices mismatch: {path}.")
+                    count += batch.num_rows
+            if "frame_index" in schema_names and count != int(expected_main["frame_count"]):
+                raise SensorTransactionError(f"Sync frame indices mismatch: {path}.")
 
     def _quarantine_staging(self) -> None:
         staging = self.root / ".sensor-staging" / self.episode_uid
@@ -449,8 +462,11 @@ class SensorTransaction:
 
 
 def replay_sensor_transactions(root: Path, *, refuse_quarantined: bool = True) -> list[SensorTransaction]:
-    """Replay every journal before reading or starting a new episode."""
+    """Explicit legacy recovery; caller must hold the writer lock before scanning history."""
+    from .sensor_transaction_v2 import _require_writer
+
     root = Path(root)
+    _require_writer(root)
     transactions: list[SensorTransaction] = []
     journal_dir = root / "meta" / "sensor_transactions"
     if not journal_dir.exists():

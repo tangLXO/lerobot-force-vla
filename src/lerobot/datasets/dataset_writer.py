@@ -451,8 +451,10 @@ class DatasetWriter:
             chunk_idx, file_idx = 0, 0
             global_frame_index = 0
             self._current_file_start_frame = 0
-            if self._meta.episodes is not None and len(self._meta.episodes) > 0:
+            latest_ep = getattr(self, "_sealed_episode", None)
+            if latest_ep is None and self._meta.episodes is not None and len(self._meta.episodes) > 0:
                 latest_ep = self._meta.episodes[-1]
+            if latest_ep is not None:
                 global_frame_index = latest_ep["dataset_to_index"]
                 chunk_idx = latest_ep["data/chunk_index"]
                 file_idx = latest_ep["data/file_index"]
@@ -482,6 +484,7 @@ class DatasetWriter:
         ep_dict["data/file_index"] = file_idx
 
         path = self._root / self._meta.data_path.format(chunk_index=chunk_idx, file_index=file_idx)
+        self._meta._register_sensor_artifact(path, "data")
         path.parent.mkdir(parents=True, exist_ok=True)
 
         table = ep_dataset.with_format("arrow")[:]
@@ -523,9 +526,17 @@ class DatasetWriter:
             or f"videos/{video_key}/chunk_index" not in self._meta.latest_episode
         ):
             chunk_idx, file_idx = 0, 0
-            if self._meta.episodes is not None and len(self._meta.episodes) > 0:
-                old_chunk_idx = self._meta.episodes[-1][f"videos/{video_key}/chunk_index"]
-                old_file_idx = self._meta.episodes[-1][f"videos/{video_key}/file_index"]
+            sealed = getattr(self._meta, "_sealed_latest_episode", None)
+            previous = (
+                {key: value[0] for key, value in sealed.items()}
+                if sealed is not None
+                else self._meta.episodes[-1]
+                if self._meta.episodes is not None and len(self._meta.episodes) > 0
+                else None
+            )
+            if previous is not None:
+                old_chunk_idx = previous[f"videos/{video_key}/chunk_index"]
+                old_file_idx = previous[f"videos/{video_key}/file_index"]
                 chunk_idx, file_idx = update_chunk_file_indices(
                     old_chunk_idx, old_file_idx, self._meta.chunks_size
                 )
@@ -534,6 +545,7 @@ class DatasetWriter:
                 video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
             )
             new_path.parent.mkdir(parents=True, exist_ok=True)
+            self._meta._register_sensor_artifact(new_path, "video")
             shutil.move(str(ep_path), str(new_path))
         else:
             latest_ep = self._meta.latest_episode
@@ -552,9 +564,11 @@ class DatasetWriter:
                     video_key=video_key, chunk_index=chunk_idx, file_index=file_idx
                 )
                 new_path.parent.mkdir(parents=True, exist_ok=True)
+                self._meta._register_sensor_artifact(new_path, "video")
                 shutil.move(str(ep_path), str(new_path))
                 latest_duration_in_s = 0.0
             else:
+                self._meta._register_sensor_artifact(latest_path, "video")
                 concatenate_video_files(
                     [latest_path, ep_path],
                     latest_path,
@@ -571,6 +585,7 @@ class DatasetWriter:
                 if video_key in self._meta.depth_keys
                 else self._rgb_encoder,
             )
+            self._meta._register_sensor_artifact(self._root / "meta/info.json", "info")
             write_info(self._meta.info, self._meta.root)
 
         metadata = {
@@ -645,13 +660,60 @@ class DatasetWriter:
             self._pq_writer = None
 
     def seal_episode_artifacts(self) -> None:
-        """Make the latest episode crash-durable and rotate append-only files."""
-        self.close_writer()
-        self._latest_episode = None
-        self._meta.seal_episode_artifacts()
+        """Close complete main artifacts for process-crash recovery and rotate files."""
         if self._streaming_encoder is None and self._episodes_since_last_encoding > 0:
             self.flush_pending_videos()
             self._episodes_since_last_encoding = 0
+        self.close_writer()
+        if self._latest_episode is not None:
+            self._sealed_episode = {
+                key: self._latest_episode[key]
+                for key in ("data/chunk_index", "data/file_index", "dataset_from_index", "dataset_to_index")
+            }
+        self._latest_episode = None
+        self._meta.seal_episode_artifacts()
+
+    def set_sensor_transaction(self, transaction) -> None:
+        """Bind artifact registration and require complete per-episode video sealing."""
+        if transaction is not None and getattr(self._meta, "_sensor_transaction", None) is None:
+            if self._episodes_since_last_encoding:
+                raise RuntimeError("Seal pending main videos before starting sensor recording.")
+            self._sensor_batch_encoding_size = self._batch_encoding_size
+            self._batch_encoding_size = 1
+        elif transaction is None and getattr(self._meta, "_sensor_transaction", None) is not None:
+            self._batch_encoding_size = self._sensor_batch_encoding_size
+        self._meta._sensor_transaction = transaction
+
+    def synchronize_sensor_commit(self, transaction) -> None:
+        """Finish same-process cleanup when recovery proved a save committed."""
+        self.close_writer()
+        self._meta._close_writer()
+        # No historical episode load: use the current metadata row and small info/stats files.
+        from .io_utils import load_info, load_stats, load_tasks
+
+        self._meta.info = load_info(self._root)
+        self._meta.stats = load_stats(self._root)
+        self._meta.tasks = load_tasks(self._root) if self._meta.total_tasks else None
+        locator = next(
+            item["path"]
+            for item in transaction.journal["main_artifacts"]
+            if item["role"] == "episode_metadata"
+        )
+        from .sensor_transaction_v2 import _episode_rows
+
+        with contextlib.closing(
+            _episode_rows(self._root / locator, transaction.journal["expected_main"]["episode_index"])
+        ) as rows:
+            row = next(rows)
+        self._meta._sealed_latest_episode = {key: [value] for key, value in row.items()}
+        self._meta.latest_episode = None
+        self._sealed_episode = {
+            key: row[key]
+            for key in ("data/chunk_index", "data/file_index", "dataset_from_index", "dataset_to_index")
+        }
+        self._latest_episode = None
+        self._recorded_frames = self._meta.total_frames
+        self.episode_buffer = self._create_episode_buffer()
 
     def flush_pending_videos(self) -> None:
         """Flush any pending video encoding (streaming or batch).

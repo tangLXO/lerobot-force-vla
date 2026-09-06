@@ -10,12 +10,19 @@ import pyarrow.parquet as pq
 import pytest
 from test_sensor_stream import initialize_main, write_main_episode
 
+from lerobot.datasets.sensor_stream import SensorDatasetWriterLock
 from lerobot.datasets.sensor_transaction import (
     SensorTransaction,
     SensorTransactionError,
     TransactionState,
     parquet_file_record,
 )
+
+
+@pytest.fixture(autouse=True)
+def legacy_writer_lock(tmp_path):
+    with SensorDatasetWriterLock(tmp_path):
+        yield
 
 
 def prepare_transaction(root, file_count=1):
