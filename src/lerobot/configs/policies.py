@@ -19,7 +19,7 @@ import tempfile
 from dataclasses import dataclass, field
 from logging import getLogger
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, ClassVar, TypeVar
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -52,6 +52,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
     """
+
+    supports_sensor_windows: ClassVar[bool] = False
 
     n_obs_steps: int = 1
 

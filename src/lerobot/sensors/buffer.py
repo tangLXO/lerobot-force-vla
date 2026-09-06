@@ -30,10 +30,17 @@ class HistoryBuffer:
         self.duration_ns = int(duration_s * 1_000_000_000)
         self._samples: deque[SensorSample] = deque()
         self._lock = RLock()
+        self._last_arrival_timestamp_ns: int | None = None
 
     def append(self, sample: SensorSample) -> None:
         """Append one sample and evict entries outside the arrival horizon."""
         with self._lock:
+            if (
+                self._last_arrival_timestamp_ns is not None
+                and sample.arrival_timestamp_ns < self._last_arrival_timestamp_ns
+            ):
+                raise ValueError("Sensor arrival_timestamp_ns must be monotonically non-decreasing.")
+            self._last_arrival_timestamp_ns = sample.arrival_timestamp_ns
             self._samples.append(sample)
             cutoff_ns = sample.arrival_timestamp_ns - self.duration_ns
             while self._samples and self._samples[0].arrival_timestamp_ns < cutoff_ns:
@@ -48,6 +55,7 @@ class HistoryBuffer:
         """Remove all history entries."""
         with self._lock:
             self._samples.clear()
+            self._last_arrival_timestamp_ns = None
 
     def __len__(self) -> int:
         """Return the retained sample count."""

@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from lerobot.sensors import Sensor, SensorFeature, SensorSubscription
+from lerobot.sensors.sensor import SensorRecorderLease
 
 from .sensor_transaction import (
     SensorTransaction,
@@ -196,6 +197,7 @@ class SensorStreamRecorder:
         self._episode_start_ns = 0
         self._main_precondition: dict[str, Any] | None = None
         self._subscriptions: dict[str, SensorSubscription] = {}
+        self._recorder_leases: dict[str, SensorRecorderLease] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stop_event = threading.Event()
         self._raw_rows: dict[str, list[dict[str, Any]]] = {}
@@ -248,6 +250,8 @@ class SensorStreamRecorder:
         self._transaction = None
         self._minimum_timestamp_ns = None
         try:
+            for instance, sensor in self.sensors.items():
+                self._recorder_leases[instance] = sensor.acquire_recorder()
             for instance, sensor in self.sensors.items():
                 subscription = sensor.subscribe(sensor.config.resolve_recorder_queue_capacity())
                 self._subscriptions[instance] = subscription
@@ -325,6 +329,9 @@ class SensorStreamRecorder:
 
     def check_health(self) -> None:
         """Raise immediately on worker failure or subscriber overflow."""
+        for instance, lease in self._recorder_leases.items():
+            if lease.error is not None:
+                raise SensorRecorderError(f"Sensor {instance!r} episode fault: {lease.error}")
         if self._worker_errors:
             instance, error = next(iter(self._worker_errors.items()))
             raise SensorRecorderError(f"Sensor recorder worker {instance!r} failed: {error}") from error
@@ -397,7 +404,7 @@ class SensorStreamRecorder:
         try:
             self.check_health()
         except Exception as exc:
-            transaction.abort(str(exc))
+            transaction.quarantine(str(exc))
             self._reset_episode()
             raise
         self._active = False
@@ -413,6 +420,12 @@ class SensorStreamRecorder:
         transaction = self._transaction
         if transaction is None or transaction.state != "PREPARED":
             raise SensorRecorderError("No PREPARED sensor transaction to commit.")
+        try:
+            self.check_health()
+        except Exception as exc:
+            transaction.quarantine(str(exc))
+            self._reset_episode()
+            raise
         try:
             dataset.save_episode(**save_kwargs)
             seal_episode_artifacts = getattr(dataset, "seal_episode_artifacts", None)
@@ -456,19 +469,31 @@ class SensorStreamRecorder:
                 finally:
                     self._reset_episode()
         finally:
-            self._writer_lock.release()
-            self._closed = True
+            if not any(thread.is_alive() for thread in self._threads.values()):
+                self._writer_lock.release()
+                self._closed = True
 
     def _stop_workers(self) -> None:
-        self._stop_event.set()
         for instance, subscription in tuple(self._subscriptions.items()):
             self.sensors[instance].unsubscribe(subscription)
+        self._stop_event.set()
         for thread in self._threads.values():
-            thread.join(timeout=5.0)
+            if thread.ident is not None:
+                thread.join(timeout=5.0)
             if thread.is_alive():
                 self._worker_errors[thread.name] = RuntimeError("worker did not stop")
+        if any(thread.is_alive() for thread in self._threads.values()):
+            raise SensorRecorderError("Sensor recorder worker did not stop; ownership retained.")
+        for instance, subscription in self._subscriptions.items():
+            if not subscription.closed:
+                raise SensorRecorderError(f"Sensor {instance!r} subscription was not removed.")
 
     def _reset_episode(self) -> None:
+        if any(thread.is_alive() for thread in self._threads.values()):
+            return
+        for instance, lease in self._recorder_leases.items():
+            self.sensors[instance].release_recorder(lease)
+        self._recorder_leases.clear()
         self._active = False
         self._episode_uid = None
         self._episode_index = None
