@@ -309,8 +309,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self._is_finalized = False
             return
 
-        # Load actual data
-        if force_cache_sync or not self.reader.try_load():
+        from .sensor_hub import ensure_sensor_subset
+
+        has_sensor_sidecar = (self.root / "meta/sensor_streams.json").is_file()
+        if has_sensor_sidecar:
+            ensure_sensor_subset(
+                self.root,
+                self.episodes,
+                self.meta.total_episodes,
+                lambda paths: self._download_sensor_files(paths, token=token),
+                refresh=force_cache_sync,
+                main_paths=self.reader.get_episodes_file_paths(),
+            )
+
+        # Sensor localization validates selected journals before downloading large artifacts.
+        if (force_cache_sync and not has_sensor_sidecar) or not self.reader.try_load():
             if is_valid_version(self.revision):
                 if token is None:
                     self.revision = get_safe_version(self.repo_id, self.revision)
@@ -711,11 +724,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
     def _download(self, download_videos: bool = True, *, token: str | bool | None = None) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version."""
         ignore_patterns = None if download_videos else "videos/"
-        files = None
+        files = (
+            self.reader.get_episodes_file_paths()
+            if self.episodes is not None or (self.root / "meta/sensor_streams.json").exists()
+            else None
+        )
         token_kwargs = {} if token is None else {"token": token}
-        if self.episodes is not None:
-            # Reader is guaranteed to exist here (created in __init__ before _download)
-            files = self.reader.get_episodes_file_paths()
 
         if self._requested_root is None:
             self.meta.root = Path(
@@ -745,6 +759,33 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Propagate resolved root from metadata (single source of truth)
         self.root = self.meta.root
         self.reader.root = self.meta.root
+
+    def _download_sensor_files(self, paths, *, token=None):
+        """Fetch an exact Sensor closure at the same revision and destination as main data."""
+        from .sensor_hub import pin_sensor_revision
+
+        self.revision = pin_sensor_revision(self.root, self.repo_id, self.revision, token=token)
+        self.meta.revision = self.revision
+        token_kwargs = {} if token is None else {"token": token}
+        destination = (
+            {"cache_dir": HF_LEROBOT_HUB_CACHE}
+            if self._requested_root is None
+            else {"local_dir": self._requested_root}
+        )
+        resolved = Path(
+            snapshot_download(
+                self.repo_id,
+                repo_type="dataset",
+                revision=self.revision,
+                allow_patterns=paths,
+                **destination,
+                **token_kwargs,
+            )
+        )
+        if resolved.resolve() != self.root.resolve():
+            raise RuntimeError(
+                "Sensor download resolved a different Dataset revision/root; reopen at a fixed revision."
+            )
 
     # ── Class constructors ────────────────────────────────────────────
 

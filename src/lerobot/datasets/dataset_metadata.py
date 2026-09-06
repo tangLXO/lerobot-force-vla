@@ -145,7 +145,14 @@ class LeRobotDatasetMetadata:
                     else:
                         self.revision = get_safe_version(self.repo_id, self.revision, token=token)
 
-                self._pull_from_repo(allow_patterns="meta/", token=token)
+                from .sensor_hub import METADATA_DOWNLOAD_PATTERNS, pin_sensor_revision
+
+                self._pull_from_repo(allow_patterns=METADATA_DOWNLOAD_PATTERNS, token=token)
+                if (self.root / "meta/sensor_streams.json").exists():
+                    pinned = pin_sensor_revision(self.root, self.repo_id, self.revision, token=token)
+                    if self.revision != pinned:
+                        self.revision = pinned
+                        self._pull_from_repo(allow_patterns=METADATA_DOWNLOAD_PATTERNS, token=token)
                 self._load_metadata()
 
     def _flush_metadata_buffer(self) -> None:

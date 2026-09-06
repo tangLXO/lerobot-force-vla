@@ -187,7 +187,14 @@ def test_metadata_without_root_uses_hub_cache_snapshot_download(
         "repo_type": "dataset",
         "revision": "main",
         "cache_dir": cache_root / "hub",
-        "allow_patterns": "meta/",
+        "allow_patterns": [
+            "meta/info.json",
+            "meta/stats.json",
+            "meta/tasks.parquet",
+            "meta/episodes/**/*.parquet",
+            "meta/sensor_streams.json",
+            "meta/sensor_episodes/*.json",
+        ],
         "ignore_patterns": None,
     }
 
@@ -225,12 +232,15 @@ def test_data_download_forwards_token(tmp_path, monkeypatch, token):
     dataset.revision = "main"
     dataset.episodes = None
     dataset._requested_root = None
-    dataset.meta = SimpleNamespace(root=None)
-    dataset.reader = SimpleNamespace(root=None)
+    dataset.root = tmp_path / "metadata"
+    dataset.meta = SimpleNamespace(root=dataset.root)
+    dataset.reader = SimpleNamespace(root=dataset.root)
 
     dataset._download(token=token)
 
     assert dataset.root == snapshot_root
+    assert dataset.meta.root == snapshot_root
+    assert dataset.reader.root == snapshot_root
     assert snapshot_download.call_args.kwargs["token"] is token
 
 

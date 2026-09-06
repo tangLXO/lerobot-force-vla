@@ -33,6 +33,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`configs/`** — Dataclass configs parsed by draccus. `train.py` has `TrainPipelineConfig` (top-level). `policies.py` has `PreTrainedConfig` base. Polymorphism via `draccus.ChoiceRegistry` with `@register_subclass("name")` decorators.
 - **`policies/`** — Each policy in its own subdir. All inherit `PreTrainedPolicy` (`nn.Module` + `HubMixin`) from `pretrained.py`. Factory with lazy imports in `factory.py`.
 - **`processor/`** — Data transformation pipeline. `ProcessorStep` base with registry. `DataProcessorPipeline` / `PolicyProcessorPipeline` chain steps.
+- **`sensors/`** — Non-visual physical sensor abstraction. Before any sensor-related design or implementation, read all of [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) and follow it as the locked source of truth unless the user explicitly asks to revise it.
 - **`datasets/`** — `LeRobotDataset` (episode-aware sampling + video decoding) and `LeRobotDatasetMetadata`.
 - **`envs/`** — `EnvConfig` base in `configs.py`, factory in `factory.py`. Each env subclass defines `gym_kwargs` and `create_envs()`.
 - **`robots/`, `motors/`, `cameras/`, `teleoperators/`** — Hardware abstraction layers.
@@ -40,7 +41,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 
 ## Repository Structure (outside `src/`)
 
-- **`tests/`** — Pytest suite organized by module. Fixtures in `tests/fixtures/`, mocks in `tests/mocks/`. Hardware tests use skip decorators from `tests/utils.py`. E2E tests via `Makefile` write to `tests/outputs/`.
+- **`tests/`** — Pytest suite organized by module. Fixtures in `tests/fixtures/`, mocks in `tests/mocks/`. Hardware tests use skip decorators from `tests/utils.py`. E2E tests via `Makefile` write to `tests/outputs/`. Sensor unit tests must not require real hardware and use `tests/sensors/test_<sensor>.py`; real-hardware checks belong in `examples/<sensor>/<sensor>_hardware_smoke_test.py`, with an optional Windows launcher named `run_<sensor>_hardware_smoke_test.bat` in the same directory. Do not place temporary archives, logs, or captured sensor data under `src/`.
 - **`.github/workflows/`** — CI: `quality.yml` (pre-commit), `fast_tests.yml` (base deps, every PR), `full_tests.yml` (all extras + E2E + GPU, post-approval), `latest_deps_tests.yml` (daily lockfile upgrade), `security.yml` (TruffleHog), `release.yml` (PyPI publish on tags).
 - **`docs/source/`** — HF documentation (`.mdx` files). Per-policy READMEs, hardware guides, tutorials. Built separately via `docs-requirements.txt` and CI workflows.
 - **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
@@ -55,3 +56,10 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`, see `pyproject.toml`). Guard optional imports with `TYPE_CHECKING or _foo_available` at module top + a `require_package(...)` check at use time. Reuse the `_foo_available` flags in `utils/import_utils.py`; don't call `is_package_available`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+- **Sensor persistence**: follow [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) and
+  [`SENSOR_INTEGRATION_GUIDE.md`](./SENSOR_INTEGRATION_GUIDE.md). Preserve Sidecar v1 final schemas/layout;
+  Transaction v2 guarantees process-crash recovery and replayable on-disk state, not power-loss durability.
+  Reader paths are strictly read-only. Recovery belongs to a Writer/RecoveryManager holding the writer lock;
+  v1 historical recovery is explicit. Keep runtime diagnostics out of stable manifests. Validate bounded Raw
+  and Sync memory, subprocess recovery, read-only tree/mtime invariants, window oracle, Hub subset closure
+  and Windows spawn/batch behavior. Use structural I/O assertions in CI; benchmark speedup is not a hard gate.

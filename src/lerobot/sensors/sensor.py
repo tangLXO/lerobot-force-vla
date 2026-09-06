@@ -21,6 +21,7 @@ from lerobot.utils.errors import DeviceNotConnectedError
 
 from .buffer import HistoryBuffer
 from .configs import SensorConfig
+from .diagnostics import SensorQueueDiagnostics
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class SensorSubscription:
     closed: bool = False
     start_sequence: int = 0
     end_sequence: int | None = None
+    diagnostics: SensorQueueDiagnostics = field(default_factory=SensorQueueDiagnostics, repr=False)
 
     def get(self, timeout: float | None = None) -> SensorSample:
         """Get the next queued native-rate sample."""
@@ -223,6 +225,7 @@ class Sensor(abc.ABC):
                     continue
                 try:
                     subscription.queue.put_nowait(sample)
+                    subscription.diagnostics.observe(subscription.queue)
                 except queue.Full:
                     subscription.overflowed = True
                     subscription.overflow_count += 1
