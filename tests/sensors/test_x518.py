@@ -527,6 +527,43 @@ def test_sensor_reconnects_and_refreshes_device_settings() -> None:
         sensor.disconnect()
 
 
+def test_explicit_connect_cannot_reset_sequence_during_recorder_ownership():
+    sensor = X518Sensor(_x518_config())
+    lease = sensor.acquire_recorder()
+    try:
+        with pytest.raises(RuntimeError, match="recorder ownership"):
+            sensor.connect()
+        assert lease.error is not None
+    finally:
+        sensor.release_recorder(lease)
+
+
+def test_required_episode_stops_background_reconnect_and_latches_failure():
+    fail = threading.Event()
+
+    def raw_reader(_word_swap):
+        if fail.is_set():
+            raise ConnectionError("lost during episode")
+        return 1, 2
+
+    sensor = X518Sensor(_x518_config(sample_rate_hz=100, reconnect_delay_s=0))
+    fake_client = _FakeClient(settings=[_settings()], raw_reader=raw_reader)
+    sensor._client = fake_client
+    sensor.connect()
+    lease = sensor.acquire_recorder()
+    try:
+        fail.set()
+        sensor._thread.join(1)
+        assert not sensor._thread.is_alive()
+        assert lease.error is not None
+        assert fake_client.connect_calls == 1
+        with pytest.raises(RuntimeError, match="needs reconnect"):
+            sensor.async_read(0)
+    finally:
+        sensor.release_recorder(lease)
+        sensor.disconnect()
+
+
 def test_sensor_rejects_unit_mismatch_and_excessive_poll_rate() -> None:
     wrong_unit = X518Sensor(_x518_config(expected_unit="kg", connect_retries=0))
     wrong_unit._client = _FakeClient(settings=[_settings(unit="N")])

@@ -410,3 +410,53 @@ def test_reader_uses_manifest_layout_templates(tmp_path) -> None:
     reader = SensorStreamReader(tmp_path, instance="gripper_force", episode_index=0)
     assert len(reader.read_raw()) == 1
     assert len(reader.read_sync()) == 2
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_sequence_reset_quarantines_episode_even_after_unsubscribe(tmp_path, prepared):
+    initialize_main(tmp_path)
+    sensor = FakeSensor()
+    recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
+    uid = recorder.start_episode(0)
+    if prepared:
+        recorder.prepare_episode()
+        assert sensor.subscriber_count == 0
+    with pytest.raises(RuntimeError, match="recorder ownership"):
+        sensor._reset_framework_state()
+    with pytest.raises(SensorRecorderError, match="episode fault"):
+        if prepared:
+            recorder.commit_prepared(FakeDataset(tmp_path))
+        else:
+            recorder.prepare_episode()
+    recorder.close()
+    journal = json.loads((tmp_path / "meta/sensor_transactions" / f"{uid}.json").read_text())
+    assert journal["state"] == TransactionState.QUARANTINED
+    sensor._reset_framework_state()
+
+
+def test_join_timeout_retains_worker_and_sequence_ownership(tmp_path, monkeypatch):
+    initialize_main(tmp_path)
+    sensor = FakeSensor()
+    recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
+    release = threading.Event()
+    monkeypatch.setattr(recorder, "_drain", lambda *_args: release.wait())
+    recorder.start_episode(0)
+    threads = recorder.worker_threads
+    thread = recorder._threads["gripper_force"]
+    original_join = thread.join
+    monkeypatch.setattr(thread, "join", lambda timeout: original_join(timeout=0))
+    try:
+        with pytest.raises(SensorRecorderError, match="did not stop"):
+            recorder.close()
+        assert recorder.worker_threads == threads
+        assert (tmp_path / ".sensor-writer.lock").exists()
+        with pytest.raises(RuntimeError, match="recorder ownership"):
+            sensor._reset_framework_state()
+        with pytest.raises(SensorRecorderError, match="already active"):
+            recorder.start_episode(0)
+    finally:
+        release.set()
+        original_join(1)
+        with pytest.raises(SensorRecorderError):
+            recorder.close()
+    assert not (tmp_path / ".sensor-writer.lock").exists()

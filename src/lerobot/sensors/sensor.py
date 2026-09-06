@@ -80,6 +80,8 @@ class SensorSubscription:
     overflowed: bool = False
     overflow_count: int = 0
     closed: bool = False
+    start_sequence: int = 0
+    end_sequence: int | None = None
 
     def get(self, timeout: float | None = None) -> SensorSample:
         """Get the next queued native-rate sample."""
@@ -88,6 +90,15 @@ class SensorSubscription:
     def get_nowait(self) -> SensorSample:
         """Get the next sample without blocking."""
         return self.queue.get_nowait()
+
+
+@dataclass
+class SensorRecorderLease:
+    """Recorder ownership retained through draining and transaction cleanup."""
+
+    id: str
+    error: str | None = None
+    start_sequence: int = 0
 
 
 class Sensor(abc.ABC):
@@ -102,6 +113,7 @@ class Sensor(abc.ABC):
         self._next_sequence = 0
         self._last_consumed_sequence = -1
         self._subscribers: dict[str, SensorSubscription] = {}
+        self._recorder_leases: dict[str, SensorRecorderLease] = {}
 
     def __enter__(self):
         """Connect the sensor for context-manager use."""
@@ -163,8 +175,6 @@ class Sensor(abc.ABC):
         error: str | None = None,
     ) -> SensorSample:
         """Validate, sequence, retain, and fan out one acquisition attempt."""
-        if arrival_timestamp_ns is None:
-            arrival_timestamp_ns = time.perf_counter_ns()
         semantic_values = {} if values is None else dict(values)
         if is_valid:
             expected = set(self.features)
@@ -191,6 +201,8 @@ class Sensor(abc.ABC):
             raise TypeError("native_payload must be bytes or None.")
 
         with self._publication_condition:
+            if arrival_timestamp_ns is None:
+                arrival_timestamp_ns = time.perf_counter_ns()
             sample = SensorSample(
                 timestamp_ns=int(timestamp_ns),
                 arrival_timestamp_ns=int(arrival_timestamp_ns),
@@ -204,8 +216,8 @@ class Sensor(abc.ABC):
                 status=status,
                 error=error,
             )
-            self._next_sequence += 1
             self._history.append(sample)
+            self._next_sequence += 1
             for subscription in tuple(self._subscribers.values()):
                 if subscription.closed:
                     continue
@@ -237,8 +249,54 @@ class Sensor(abc.ABC):
             raise ValueError("Sensor subscription capacity must be a positive integer.")
         subscription = SensorSubscription(id=str(uuid.uuid4()), queue=queue.Queue(maxsize=capacity))
         with self._publication_condition:
+            subscription.start_sequence = self._next_sequence
             self._subscribers[subscription.id] = subscription
         return subscription
+
+    def acquire_recorder(self) -> SensorRecorderLease:
+        """Reserve sequence identity until the recorder releases this lease."""
+        with self._publication_condition:
+            self._check_recorder_fault()
+            lease = SensorRecorderLease(str(uuid.uuid4()), start_sequence=self._next_sequence)
+            self._recorder_leases[lease.id] = lease
+            return lease
+
+    def release_recorder(self, lease: SensorRecorderLease) -> None:
+        """Release ownership only after all recorder workers and cleanup finish."""
+        with self._publication_condition:
+            self._recorder_leases.pop(lease.id, None)
+
+    def _reset_framework_state(self) -> None:
+        """Reinitialize a disconnected driver only outside recorder ownership."""
+        with self._publication_condition:
+            if self._recorder_leases or self._subscribers:
+                reason = "Cannot reset Sensor framework sequence during recorder ownership."
+                self._latch_recorder_fault(reason)
+                raise RuntimeError(reason)
+            self._history.clear()
+            self._next_sequence = 0
+            self._last_consumed_sequence = -1
+
+    def _latch_recorder_fault(self, reason: str) -> None:
+        with self._publication_condition:
+            for lease in self._recorder_leases.values():
+                if lease.error is None:
+                    lease.error = reason
+            self._publication_condition.notify_all()
+
+    def _notify_reconnect_required(self, error: Exception) -> bool:
+        """Latch required-stream failure; return whether recovery must stop."""
+        with self._publication_condition:
+            if self.config.required and self._recorder_leases:
+                self._latch_recorder_fault(f"Required Sensor needs reconnect: {error}")
+                return True
+            return False
+
+    def _check_recorder_fault(self) -> None:
+        with self._publication_condition:
+            for lease in self._recorder_leases.values():
+                if lease.error is not None:
+                    raise RuntimeError(lease.error)
 
     def unsubscribe(self, subscription: SensorSubscription) -> None:
         """Remove a subscriber reference and mark it closed."""
@@ -246,6 +304,7 @@ class Sensor(abc.ABC):
             removed = self._subscribers.pop(subscription.id, None)
             if removed is not None:
                 removed.closed = True
+                removed.end_sequence = self._next_sequence
 
     @property
     def subscriber_count(self) -> int:
@@ -260,20 +319,25 @@ class Sensor(abc.ABC):
             return any(subscription.overflowed for subscription in self._subscribers.values())
 
     def read(self) -> SensorSample:
-        """Wait indefinitely for the next valid sample."""
+        """Return the newest unconsumed valid sample, waiting indefinitely."""
         with self._publication_condition:
-            self._require_active()
-            samples = self._history.snapshot()
-            baseline = samples[-1].sequence if samples else -1
             while True:
-                self._publication_condition.wait()
                 self._require_active()
-                samples = self._history.snapshot()
-                if samples and samples[-1].sequence > baseline:
-                    self._last_consumed_sequence = samples[-1].sequence
-                    if samples[-1].is_valid:
-                        return samples[-1]
-                    baseline = samples[-1].sequence
+                sample = self._consume_latest_valid()
+                if sample is not None:
+                    return sample
+                self._publication_condition.wait()
+
+    def _consume_latest_valid(self) -> SensorSample | None:
+        """Consume the full unseen interval under the publication lock."""
+        samples = self._history.snapshot()
+        baseline = self._last_consumed_sequence
+        if not samples or samples[-1].sequence <= baseline:
+            return None
+        self._last_consumed_sequence = samples[-1].sequence
+        return next(
+            (sample for sample in reversed(samples) if sample.sequence > baseline and sample.is_valid), None
+        )
 
     def async_read(self, timeout_ms: float = 200) -> SensorSample:
         """Return the newest unconsumed valid sample within a timeout."""
@@ -282,12 +346,9 @@ class Sensor(abc.ABC):
         with self._publication_condition:
             self._require_active()
             while True:
-                samples = self._history.snapshot()
-                if samples and samples[-1].sequence > self._last_consumed_sequence:
-                    sample = samples[-1]
-                    self._last_consumed_sequence = sample.sequence
-                    if sample.is_valid:
-                        return sample
+                sample = self._consume_latest_valid()
+                if sample is not None:
+                    return sample
                 remaining_s = deadline - time.perf_counter()
                 if remaining_s <= 0:
                     label = type(self).__name__.removesuffix("Sensor")
@@ -319,7 +380,9 @@ class Sensor(abc.ABC):
         from .synchronization import SensorDataUnavailableError, latest_causal_sample
 
         self._require_active()
-        samples = self._history.snapshot()
+        with self._publication_condition:
+            boundary = max((lease.start_sequence for lease in self._recorder_leases.values()), default=0)
+            samples = tuple(sample for sample in self._history.snapshot() if sample.sequence >= boundary)
         if not samples:
             raise RuntimeError(f"{type(self).__name__} has not produced a sample yet.")
         if max_age_ms is None:
@@ -344,6 +407,7 @@ class Sensor(abc.ABC):
         return causal_samples_in_interval(self._history.snapshot(), start_timestamp_ns, end_timestamp_ns)
 
     def _require_active(self) -> None:
+        self._check_recorder_fault()
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{type(self).__name__} is not connected.")
 

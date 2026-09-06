@@ -122,11 +122,8 @@ class X518Sensor(Sensor):
             if self._lifecycle_active or self.is_connected:
                 raise DeviceAlreadyConnectedError(f"{self.__class__.__name__} is already connected.")
 
+            self._reset_framework_state()
             self._stop_event.clear()
-            with self._sample_ready:
-                self._history.clear()
-                self._next_sequence = 0
-                self._last_consumed_sequence = -1
 
             try:
                 settings = self._connect_initially()
@@ -239,6 +236,9 @@ class X518Sensor(Sensor):
                 self._client.close()
                 self._record_read_error(exc)
 
+                if self._notify_reconnect_required(exc):
+                    break
+
             sample_rate_hz = self.sample_rate_hz
             if sample_rate_hz is None:  # pragma: no cover - settings validation establishes a rate
                 self._record_read_error(RuntimeError("X518 polling rate is unavailable."))
@@ -274,6 +274,8 @@ class X518Sensor(Sensor):
 
         中文说明：断线后持续尝试恢复连接；每次成功后重新读取设备参数，停止时返回 ``False``。
         """
+        if self._notify_reconnect_required(ConnectionError("X518 connection lost")):
+            return False
         while not self._stop_event.is_set():
             try:
                 self._client.connect()
@@ -349,6 +351,7 @@ class X518Sensor(Sensor):
 
         中文说明：统一检查连接状态和后台线程状态，供三个读取接口在访问样本前调用。
         """
+        self._check_recorder_fault()
         if not self._lifecycle_active:
             raise DeviceNotConnectedError(f"{self.__class__.__name__} is not connected.")
         thread = self._thread
@@ -365,6 +368,7 @@ class X518Sensor(Sensor):
             if not self._lifecycle_active and (thread is None or not thread.is_alive()):
                 raise DeviceNotConnectedError(f"{self.__class__.__name__} is not connected.")
 
+            self._notify_reconnect_required(ConnectionError("X518 disconnected"))
             self._lifecycle_active = False
             self._stop_event.set()
             with self._sample_ready:

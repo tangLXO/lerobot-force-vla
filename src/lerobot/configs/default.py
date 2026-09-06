@@ -55,9 +55,9 @@ class SensorWindowConfig:
             isinstance(self.max_age_ms, bool)
             or not isinstance(self.max_age_ms, int | float)
             or not math.isfinite(self.max_age_ms)
-            or self.max_age_ms <= 0
+            or self.max_age_ms < 0
         ):
-            raise ValueError("SensorWindowConfig.max_age_ms must be positive and finite.")
+            raise ValueError("SensorWindowConfig.max_age_ms must be non-negative and finite.")
 
 
 @dataclass
