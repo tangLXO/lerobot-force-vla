@@ -4,6 +4,9 @@ Scope: six ordered stages from the user attachment, preserving Sidecar v1 final 
 Sensor/SensorizedRobot APIs, state inputs, and process-crash recovery (no power-loss guarantee).
 The initial user edits to AGENTS.md and three untracked Sensor documents are retained.
 
+The commit IDs in this progress record use the final message-normalized history. The
+corresponding implementation trees are identical to those used during validation.
+
 ## Verification environment
 
 Use the existing uv environment without dependency synchronization. Windows sandbox caches:
@@ -211,7 +214,8 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
 | Full regression and six reviewable PR deliveries | Final pytest/benchmark results pending; no commits or PRs have been created. Delivery preference requested |
 
 - Delivery preference is now confirmed: **six local commits**, no GitHub publication.
-- Two ordinary Dataset failures were reproduced unchanged against original HEAD `74b75a39`:
+- Two ordinary Dataset failures were reproduced unchanged against the tree now published as
+  `36bb61cd`:
   POSIX-only `"data/" in str(Path)` assertion and deleting an open decoded video on Windows.
   Baseline source was exported read-only from Git to `.cache/sensor-baseline-audit/src` and
   imported via PYTHONPATH (module path checked). Logs: `.cache/sensor-pr6-head-failures.log`
@@ -231,7 +235,7 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
 
 ### Active checkpoint — 2026-09-06 14:24 CST
 
-- Local delivery branch created: `codex/sensor-production`; HEAD is still `74b75a39`.
+- Local delivery branch created: `codex/sensor-production`; HEAD is still `36bb61cd`.
   No commits yet. Six local commits are explicitly authorized; do not publish GitHub PRs.
 - The four existing Hub tests were updated as described above without removing coverage.
   Full `test_lerobot_dataset.py` plus `test_sensor_hub.py`: **50 passed, 1 skipped**
@@ -268,8 +272,8 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
 
 - Full-suite run completed: **3,851 passed, 43 failed, 313 skipped, 4 deselected**.
   Six Torch-cache failures pass with workspace TORCH_HOME. All remaining 37 failures
-  were reproduced against original `74b75a39`. Large RL flow and both async iterator
-  hangs were also reproduced against original source; small RL flow passes.
+  were reproduced against the tree now published as `36bb61cd`. Large RL flow and both
+  async iterator hangs were also reproduced against original source; small RL flow passes.
   See `SENSOR_VALIDATION_REPORT.md` for categorized failures and exact evidence logs.
 - Final footer union pruning scans each row-group's statistics once per batch range union,
   including absent statistics and unordered measurements. A new failure regression verifies
@@ -287,7 +291,7 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
   **101.84 fps**: **3.39x**, below the non-CI 5x target. Random/batch valid-point totals match;
   resident decoded cache is **66,901,392 / 67,108,864 bytes**. Full sampled JSON is
   `.cache/sensor-benchmark-pruned/benchmark_sampled_results.json`.
-- Stage 1 commit exists: `2b4717fb`. Remaining Git staging attempts were rejected twice by
+- Stage 1 commit exists: `a7cde76a`. Remaining Git staging attempts were rejected twice by
   automatic approval review because its service returned HTTP 503 (no available model
   channel), not a code-risk finding. The worktree remains intact and index empty.
   Six review patches are exported to `.cache/sensor-review-patches/`; stages 2–6 pass
@@ -300,7 +304,7 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
 - Final combined gate completed: **1,479 passed, 5 platform skips** in 195.14 seconds,
   `.cache/sensor-production-final.log` and `.cache/sensor-production-final.xml`.
 - The automatic approval service recovered. Local commits now exist for stages 1–5:
-  `2b4717fb`, `784db965`, `23f5b1fb`, `36500326`, `3e30d6c3`. Every staged tree was
+  `a7cde76a`, `21c79b7b`, `15bfa5ea`, `bd24c1f5`, `df8af560`. Every staged tree was
   compared with the corresponding independent snapshot before committing; the final worktree
   was preserved. Stage 2 was reverified as **252 passed** and the stage 3 spool suite as
   **24 passed** after the copied journal-version assertions were corrected.

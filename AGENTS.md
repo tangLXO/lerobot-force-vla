@@ -4,7 +4,7 @@ This file provides guidance to AI agents when working with code in this reposito
 
 ## Project Overview
 
-LeRobot is a PyTorch-based library for real-world robotics, providing datasets, pretrained policies, and tools for training, evaluation, data collection, and robot control. It integrates with Hugging Face Hub for model/dataset sharing.
+LeRobot provides PyTorch-based robot policies, datasets, training, evaluation, and hardware control. See `README.md` and `CONTRIBUTING.md` for general project and contribution guidance.
 
 ## Tech Stack
 
@@ -16,15 +16,24 @@ Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (
 uv sync --locked                            # Base dependencies
 uv sync --locked --extra test --extra dev   # Test + dev tools
 uv sync --locked --extra all                # Everything
-git lfs install && git lfs pull             # Test artifacts
+git lfs install
+git lfs pull                               # When LFS test artifacts are needed
 ```
 
 ## Key Commands
 
 ```bash
-uv run pytest tests -svv --maxfail=10                 # All tests
-DEVICE=cuda make test-end-to-end                      # All E2E tests
-pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
+uv run pytest tests/<affected_module> -q             # Start with relevant tests
+uv run pytest tests -svv --maxfail=10                # Full suite when warranted
+uv run pre-commit run --all-files                    # Repository-wide lint/format checks
+```
+
+Run checks relevant to the change first and complete applicable CI requirements. Broaden to the full suite for cross-module changes or unresolved integration risks; this command list is not a requirement to run every check for every edit. Report targeted tests, full-suite tests, benchmarks, and real-hardware checks separately.
+
+The Makefile E2E workflow requires a compatible Bash/WSL/Linux environment and its dependencies; do not run Bash assignment syntax directly in PowerShell:
+
+```bash
+DEVICE=cuda make test-end-to-end
 ```
 
 ## Architecture (`src/lerobot/`)
@@ -33,7 +42,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`configs/`** — Dataclass configs parsed by draccus. `train.py` has `TrainPipelineConfig` (top-level). `policies.py` has `PreTrainedConfig` base. Polymorphism via `draccus.ChoiceRegistry` with `@register_subclass("name")` decorators.
 - **`policies/`** — Each policy in its own subdir. All inherit `PreTrainedPolicy` (`nn.Module` + `HubMixin`) from `pretrained.py`. Factory with lazy imports in `factory.py`.
 - **`processor/`** — Data transformation pipeline. `ProcessorStep` base with registry. `DataProcessorPipeline` / `PolicyProcessorPipeline` chain steps.
-- **`sensors/`** — Non-visual physical sensor abstraction. Before any sensor-related design or implementation, read all of [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) and follow it as the locked source of truth unless the user explicitly asks to revise it.
+- **`sensors/`** — Non-visual physical sensor abstraction. Before any sensor-related design or implementation, read all of [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) and follow it as the locked source of truth unless the user explicitly asks to revise it. If it has already been read in this task and is unchanged, reuse that context instead of rereading it.
 - **`datasets/`** — `LeRobotDataset` (episode-aware sampling + video decoding) and `LeRobotDatasetMetadata`.
 - **`envs/`** — `EnvConfig` base in `configs.py`, factory in `factory.py`. Each env subclass defines `gym_kwargs` and `create_envs()`.
 - **`robots/`, `motors/`, `cameras/`, `teleoperators/`** — Hardware abstraction layers.
@@ -42,7 +51,7 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 ## Repository Structure (outside `src/`)
 
 - **`tests/`** — Pytest suite organized by module. Fixtures in `tests/fixtures/`, mocks in `tests/mocks/`. Hardware tests use skip decorators from `tests/utils.py`. E2E tests via `Makefile` write to `tests/outputs/`. Sensor unit tests must not require real hardware and use `tests/sensors/test_<sensor>.py`; real-hardware checks belong in `examples/<sensor>/<sensor>_hardware_smoke_test.py`, with an optional Windows launcher named `run_<sensor>_hardware_smoke_test.bat` in the same directory. Do not place temporary archives, logs, or captured sensor data under `src/`.
-- **`.github/workflows/`** — CI: `quality.yml` (pre-commit), `fast_tests.yml` (base deps, every PR), `full_tests.yml` (all extras + E2E + GPU, post-approval), `latest_deps_tests.yml` (daily lockfile upgrade), `security.yml` (TruffleHog), `release.yml` (PyPI publish on tags).
+- **`.github/workflows/`** — Source of truth for current CI checks, test environments, and release workflows.
 - **`docs/source/`** — HF documentation (`.mdx` files). Per-policy READMEs, hardware guides, tutorials. Built separately via `docs-requirements.txt` and CI workflows.
 - **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
 - **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
