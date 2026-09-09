@@ -5,6 +5,9 @@ inputs and Sidecar v1 final schemas/layout. Transaction v2 provides **process-cr
 + replayable on-disk state**; it does not provide power-loss durability or concurrent
 Reader/Writer isolation.
 
+The published commit IDs below reflect the final message-only history normalization. Their
+validation-relevant source trees are identical to the commits used for the recorded runs.
+
 ## Delivered behavior
 
 1. Non-decreasing arrival publication, complete unseen-interval consuming reads, recorder
@@ -27,8 +30,8 @@ changing the final worktree; each snapshot was tested against the preceding stag
 
 | Stage | Validation |
 | --- | --- |
-| 1 | 118 passed; local commit `2b4717fb` |
-| 2 | 252 passed in the final independent snapshot; local commit `784db965` |
+| 1 | 118 passed; local commit `a7cde76a` |
+| 2 | 252 passed in the final independent snapshot; local commit `21c79b7b` |
 | 3 | 343 passed initially; two copied v1 expectations were corrected to v2; all 24 spool tests then passed (346 distinct cases in the resulting gate) |
 | 4 | 1,385 passed, including earlier stages and 1,000 independent oracle cases |
 | 5 | 1,412 passed, including Windows spawn/batch/cache, split-first factory and config tests |
@@ -47,7 +50,8 @@ This is not an all-green full suite.
 
 - Six ACT/VQ-BeT failures were caused by an unwritable external Torch cache. All six passed
   after setting `TORCH_HOME` to the workspace cache.
-- The remaining 37 failures were reproduced using original source from `74b75a39`:
+- The remaining 37 failures were reproduced using the tree-identical original source now
+  published as `36bb61cd`:
   32 OpenCV cases decode existing PNG fixtures as four-channel frames; one Dataset test assumes
   POSIX path separators; one Dataset conversion test deletes a video still open on Windows;
   two checkpoint tests require Windows symlink privileges; one image augmentation test requires
@@ -84,6 +88,34 @@ The full-frame reading run was stopped after capture because it was slow; its in
 output is not counted as a completed benchmark. JSON evidence:
 `.cache/sensor-benchmark-pruned/benchmark_sampled_results.json`.
 
+## Post-delivery hardware acceptance
+
+Real-device acceptance ran on Windows from 2026-09-07 through 2026-09-09 using an SO101
+leader on COM24, an SO101 follower on COM13, two 640x480 DirectShow cameras at 30 Hz, and an
+X518 at `192.168.1.100:502` configured for 200 Hz. No data or logs from `outputs/` are tracked.
+
+- The corrected X518 read-only smoke test produced 20 consecutive valid samples using the
+  locked `left.normal_force` / `right.normal_force` feature names. The device reported kg and
+  the driver converted its semantic outputs to N; all 58 X518 unit tests passed.
+- Read-only collection exercised the real record entry point in regular and streaming video
+  modes. Each mode produced two COMMITTED episodes after one deliberate ABORTED rerecord:
+  360 main/Sync frames and 720 decoded camera frames in total. Full Sidecar verification and
+  causal state-to-Raw reconstruction passed, with no invalid samples, sequence gaps or queue
+  overflow; maximum selected-sample age was 3.502 ms.
+- Guarded real teleoperation completed 449 bounded motion commands and left every follower
+  torque register at zero during cleanup. A separate 30-second official teleoperation run
+  completed 898 ticks at 29.93 Hz. The diagnostic envelope also stopped an out-of-bounds
+  target instead of continuing motion.
+- The final real-motion recording produced one COMMITTED 30-second episode with 900 main and
+  Sync frames, 1,800 decoded camera frames and 6,003 Raw X518 samples. A fresh read-only
+  `verify="full"` pass matched both force state values to causal Raw data for all 900 frames,
+  found zero future-sample violations, invalid samples, sequence gaps or queue overflows, and
+  measured 200.001 Hz Raw acquisition with 1.050 ms maximum selected-sample age.
+
+This acceptance does not prove power-loss durability, hardware-triggered camera synchronization,
+or X518 left/right wiring and absolute force calibration. Those remain explicit experimental
+setup responsibilities. Process-crash recovery is covered by the subprocess crash matrix above.
+
 ## Reproduction environment
 
 Use the existing uv environment with `--no-sync`. Set `UV_CACHE_DIR`, `HF_DATASETS_CACHE`,
@@ -91,24 +123,29 @@ Use the existing uv environment with `--no-sync`. Set `UV_CACHE_DIR`, `HF_DATASE
 run also uses `.cache/ffmpeg-bootstrap` on `PYTHONPATH`: it provides workspace-only aliases to
 existing PyAV FFmpeg DLLs so TorchCodec can load. No dependency versions were changed.
 All 50 tracked Git LFS test artifacts were materialized and verified against their identities.
-Hardware tests were not run against real robots or sensors.
+The six-stage software gate itself used simulated hardware; the later real-device acceptance is
+reported separately above.
 
-## Local delivery
+## Delivery history
 
-Branch: `codex/sensor-production`. The user requested six ordered local commits; no GitHub
-publication occurs. Each intermediate index tree was compared with its tested independent
-snapshot before committing. The temporary approval-service HTTP 503 failure has resolved.
+The six production stages were created as ordered commits on `codex/sensor-production`. Each
+intermediate index tree was compared with its tested independent snapshot before committing.
 
 | Commit | Scope |
 | --- | --- |
-| `2b4717fb` | Core causal reads and recorder sequence ownership |
-| `784db965` | Bounded Raw/Sync spool and lifecycle, retaining Transaction v1 |
-| `23f5b1fb` | Transaction v2, sealing and crash recovery |
-| `36500326` | Strict read-only Reader and causal range windows |
-| `3e30d6c3` | Worker-local cache, batch windows and factory integration |
-| Final delivery commit | Hub subset, diagnostics, documentation and benchmark |
+| `a7cde76a` | Core causal reads and recorder sequence ownership |
+| `21c79b7b` | Bounded Raw/Sync spool and lifecycle, retaining Transaction v1 |
+| `15bfa5ea` | Transaction v2, sealing and crash recovery |
+| `bd24c1f5` | Strict read-only Reader and causal range windows |
+| `df8af560` | Worker-local cache, batch windows and factory integration |
+| `5b2465ea` | Hub subset, diagnostics, documentation and benchmark |
 
 Final combined regression evidence is `.cache/sensor-production-final.log` and its JUnit XML:
 **1,479 passed, 5 skipped**. The skips are unavailable Windows SIGHUP/SIGQUIT signals (four)
 and a filesystem symlink requiring privileges (one). The full-suite and sampled-benchmark
 limitations above remain part of this delivery; they are not reported as passes.
+
+The hardware-accepted integration baseline is published from `force-vla` and preserved by the
+annotated `sensor-framework-v1.0` tag. The acceptance follow-up commits add only hardware smoke
+workflows, pre-save failure logging/tests, and validation documentation; they do not change the
+Sensor public API or Sidecar schemas.
