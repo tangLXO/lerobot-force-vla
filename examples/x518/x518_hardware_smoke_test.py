@@ -23,8 +23,8 @@ import argparse
 
 from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
 
-_LEFT_FORCE = "tactile.gripper.left_finger.normal_force"
-_RIGHT_FORCE = "tactile.gripper.right_finger.normal_force"
+_LEFT_FORCE = "left.normal_force"
+_RIGHT_FORCE = "right.normal_force"
 
 
 def _positive_int(value: str) -> int:
