@@ -535,6 +535,7 @@ def record(
                     if sensor_recorder is not None:
                         sensor_recorder.prepare_episode(task_info=[cfg.dataset.single_task])
                 except Exception:
+                    logging.exception("Recording failed before main save; aborting the current episode.")
                     dataset.clear_episode_buffer()
                     if sensor_recorder is not None:
                         sensor_recorder.abort_episode("Recording failed before main save.")
