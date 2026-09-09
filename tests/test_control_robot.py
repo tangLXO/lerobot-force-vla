@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import re
 from unittest.mock import patch
 
@@ -25,10 +26,12 @@ pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[ha
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
+from lerobot.robots.sensorized_robot import SensorizedRobot
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
 from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
+from lerobot.sensors import Sensor, SensorConfig, SensorFeature
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -42,6 +45,28 @@ def _ticks(summary: str) -> int:
 def _step_calls(summary: str, step: str) -> int:
     """How many ticks ran *step*, off the loop-body breakdown of a run summary."""
     return int(re.search(rf"\n\s+{step}\s+.*· (\d+) calls", summary).group(1))
+
+
+class _RecorderFailureSensor(Sensor):
+    """Optional raw-only sensor used to exercise recorder abort cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__(SensorConfig(expected_sample_rate_hz=100, required=False, state_features=[]))
+        self.connected = False
+
+    @property
+    def features(self) -> dict[str, SensorFeature]:
+        return {"probe.normal_force": SensorFeature("float32", "N")}
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def disconnect(self) -> None:
+        self.connected = False
 
 
 def test_calibrate():
@@ -223,3 +248,49 @@ def test_record_loop_without_a_teleoperator_paces_and_terminates():
 
     # 0.1 s at 30 Hz is 3 ticks; the upper bound is what proves the phase was paced.
     assert 1 <= calls <= 6
+
+
+def test_record_logs_and_aborts_sensor_episode_on_pre_save_failure(tmp_path):
+    sensor = _RecorderFailureSensor()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "pre_save_failure",
+        num_episodes=1,
+        episode_time_s=0.1,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+    )
+
+    def attach_failure_sensor(robot, _configs):
+        return SensorizedRobot(robot, {"failure_probe": sensor})
+
+    with (
+        patch("lerobot.scripts.lerobot_record.logging.exception") as log_exception,
+        patch("lerobot.scripts.lerobot_record.attach_sensors", side_effect=attach_failure_sensor),
+        patch(
+            "lerobot.scripts.lerobot_record.init_keyboard_listener",
+            return_value=(
+                None,
+                {"stop_recording": False, "exit_early": False, "rerecord_episode": False},
+            ),
+        ),
+        patch(
+            "lerobot.scripts.lerobot_record.record_loop",
+            side_effect=RuntimeError("synthetic pre-save failure"),
+        ),
+        pytest.raises(RuntimeError, match="synthetic pre-save failure"),
+    ):
+        record(cfg)
+
+    log_exception.assert_called_once_with("Recording failed before main save; aborting the current episode.")
+    journal_paths = list((dataset_cfg.root / "meta" / "sensor_transactions").glob("*.json"))
+    assert len(journal_paths) == 1
+    assert json.loads(journal_paths[0].read_text())["state"] == "ABORTED"
+    assert not sensor.is_connected
+    assert not (dataset_cfg.root / ".sensor-writer.lock").exists()
