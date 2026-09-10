@@ -12,8 +12,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import lerobot.datasets.sensor_transaction as legacy
-import lerobot.datasets.sensor_transaction_v2 as v2
+import lerobot.datasets.sensor_transaction as transaction_module
 from lerobot.datasets.sensor_stream import SensorStreamRecorder
 from lerobot.sensors import Sensor, SensorConfig, SensorFeature
 
@@ -35,7 +34,7 @@ def main():
         if phase == name:
             os._exit(73)
 
-    original_atomic = legacy._atomic_write_json
+    original_atomic = transaction_module._atomic_write_json
 
     def atomic(path, payload):
         label = (
@@ -49,8 +48,7 @@ def main():
         original_atomic(path, payload)
         checkpoint(label + ":after")
 
-    legacy._atomic_write_json = atomic
-    v2._atomic_write_json = atomic
+    transaction_module._atomic_write_json = atomic
     original_replace = os.replace
 
     def replace(source, destination):
@@ -72,14 +70,14 @@ def main():
             checkpoint("promote:after")
 
     os.replace = replace
-    original_cleanup = legacy.SensorTransaction._cleanup_staging
+    original_cleanup = transaction_module.SensorTransaction._cleanup_staging
 
     def cleanup(transaction):
         checkpoint("cleanup:before")
         original_cleanup(transaction)
         checkpoint("cleanup:after")
 
-    legacy.SensorTransaction._cleanup_staging = cleanup
+    transaction_module.SensorTransaction._cleanup_staging = cleanup
     original_unlink = Path.unlink
 
     def unlink(path, *args, **kwargs):
@@ -91,7 +89,7 @@ def main():
 
     Path.unlink = unlink
     if recovering:
-        v2.TransactionRecoveryManager(root).recover()
+        transaction_module.TransactionRecoveryManager(root).recover()
         raise AssertionError(f"Recovery crash point was not reached: {phase}")
 
     class Force(Sensor):

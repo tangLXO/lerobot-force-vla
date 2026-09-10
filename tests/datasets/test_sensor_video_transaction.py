@@ -11,7 +11,7 @@ from test_sensor_stream import FakeSensor, capture
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sensor_stream import SensorStreamRecorder
-from lerobot.datasets.sensor_transaction_v2 import capture_logical_evidence
+from lerobot.datasets.sensor_transaction import capture_logical_evidence
 
 
 def encode_video(path, count=3):

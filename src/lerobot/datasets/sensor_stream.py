@@ -33,11 +33,11 @@ from lerobot.utils.errors import DeviceNotConnectedError
 from .sensor_spool import SensorParquetSpoolWriter
 from .sensor_transaction import (
     SensorTransaction,
+    TransactionRecoveryManager,
     parquet_file_record,
     sha256_file,
     validate_episode_uid,
 )
-from .sensor_transaction_v2 import SensorTransactionV2, TransactionRecoveryManager
 
 SIDECAR_SCHEMA_VERSION = 1
 logger = logging.getLogger(__name__)
@@ -305,7 +305,7 @@ class SensorStreamRecorder:
             for instance, sensor in self.sensors.items():
                 self._recorder_leases[instance] = sensor.acquire_recorder()
             self._active = True
-            self._transaction = SensorTransactionV2.begin(self.root, resolved_uid, episode_index)
+            self._transaction = SensorTransaction.begin(self.root, resolved_uid, episode_index)
             self._main_precondition = self._transaction.journal["main_precondition"]
             if dataset is not None:
                 self._bind_dataset(dataset)

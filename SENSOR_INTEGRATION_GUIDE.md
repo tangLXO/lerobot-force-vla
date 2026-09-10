@@ -447,8 +447,9 @@ Robot 集成使用 `SensorizedRobot` 组合，持有 `sensors`，把 `sensor.fea
 
 恢复能力限定为 **process-crash recoverable + replayable on-disk state**，不承诺掉电持久性。
 Reader 的 fast/full 验证都严格只读；恢复交给持写锁的 Writer 或 `TransactionRecoveryManager`。
-v1 通过显式 `recover_legacy()` 恢复，不自动升级 journal。Hub subset、Windows spawn、批量窗口、
-64 MiB worker-local 缓存与诊断使用方式见 [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md)。
+恢复仅发现 active pointer 和未清理 staging，不扫描历史 journal；早期原型格式不受支持且不提供迁移。
+Hub subset、Windows spawn、批量窗口、64 MiB worker-local 缓存与诊断使用方式见
+[`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md)。
 
 ## 14. 当前 X518 参考实例
 

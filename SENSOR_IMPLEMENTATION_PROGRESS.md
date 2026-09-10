@@ -53,11 +53,12 @@ Default external uv/pytest/HF caches were not writable; workspace caches resolve
 - Acceptance: **249 passed** (139 Sensor baseline/new tests plus 110 rollout/interactive tests).
   Ruff check, format check (17 changed/new Python files), and `git diff --check` passed.
   Bounded buffer tests cover 256 and 8192 Raw/Sync rows; no whole-episode row or fragment list remains.
-  Transaction v1 remains in use; stage 3 introduces RECORDING and the active pointer together.
+  The predecessor transaction implementation remains in use; stage 3 introduces RECORDING and the
+  active pointer together.
 
 ## Stage 3 — verified
 
-- Transaction v2 records RECORDING before subscriptions, with a fixed
+- The finalized transaction implementation records RECORDING before subscriptions, with a fixed
   `.sensor-staging/active_transaction.json` and an episode-local discovery intent.
   The existing journal path remains authoritative. Missing/malformed/stale pointers
   are rebuilt from uncleaned staging; conflicting candidates are refused.
@@ -72,8 +73,8 @@ Default external uv/pytest/HF caches were not writable; workspace caches resolve
   historical episodes. Sensor recording seals videos per episode even when ordinary
   main recording is configured for batched encoding; the setting is restored afterward.
 - Recovery and mutations require the writer lock. Writer startup discovers only the
-  active transaction. `TransactionRecoveryManager.recover_legacy()` explicitly opts into
-  v1 historical recovery without upgrading journals. Reader conversion remains stage 4.
+  active transaction from its pointer or uncleaned staging; historical journals are never scanned.
+  Reader conversion remains stage 4.
 - A save exception followed by successful COMMITTED recovery returns success and
   synchronizes the real Writer's in-memory state; the next episode can be recorded.
 - Staging fragments carry UID/instance metadata removed from final Sidecar v1 files.
@@ -95,7 +96,8 @@ Default external uv/pytest/HF caches were not writable; workspace caches resolve
   video or global metadata without sufficient content evidence require explicit recovery.
 - Fast verification checks Sidecar size/footer and small JSON digests; full additionally
   hashes and checks every Sidecar row identity. Both verify selected main logical evidence.
-  V1 reads never use historical snapshot hashes or invent sequence boundaries.
+  Reads use journal logical evidence and recorded sequence boundaries, never historical
+  snapshot hashes.
 - Raw range reads conservatively prune row groups without assuming measurement order.
   Dense selection uses bounded candidate/grid blocks and the full causal/age predicate.
   Rational relative grids preserve integer anchors; Sync anchors use a four-episode LRU.
@@ -130,15 +132,15 @@ Default external uv/pytest/HF caches were not writable; workspace caches resolve
 
 - Hub localization narrows metadata discovery, validates selected COMMITTED journals before
   large downloads, and fetches exact main/Raw/Sync/metadata closure even when main data is cached.
-  Requests pin a commit and preserve token/cache destination. V1 subset reads avoid snapshot
-  verification/upgrades. Complete local data needs no network. Read-only snapshot blob links
-  are permitted only within the same Hub repository cache.
+  Requests pin a commit and preserve token/cache destination. Subset reads use logical evidence
+  without snapshot verification or upgrades. Complete local data needs no network. Read-only
+  snapshot blob links are permitted only within the same Hub repository cache.
 - Raw/Sync queue watermarks, utilization and rate-limited >75% warnings are runtime-only.
   Diagnostics include lag, invalid attempts, sequence gaps, spool/final bytes, fragments,
   row groups, compression and flush timings, overflow and worker errors. COMMITTED logs
   one concise summary and retains the last diagnostic snapshot after cleanup.
 - Three Sensor documents and AGENTS retain existing material with corrected lifecycle,
-  process-crash-only recovery, read-only Reader, explicit legacy recovery and Hub/cache/batch
+  process-crash-only active-transaction recovery, read-only Reader and Hub/cache/batch
   guidance. Markdown local links and Python example syntax are tested.
 - `benchmarks/sensor_pipeline.py` implements the default 2x1000 Hz / 30-minute / 30 Hz /
   500 ms / 200 Hz workload and sequential/random/batch measurements. A 1-second smoke run
@@ -201,9 +203,9 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
 | Required raw-only startup, optional nonblocking, shared record/rollout boundaries | `sensor_stream.py`, `sensorized_robot.py`, record/rollout adapters; `test_sensor_spool.py` startup and causal-boundary checks |
 | Bounded Raw and Sync, disk fragment/reference index, timed flush | `sensor_spool.py`; 256/8192-row tests inspect both buffer peaks, SQLite reference counts and final footer row counts |
 | Shutdown ownership, fatal overflow, trim and exact Sync references | Recorder lifecycle and merge; stream/spool tests inject join timeout, overflow, corrupted references and late rows |
-| Fixed pointer, RECORDING ordering, recovery state machine | `sensor_transaction_v2.py`; subprocess exit boundaries, discover-before-subscribe, conflicting staging and three-repeat recovery snapshots |
+| Fixed pointer, RECORDING ordering, recovery state machine | `sensor_transaction.py`; subprocess exit boundaries, discover-before-subscribe, conflicting staging and three-repeat recovery snapshots |
 | Main data/video/metadata seal, append-stable logical evidence | Writer/metadata hooks; real writer next-episode recovery, shared append and video sealing tests |
-| No unrelated history scan or shared-main whole-file hash | Metered opens/read bytes/hash calls compare zero versus 100 unrelated historical groups; legacy snapshot helper must not run |
+| No unrelated history scan or shared-main whole-file hash | Metered opens/read bytes/hash calls compare zero versus 100 unrelated historical groups; snapshot scanning must not run |
 | Fast/full read-only verification and live/shared conflict refusal | `sensor_verification.py`, Reader; full tree/mtime/content comparison, dead locks, new live writer, selected/unselected and shared-artifact corruption tests |
 | Range pruning, exact integer grids, full candidate predicate | Selection module; missing footer statistics, unordered measurement and 1000 independent oracle cases compare all six fields |
 | Worker byte LRU, no handles in pickle, PID reset | `sensor_window_cache.py`; eviction, oversized and dictionary-expanded groups, pickle/PID tests |
@@ -281,7 +283,7 @@ Requirement evidence map (test assertions were inspected; final run outcomes rem
   The completed-fragment count now becomes visible only after footer access finishes.
 - Independent delivery snapshots: stage 1 **118 passed**; stage 2 **251 passed** plus
   the added footer-failure regression; stage 3 has **346** distinct passing cases after
-  correcting two copied journal-v1 expectations and rerunning all **24** spool tests;
+  correcting two copied predecessor-journal expectations and rerunning all **24** spool tests;
   stage 4 **1,385 passed**; stage 5 **1,412 passed**. Final stage 6 combined gate is
   running as exec **47926**, `.cache/sensor-production-final.log` and matching JUnit XML.
 - The full 30-minute capture is complete: two streams of 1.8 million rows and 54,000

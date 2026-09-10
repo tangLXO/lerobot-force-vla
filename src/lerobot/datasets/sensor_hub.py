@@ -115,12 +115,10 @@ def ensure_sensor_subset(root, episodes, total_episodes, download, *, refresh=Fa
                 "Selected Sensor journal does not describe its complete Sidecar closure."
             )
         closure.update(required)
-        if journal["journal_version"] == 2:
-            evidence = journal.get("main_evidence")
-            if not evidence or evidence.get("version") != 1:
-                raise SensorTransactionError("Selected Hub Sensor journal lacks supported main evidence.")
-            closure.update(item["path"] for item in journal["main_artifacts"] if item["role"] != "temporary")
-        # V1 main data/video paths have already been selected by the base Dataset.
+        evidence = journal.get("main_evidence")
+        if not evidence or evidence.get("version") != 1:
+            raise SensorTransactionError("Selected Hub Sensor journal lacks supported main evidence.")
+        closure.update(item["path"] for item in journal["main_artifacts"] if item["role"] != "temporary")
     for relative in closure:
         _exact_path(root, relative)
     missing = sorted(name for name in closure if refresh or not (root / name).is_file())

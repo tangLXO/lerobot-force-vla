@@ -6,17 +6,22 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import math
 import os
 import shutil
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import pyarrow.parquet as pq
+
+JOURNAL_VERSION = 1
 
 
 class SensorTransactionError(RuntimeError):
@@ -69,101 +74,6 @@ def parquet_file_record(root: Path, staging_path: Path, final_path: Path) -> dic
     }
 
 
-def capture_main_dataset_state(root: Path) -> dict[str, Any]:
-    """Capture exact main metadata plus all committed main artifact digests."""
-    info_path = root / "meta" / "info.json"
-    info = json.loads(info_path.read_text(encoding="utf-8")) if info_path.exists() else {}
-    artifacts: dict[str, dict[str, Any]] = {}
-    for top_level in ("data", "videos", "meta"):
-        directory = root / top_level
-        if not directory.exists():
-            continue
-        for path in sorted(file for file in directory.rglob("*") if file.is_file()):
-            relative = path.relative_to(root).as_posix()
-            if relative == "meta/sensor_streams.json" or relative.startswith(
-                ("meta/sensor_episodes/", "meta/sensor_transactions/")
-            ):
-                continue
-            artifacts[relative] = {
-                "size": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-    return {
-        "info_sha256": sha256_file(info_path) if info_path.exists() else None,
-        "total_episodes": info.get("total_episodes"),
-        "total_frames": info.get("total_frames"),
-        "artifacts": artifacts,
-    }
-
-
-def verify_expected_main_episode(root: Path, expected: dict[str, Any]) -> bool:
-    """Verify episode metadata, contiguous data indices, and the referenced data file."""
-    info_path = root / "meta" / "info.json"
-    if not info_path.exists():
-        return False
-    info = json.loads(info_path.read_text(encoding="utf-8"))
-    episode_index = int(expected["episode_index"])
-    frame_count = int(expected["frame_count"])
-    data_from = int(expected["dataset_from_index"])
-    data_to = int(expected["dataset_to_index"])
-    if data_to - data_from != frame_count:
-        return False
-    if info.get("total_episodes", 0) < episode_index + 1 or info.get("total_frames", 0) < data_to:
-        return False
-
-    episode_rows: list[dict[str, Any]] = []
-    episodes_dir = root / "meta" / "episodes"
-    if not episodes_dir.exists():
-        return False
-    for path in sorted(episodes_dir.rglob("*.parquet")):
-        episode_rows.extend(pq.read_table(path).to_pylist())
-    row = next((item for item in episode_rows if int(item["episode_index"]) == episode_index), None)
-    if row is None:
-        return False
-    if int(row["length"]) != frame_count:
-        return False
-    if int(row["dataset_from_index"]) != data_from or int(row["dataset_to_index"]) != data_to:
-        return False
-    task_info = expected.get("task_info")
-    if task_info is not None and row.get("tasks") != task_info:
-        return False
-
-    info_template = info.get("data_path", "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet")
-    data_path = root / info_template.format(
-        chunk_index=int(row["data/chunk_index"]), file_index=int(row["data/file_index"])
-    )
-    if not data_path.exists():
-        return False
-    data_rows = pq.read_table(data_path, columns=["index", "episode_index"]).to_pylist()
-    matching = [item for item in data_rows if int(item["episode_index"]) == episode_index]
-    if len(matching) != frame_count or [int(item["index"]) for item in matching] != list(
-        range(data_from, data_to)
-    ):
-        return False
-
-    video_keys = [
-        name for name, feature in info.get("features", {}).items() if feature.get("dtype") == "video"
-    ]
-    video_template = info.get("video_path")
-    for video_key in video_keys:
-        chunk_key = f"videos/{video_key}/chunk_index"
-        file_key = f"videos/{video_key}/file_index"
-        from_key = f"videos/{video_key}/from_timestamp"
-        to_key = f"videos/{video_key}/to_timestamp"
-        if video_template is None or any(key not in row for key in (chunk_key, file_key, from_key, to_key)):
-            return False
-        video_path = root / video_template.format(
-            video_key=video_key,
-            chunk_index=int(row[chunk_key]),
-            file_index=int(row[file_key]),
-        )
-        if not video_path.is_file() or video_path.stat().st_size == 0:
-            return False
-        if float(row[to_key]) <= float(row[from_key]):
-            return False
-    return True
-
-
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
@@ -185,9 +95,165 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         os.close(directory_fd)
 
 
+def light_main_precondition(root: Path) -> dict[str, Any]:
+    """Read only the small main info document, never historical artifacts."""
+    path = root / "meta/info.json"
+    content = path.read_bytes() if path.exists() else b""
+    info = json.loads(content) if content else {}
+    return {
+        "info_sha256": hashlib.sha256(content).hexdigest(),
+        "total_frames": info.get("total_frames", 0),
+        "total_episodes": info.get("total_episodes", 0),
+    }
+
+
+def _file_stamp(path: Path) -> dict[str, int] | None:
+    if not path.exists():
+        return None
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _canonical(value):
+    if isinstance(value, dict):
+        return {key: _canonical(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(item) for item in value]
+    if isinstance(value, bytes):
+        return {"bytes": base64.b64encode(value).decode("ascii")}
+    if isinstance(value, float):
+        return {"float_hex": value.hex()}
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise SensorTransactionError(f"Unsupported logical digest value: {type(value).__name__}.")
+
+
+def _row_bytes(row) -> bytes:
+    return (
+        json.dumps(_canonical(row), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode() + b"\n"
+    )
+
+
+def _episode_rows(path: Path, episode_index: int):
+    """Bound decoding and prune only when statistics prove the episode absent."""
+    with path.open("rb") as handle, pq.ParquetFile(handle) as parquet:
+        schema = parquet.schema_arrow
+        if "episode_index" not in schema.names:
+            raise SensorTransactionError(f"Missing episode_index in {path}.")
+        column = parquet.schema.names.index("episode_index")
+        for group in range(parquet.num_row_groups):
+            stats = parquet.metadata.row_group(group).column(column).statistics
+            if stats is not None and stats.has_min_max and not stats.min <= episode_index <= stats.max:
+                continue
+            for batch in parquet.iter_batches(batch_size=4096, row_groups=[group]):
+                for row in batch.to_pylist():
+                    if row["episode_index"] == episode_index:
+                        yield row
+
+
+def capture_logical_evidence(transaction: SensorTransaction, *, path_resolver=None) -> dict[str, Any]:
+    """Seal precisely one episode's metadata row, data range, schema and video ranges."""
+    root, journal = transaction.root, transaction.journal
+    resolve_path = path_resolver or transaction._artifact_path
+    expected = journal["expected_main"]
+    index = expected["episode_index"]
+    info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+    if info.get("total_frames", 0) < expected["dataset_to_index"] or info.get("total_episodes", 0) <= index:
+        raise SensorTransactionError("Main episode totals are not sealed.")
+    metadata_paths = [
+        item["path"] for item in journal["main_artifacts"] if item["role"] == "episode_metadata"
+    ]
+    if not metadata_paths:
+        raise SensorTransactionError("No registered episode metadata artifact.")
+    metadata_row = None
+    metadata_path = None
+    for relative in metadata_paths:
+        path = resolve_path(relative)
+        with closing(_episode_rows(path, index)) as rows:
+            for row in rows:
+                if metadata_row is not None:
+                    raise SensorTransactionError("Duplicate main episode identity.")
+                metadata_row, metadata_path = row, relative
+    if metadata_row is None:
+        raise SensorTransactionError("Registered metadata has no matching episode row.")
+    for key, value in (
+        ("length", expected["frame_count"]),
+        ("dataset_from_index", expected["dataset_from_index"]),
+        ("dataset_to_index", expected["dataset_to_index"]),
+    ):
+        if metadata_row.get(key) != value:
+            raise SensorTransactionError(f"Main episode {key} mismatch.")
+    if expected.get("task_info") is not None and metadata_row.get("tasks") != expected["task_info"]:
+        raise SensorTransactionError("Main episode task mismatch.")
+    data_relative = info["data_path"].format(
+        chunk_index=metadata_row["data/chunk_index"], file_index=metadata_row["data/file_index"]
+    )
+    if not any(
+        item["path"] == data_relative and item["role"] == "data" for item in journal["main_artifacts"]
+    ):
+        raise SensorTransactionError("Main data artifact was not registered before writing.")
+    data_path = resolve_path(data_relative)
+    digest = hashlib.sha256(b"lerobot-logical-rows-v1\n")
+    with data_path.open("rb") as handle, pq.ParquetFile(handle) as parquet:
+        schema = parquet.schema_arrow.remove_metadata()
+    digest.update(schema.serialize().to_pybytes())
+    count = 0
+    with closing(_episode_rows(data_path, index)) as rows:
+        for row in rows:
+            if row.get("index") != expected["dataset_from_index"] + count:
+                raise SensorTransactionError("Main episode logical range is not continuous.")
+            digest.update(_row_bytes(row))
+            count += 1
+    if count != expected["frame_count"]:
+        raise SensorTransactionError("Main episode logical row count mismatch.")
+    videos = []
+    for key, feature in info.get("features", {}).items():
+        if feature.get("dtype") != "video":
+            continue
+        from .video_utils import get_video_duration_in_s
+
+        prefix = f"videos/{key}"
+        relative = info["video_path"].format(
+            video_key=key,
+            chunk_index=metadata_row[f"{prefix}/chunk_index"],
+            file_index=metadata_row[f"{prefix}/file_index"],
+        )
+        start, end = metadata_row[f"{prefix}/from_timestamp"], metadata_row[f"{prefix}/to_timestamp"]
+        if not all(math.isfinite(value) for value in (start, end)) or not 0 <= start < end:
+            raise SensorTransactionError("Invalid main video time range.")
+        path = resolve_path(relative)
+        if not any(
+            item["path"] == relative and item["role"] == "video" for item in journal["main_artifacts"]
+        ):
+            raise SensorTransactionError("Main video artifact was not registered before writing.")
+        if get_video_duration_in_s(path) + 1 / info.get("fps", 30) < end:
+            raise SensorTransactionError("Main video is shorter than its episode range.")
+        videos.append({"path": relative, "from_timestamp": start, "to_timestamp": end})
+    return {
+        "version": 1,
+        "metadata_path": metadata_path,
+        "metadata_row": _canonical(metadata_row),
+        "data_path": data_relative,
+        "data_schema": str(schema),
+        "logical_rows_sha256": digest.hexdigest(),
+        "frame_count": count,
+        "videos": videos,
+    }
+
+
+def _require_writer(root: Path) -> None:
+    try:
+        owner = json.loads((root / ".sensor-writer.lock").read_text(encoding="utf-8"))
+        if owner["pid"] == os.getpid():
+            return
+    except (OSError, ValueError, KeyError):
+        pass
+    raise SensorTransactionError("Transaction recovery/mutation requires the Dataset writer lock.")
+
+
 @dataclass
 class SensorTransaction:
-    """One durable main-Dataset plus sidecar commit transaction."""
+    """One crash-replayable main-Dataset plus sidecar commit transaction."""
 
     root: Path
     journal: dict[str, Any]
@@ -199,7 +265,7 @@ class SensorTransaction:
 
     @property
     def state(self) -> TransactionState:
-        """Return the current durable state."""
+        """Return the transaction state recorded in the journal."""
         return TransactionState(self.journal["state"])
 
     @property
@@ -208,75 +274,106 @@ class SensorTransaction:
         return self.root / "meta" / "sensor_transactions" / f"{self.episode_uid}.json"
 
     @classmethod
-    def prepare(
-        cls,
-        root: Path,
-        *,
-        episode_uid: str,
-        episode_index: int,
-        frame_count: int,
-        dataset_from_index: int,
-        files: list[dict[str, Any]],
-        task_info: Any = None,
-        main_precondition: dict[str, Any] | None = None,
-    ) -> SensorTransaction:
-        """Persist PREPARED after every staging artifact has been closed and verified."""
-        root = Path(root)
-        validate_episode_uid(episode_uid)
-        precondition = main_precondition or capture_main_dataset_state(root)
-        expected = {
-            "episode_index": episode_index,
-            "frame_count": frame_count,
-            "dataset_from_index": dataset_from_index,
-            "dataset_to_index": dataset_from_index + frame_count,
-            "task_info": task_info,
-        }
-        transaction = cls(
-            root=root,
-            journal={
-                "journal_version": 1,
-                "episode_uid": episode_uid,
-                "state": TransactionState.PREPARED,
-                "main_precondition": precondition,
-                "expected_main": expected,
-                "main_postcondition": None,
-                "files": files,
-                "reason": None,
-            },
-        )
-        transaction._verify_staging_files()
-        transaction._persist()
-        return transaction
-
-    @classmethod
     def load(cls, path: Path) -> SensorTransaction:
         """Load one existing journal without changing it."""
         path = Path(path)
         journal = json.loads(path.read_text(encoding="utf-8"))
+        version = journal.get("journal_version")
+        if isinstance(version, bool) or not isinstance(version, int) or version != JOURNAL_VERSION:
+            raise SensorTransactionError("Unsupported sensor journal version.")
         episode_uid = validate_episode_uid(journal.get("episode_uid"))
         if path.stem != episode_uid:
             raise ValueError(f"Sensor transaction filename and episode_uid differ: {path}.")
-        if journal.get("journal_version") == 2:
-            from .sensor_transaction_v2 import SensorTransactionV2
-
-            return SensorTransactionV2(path.parents[2], journal)
-        if journal.get("journal_version") != 1:
-            raise SensorTransactionError("Unsupported sensor journal version.")
         return cls(path.parents[2], journal)
 
-    def mark_main_saved(self, main_postcondition: dict[str, Any] | None = None) -> None:
-        """Verify the main episode postcondition and advance to MAIN_SAVED."""
+    @classmethod
+    def begin(cls, root: Path, episode_uid: str, episode_index: int) -> SensorTransaction:
+        """Persist a discoverable RECORDING transaction before subscriptions begin."""
+        root = Path(root)
+        _require_writer(root)
+        validate_episode_uid(episode_uid)
+        precondition = light_main_precondition(root)
+        if episode_index != precondition["total_episodes"]:
+            raise SensorTransactionError("Recording episode index differs from main precondition.")
+        staging = root / ".sensor-staging" / episode_uid
+        staging.mkdir(parents=True, exist_ok=False)
+        intent = {
+            "episode_uid": episode_uid,
+            "intent_id": str(uuid.uuid4()),
+            "episode_index": episode_index,
+            "precondition": precondition,
+        }
+        _atomic_write_json(staging / "transaction_intent.json", intent)
+        transaction = cls(
+            root,
+            {
+                "journal_version": JOURNAL_VERSION,
+                "episode_uid": episode_uid,
+                "state": TransactionState.RECORDING,
+                "intent_id": intent["intent_id"],
+                "main_precondition": precondition,
+                "expected_main": {"episode_index": episode_index},
+                "main_artifacts": [],
+                "files": [],
+                "main_evidence": None,
+                "episode_start_sequence": {},
+                "reason": None,
+            },
+        )
+        transaction._persist()
+        _atomic_write_json(
+            root / ".sensor-staging/active_transaction.json",
+            {"episode_uid": episode_uid, "intent_id": intent["intent_id"]},
+        )
+        return transaction
+
+    def prepare_sidecars(
+        self, *, frame_count, files, task_info, sequence_boundaries, required_streams
+    ) -> SensorTransaction:
+        """Close and verify staged sidecars before the main Dataset save."""
+        if self.state != TransactionState.RECORDING:
+            raise SensorTransactionError("Only a RECORDING transaction can be prepared.")
+        intent = json.loads(
+            (self.root / ".sensor-staging" / self.episode_uid / "transaction_intent.json").read_text()
+        )
+        if intent["intent_id"] != self.journal["intent_id"] or intent["episode_uid"] != self.episode_uid:
+            raise SensorTransactionError("Staging identity mismatch.")
+        start = self.journal["main_precondition"]["total_frames"]
+        self.journal["expected_main"].update(
+            frame_count=frame_count,
+            dataset_from_index=start,
+            dataset_to_index=start + frame_count,
+            task_info=task_info,
+        )
+        self.journal.update(
+            files=files,
+            episode_start_sequence=sequence_boundaries,
+            required_streams=required_streams,
+        )
+        self._verify_staging_files()
+        self._advance(TransactionState.PREPARED)
+        return self
+
+    def register_artifact(self, path: Path, role: str) -> None:
+        """Persist the actual locator and prewrite stamp before its first modification."""
+        _require_writer(self.root)
+        if self.state not in (TransactionState.RECORDING, TransactionState.PREPARED):
+            raise SensorTransactionError("Cannot register an artifact after main sealing.")
+        relative = path.resolve().relative_to(self.root.resolve()).as_posix()
+        self._artifact_path(relative)
+        if not any(
+            item["path"] == relative and item["role"] == role for item in self.journal["main_artifacts"]
+        ):
+            self.journal["main_artifacts"].append(
+                {"path": relative, "role": role, "before": _file_stamp(path)}
+            )
+            self._persist()
+
+    def mark_main_saved(self) -> None:
+        """Seal the main episode's logical evidence and advance to MAIN_SAVED."""
         if self.state != TransactionState.PREPARED:
-            if self.state in {
-                TransactionState.MAIN_SAVED,
-                TransactionState.SIDECAR_PROMOTED,
-                TransactionState.COMMITTED,
-            }:
-                return
             raise SensorTransactionError(f"Cannot mark main saved from {self.state}.")
-        if not verify_expected_main_episode(self.root, self.journal["expected_main"]):
-            raise SensorTransactionError("Main Dataset does not satisfy the prepared episode postcondition.")
-        self.journal["main_postcondition"] = main_postcondition or capture_main_dataset_state(self.root)
+        self.journal["main_evidence"] = capture_logical_evidence(self)
         self._advance(TransactionState.MAIN_SAVED)
 
     def promote_sidecars(self) -> None:
@@ -313,65 +410,77 @@ class SensorTransaction:
             raise SensorTransactionError(f"Cannot commit from {self.state}.")
         self._verify_committed()
         self._advance(TransactionState.COMMITTED)
-
         self._cleanup_staging()
-
-    def _cleanup_staging(self) -> None:
-        staging_root = self.root / ".sensor-staging" / self.episode_uid
-        if staging_root.exists():
-            shutil.rmtree(staging_root)
 
     def abort(self, reason: str) -> None:
         """Abort a definitely-unsaved main episode and quarantine its staging data."""
-        self._quarantine_staging()
         self.journal["reason"] = reason
         self._advance(TransactionState.ABORTED)
+        self._quarantine_staging()
+        self._clear_active_pointer()
 
     def quarantine(self, reason: str) -> None:
         """Quarantine an ambiguous/conflicting transaction and refuse repair."""
-        self._quarantine_staging()
         self.journal["reason"] = reason
         self._advance(TransactionState.QUARANTINED)
+        self._quarantine_staging()
+        self._clear_active_pointer()
 
     def replay(self) -> TransactionState:
         """Deterministically replay this transaction as far as evidence permits."""
-        from .sensor_transaction_v2 import _require_writer
-
         _require_writer(self.root)
         try:
-            if self.state == TransactionState.PREPARED:
-                current = capture_main_dataset_state(self.root)
-                if current == self.journal["main_precondition"]:
-                    self.abort("Main Dataset still exactly matches the PREPARED precondition.")
+            staging = self.root / ".sensor-staging" / self.episode_uid
+            if staging.exists() and self.state not in (
+                TransactionState.ABORTED,
+                TransactionState.QUARANTINED,
+                TransactionState.COMMITTED,
+            ):
+                intent = json.loads((staging / "transaction_intent.json").read_text(encoding="utf-8"))
+                if (
+                    intent.get("intent_id") != self.journal["intent_id"]
+                    or intent.get("episode_uid") != self.episode_uid
+                ):
+                    raise SensorTransactionError("Staging identity differs from journal.")
+            if self.state in (TransactionState.RECORDING, TransactionState.PREPARED):
+                if self._definitely_unsaved():
+                    self.abort("No registered main artifact changed.")
                     return self.state
-                if not verify_expected_main_episode(self.root, self.journal["expected_main"]):
-                    self.quarantine("Cannot prove whether the prepared main episode was saved completely.")
-                    return self.state
-                self.journal["main_postcondition"] = current
-                self._advance(TransactionState.MAIN_SAVED)
+                if self.state == TransactionState.RECORDING:
+                    raise SensorTransactionError("Main artifacts changed before PREPARED.")
+                self.mark_main_saved()
             if self.state == TransactionState.MAIN_SAVED:
-                if not verify_expected_main_episode(self.root, self.journal["expected_main"]):
-                    self.quarantine("Main episode no longer matches the journal postcondition.")
-                    return self.state
                 self.promote_sidecars()
             if self.state == TransactionState.SIDECAR_PROMOTED:
                 self.commit()
             if self.state == TransactionState.COMMITTED:
                 self._verify_committed()
                 self._cleanup_staging()
+            if self.state in (TransactionState.ABORTED, TransactionState.QUARANTINED):
+                self._quarantine_staging()
+                self._clear_active_pointer()
             return self.state
-        except (OSError, ValueError, SensorTransactionError) as exc:
-            if self.state not in {TransactionState.ABORTED, TransactionState.QUARANTINED}:
-                self.quarantine(str(exc))
-            raise SensorTransactionError(
-                f"Sensor transaction {self.episode_uid} requires quarantine: {exc}"
-            ) from exc
+        except (OSError, ValueError, KeyError, SensorTransactionError) as exc:
+            self.quarantine(str(exc))
+            return self.state
+
+    def _definitely_unsaved(self) -> bool:
+        if light_main_precondition(self.root) != self.journal["main_precondition"]:
+            return False
+        for item in self.journal["main_artifacts"]:
+            if item["role"] == "temporary" or (item["role"] == "info" and item["path"] == "meta/info.json"):
+                continue
+            # Size/mtime are diagnostic stamps, not proof against partial same-size overwrite.
+            if item["before"] is not None or self._artifact_path(item["path"]).exists():
+                return False
+        return True
 
     def _advance(self, state: TransactionState) -> None:
         self.journal["state"] = state
         self._persist()
 
     def _persist(self) -> None:
+        _require_writer(self.root)
         _atomic_write_json(self.journal_path, self.journal)
 
     def _verify_staging_files(self) -> None:
@@ -405,18 +514,14 @@ class SensorTransaction:
             if str(metadata.schema.to_arrow_schema()) != record["schema"]:
                 raise SensorTransactionError(f"Transaction artifact schema mismatch: {path}.")
 
+    def _verify_main_postcondition(self) -> None:
+        if self.journal.get("main_evidence") != capture_logical_evidence(self):
+            raise SensorTransactionError("Main episode logical evidence mismatch.")
+
     def _verify_committed(self) -> None:
-        if not verify_expected_main_episode(self.root, self.journal["expected_main"]):
-            raise SensorTransactionError("Committed transaction main episode is inconsistent.")
-        if self.state != TransactionState.COMMITTED:
-            self._verify_main_postcondition()
+        self._verify_main_postcondition()
         self._verify_final_files()
         self._verify_sidecar_identity()
-
-    def _verify_main_postcondition(self) -> None:
-        expected = self.journal.get("main_postcondition")
-        if expected is None or capture_main_dataset_state(self.root) != expected:
-            raise SensorTransactionError("Main Dataset no longer matches the saved postcondition.")
 
     def _verify_sidecar_identity(self) -> None:
         expected_main = self.journal["expected_main"]
@@ -450,6 +555,21 @@ class SensorTransaction:
             if "frame_index" in schema_names and count != int(expected_main["frame_count"]):
                 raise SensorTransactionError(f"Sync frame indices mismatch: {path}.")
 
+    def _clear_active_pointer(self) -> None:
+        path = self.root / ".sensor-staging/active_transaction.json"
+        if path.exists():
+            pointer = json.loads(path.read_text(encoding="utf-8"))
+            if pointer.get("episode_uid") != self.episode_uid:
+                raise SensorTransactionError("Conflicting active transaction pointer.")
+            path.unlink()
+
+    def _cleanup_staging(self) -> None:
+        _require_writer(self.root)
+        staging_root = self.root / ".sensor-staging" / self.episode_uid
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        self._clear_active_pointer()
+
     def _quarantine_staging(self) -> None:
         staging = self.root / ".sensor-staging" / self.episode_uid
         if not staging.exists():
@@ -461,27 +581,93 @@ class SensorTransaction:
         os.replace(staging, quarantine)
 
 
-def replay_sensor_transactions(root: Path, *, refuse_quarantined: bool = True) -> list[SensorTransaction]:
-    """Explicit legacy recovery; caller must hold the writer lock before scanning history."""
-    from .sensor_transaction_v2 import _require_writer
+class TransactionRecoveryManager:
+    """Recover one discoverable active transaction under an explicit writer lock."""
 
-    root = Path(root)
-    _require_writer(root)
-    transactions: list[SensorTransaction] = []
-    journal_dir = root / "meta" / "sensor_transactions"
-    if not journal_dir.exists():
-        return transactions
-    for path in sorted(journal_dir.glob("*.json")):
-        transaction = SensorTransaction.load(path)
-        if transaction.state == TransactionState.QUARANTINED and refuse_quarantined:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+
+    def recover(self, *, writer_lock=None):
+        """Discover and replay only the active transaction or uncleaned staging."""
+        from .sensor_stream import SensorDatasetWriterLock
+
+        if writer_lock is None:
+            with SensorDatasetWriterLock(self.root) as lock:
+                return self.recover(writer_lock=lock)
+        _require_writer(self.root)
+        staging = self.root / ".sensor-staging"
+        pointer_path = staging / "active_transaction.json"
+        pointer = None
+        if pointer_path.exists():
+            try:
+                pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+                validate_episode_uid(pointer["episode_uid"])
+            except (ValueError, KeyError, TypeError):
+                pointer = None
+        candidates = []
+        if pointer is not None:
+            journal = self.root / "meta/sensor_transactions" / f"{pointer['episode_uid']}.json"
+            if journal.exists():
+                transaction = SensorTransaction.load(journal)
+                if transaction.journal.get("intent_id") == pointer.get("intent_id"):
+                    candidates.append(transaction)
+        # Only uncleaned staging is inspected. Historical COMMITTED journals are never scanned.
+        if staging.exists():
+            for directory in staging.iterdir():
+                if not directory.is_dir():
+                    continue
+                uid = validate_episode_uid(directory.name)
+                if candidates and candidates[0].episode_uid == uid:
+                    continue
+                intent_path = directory / "transaction_intent.json"
+                if not intent_path.exists():
+                    if not any(directory.iterdir()):
+                        # mkdir completed but intent creation did not start: no subscription or main write was legal.
+                        directory.rmdir()
+                        continue
+                    raise SensorTransactionError("Unidentified staging cannot be recovered safely.")
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                if intent.get("episode_uid") != uid:
+                    raise SensorTransactionError("Staging intent UID mismatch.")
+                journal = self.root / "meta/sensor_transactions" / f"{uid}.json"
+                if journal.exists():
+                    candidates.append(SensorTransaction.load(journal))
+                else:
+                    candidates.append(
+                        SensorTransaction(
+                            self.root,
+                            {
+                                "journal_version": JOURNAL_VERSION,
+                                "episode_uid": uid,
+                                "state": TransactionState.RECORDING,
+                                "intent_id": intent["intent_id"],
+                                "main_precondition": intent["precondition"],
+                                "expected_main": {"episode_index": intent["episode_index"]},
+                                "main_artifacts": [],
+                                "files": [],
+                                "main_evidence": None,
+                            },
+                        )
+                    )
+        if (
+            len(candidates) > 1
+            and candidates[0].state
+            in (TransactionState.COMMITTED, TransactionState.ABORTED, TransactionState.QUARANTINED)
+            and not (staging / candidates[0].episode_uid).exists()
+        ):
+            candidates.pop(0)  # A stale terminal pointer cannot supersede an uncleaned active intent.
+        if len(candidates) > 1:
             raise SensorTransactionError(
-                f"Dataset contains quarantined sensor transaction {transaction.episode_uid}: "
-                f"{transaction.journal.get('reason')}"
+                "Multiple conflicting active transaction candidates; refusing to guess."
             )
+        if not candidates:
+            if pointer_path.exists():
+                pointer_path.unlink()
+            return None
+        transaction = candidates[0]
+        _atomic_write_json(
+            pointer_path,
+            {"episode_uid": transaction.episode_uid, "intent_id": transaction.journal["intent_id"]},
+        )
         transaction.replay()
-        if transaction.state == TransactionState.QUARANTINED and refuse_quarantined:
-            raise SensorTransactionError(
-                f"Dataset contains quarantined sensor transaction {transaction.episode_uid}."
-            )
-        transactions.append(transaction)
-    return transactions
+        return transaction

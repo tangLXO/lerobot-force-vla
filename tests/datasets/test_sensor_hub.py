@@ -197,35 +197,27 @@ def test_dataset_rejects_selected_unfinished_journal_before_large_downloads(
     assert not any(name.startswith(("raw/", "sync/", "data/", "videos/")) for name in downloaded)
 
 
-def test_v1_subset_download_and_read_avoid_legacy_snapshot_verification(
-    recorded_dataset, tmp_path, monkeypatch
-):
-    source, destination = recorded_dataset.root, tmp_path / "legacy-subset"
+def test_unsupported_journal_version_is_rejected_before_large_downloads(recorded_dataset, tmp_path):
+    source, destination = recorded_dataset.root, tmp_path / "unsupported-journal"
     uid = uid_for(source, 1)
     path = source / f"meta/sensor_transactions/{uid}.json"
     journal = json.loads(path.read_text())
-    journal["journal_version"] = 1
-    del journal["main_artifacts"]
-    del journal["main_evidence"]
-    del journal["episode_start_sequence"]
+    journal["journal_version"] = 2
     path.write_text(json.dumps(journal))
+    copy_paths(
+        source,
+        destination,
+        list(filter_repo_objects(all_paths(source), allow_patterns=METADATA_DOWNLOAD_PATTERNS)),
+    )
+    downloaded = []
 
-    def snapshot(_repo_id, *, allow_patterns, **_kwargs):
-        names = list(filter_repo_objects(all_paths(source), allow_patterns=allow_patterns))
+    def fetch(names):
+        downloaded.extend(names)
         copy_paths(source, destination, names)
-        return str(destination)
 
-    monkeypatch.setattr("lerobot.datasets.dataset_metadata.snapshot_download", snapshot)
-    monkeypatch.setattr("lerobot.datasets.lerobot_dataset.snapshot_download", snapshot)
-    monkeypatch.setattr(
-        "lerobot.datasets.sensor_transaction.capture_main_dataset_state",
-        lambda *_a: pytest.fail("legacy snapshot scan"),
-    )
-    dataset = LeRobotDataset(recorded_dataset.repo_id, root=destination, episodes=[1], revision=COMMIT)
-    SensorStreamReader(dataset.root, episodes=[1], verify="full")
-    assert (
-        json.loads((destination / f"meta/sensor_transactions/{uid}.json").read_text())["journal_version"] == 1
-    )
+    with pytest.raises(SensorTransactionError, match="Unsupported sensor journal version"):
+        ensure_sensor_subset(destination, [1], 3, fetch)
+    assert downloaded == [f"meta/sensor_transactions/{uid}.json"]
 
 
 def test_branch_downloads_pin_before_journals_and_large_artifacts(recorded_dataset, tmp_path, monkeypatch):

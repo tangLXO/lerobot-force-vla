@@ -1,6 +1,6 @@
 # Sensor Dataset Sidecar Format
 
-Status: **Sidecar v1 / Transaction v2**
+Status: **Sidecar v1 / transaction journal format v1**
 
 This document defines the native-rate Sensor Sidecar stored beside an ordinary LeRobot
 Dataset. The main Dataset remains fixed-FPS: selected scalar Sensor features are part of
@@ -98,12 +98,12 @@ creates neither a main frame nor a Sync row.
 ## Transaction journal
 
 `meta/sensor_transactions/<episode_uid>.json` is retained for audit and deterministic recovery.
-Transaction v2 records a lightweight precondition, expected episode/frame/logical data range,
-required streams, subscription start sequences, staging identity, and actual artifact locators
-registered before main-file mutation. Immutable Sidecars have file digests. Main evidence uses
-the exact episode metadata row, continuous logical data rows, schema and a versioned logical-row
-digest; shared videos have paths and time ranges. Appending another episode does not invalidate
-older evidence through a whole shared-file SHA mismatch.
+Transaction journal format v1 records a lightweight precondition, expected episode/frame/logical
+data range, required streams, subscription start sequences, staging identity, and actual artifact
+locators registered before main-file mutation. Immutable Sidecars have file digests. Main evidence
+uses the exact episode metadata row, continuous logical data rows, schema and a versioned
+logical-row digest; shared videos have paths and time ranges. Appending another episode does not
+invalidate older evidence through a whole shared-file SHA mismatch.
 
 The process-crash-recoverable state machine is:
 
@@ -145,16 +145,14 @@ Recovery is explicit when needed:
 
 ```python
 from pathlib import Path
-from lerobot.datasets.sensor_transaction_v2 import TransactionRecoveryManager
+from lerobot.datasets.sensor_transaction import TransactionRecoveryManager
 
 recovery = TransactionRecoveryManager(Path("dataset_root"))
-recovery.recover()  # acquires the writer lock; discovers only the active v2 transaction
-# For a known v1 dataset, explicitly opt into legacy discovery/snapshot verification:
-recovery.recover_legacy()
+recovery.recover()  # acquires the writer lock; discovers only the active transaction
 ```
 
-V1 journals remain readable and explicitly recoverable without automatic upgrades. Legacy
-snapshot hashes are confined to explicit legacy recovery, never normal Reader verification.
+Earlier prototype journals are unsupported and have no migration path. Recovery discovers only
+the active pointer and uncleaned staging; it never scans historical committed journals.
 Staging and quarantine directories are excluded from Hub upload; committed Sidecars are part of
 a normal whole-Dataset upload.
 
@@ -173,14 +171,13 @@ timestamp_ns <= grid_timestamp_ns
 arrival_timestamp_ns <= grid_timestamp_ns
 is_valid
 grid_timestamp_ns - timestamp_ns <= max_age
-sequence >= episode_start_sequence[instance]  # v2 only
+sequence >= episode_start_sequence[instance]
 ```
 
-Among eligible candidates, select the maximum `(timestamp_ns, sequence)`. V1 restricts candidates
-to its own Raw episode and does not invent a sequence boundary. Row-group statistics conservatively
-prune candidates without assuming measurement order; missing statistics disable the corresponding
-pruning. Candidate and grid arrays are blocked, with expiration checked for every grid point.
-Relative rational grid offsets preserve integer nanoseconds and the exact final anchor.
+Among eligible candidates, select the maximum `(timestamp_ns, sequence)`. Row-group statistics
+conservatively prune candidates without assuming measurement order; missing statistics disable the
+corresponding pruning. Candidate and grid arrays are blocked, with expiration checked for every
+grid point. Relative rational grid offsets preserve integer nanoseconds and the exact final anchor.
 
 Missing/stale points are zero-filled with `valid_mask=false`; missing provenance uses `-1`.
 The returned fields are `values [T,D]`, `valid_mask`, `target_timestamp_ns`,

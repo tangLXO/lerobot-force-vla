@@ -16,6 +16,7 @@ from test_sensor_stream import FakeSensor, capture, initialize_main
 
 from lerobot.datasets.sensor_spool import SensorParquetSpoolWriter
 from lerobot.datasets.sensor_stream import SensorRecorderError, SensorStreamRecorder
+from lerobot.datasets.sensor_transaction import JOURNAL_VERSION
 from lerobot.sensors import SensorConfig
 
 
@@ -89,7 +90,7 @@ def test_raw_and_sync_buffers_are_bounded_independent_of_episode_length(tmp_path
     sync = tmp_path / ".sensor-staging" / uid / "raw/sync" / f"{uid}.parquet"
     assert pq.read_metadata(raw).num_rows == count
     assert pq.read_metadata(sync).num_rows == count
-    assert transaction.journal["journal_version"] == 2
+    assert transaction.journal["journal_version"] == JOURNAL_VERSION == 1
     recorder.abort_prepared("test finished")
     recorder.close()
 

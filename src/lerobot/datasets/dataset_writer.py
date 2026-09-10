@@ -699,7 +699,7 @@ class DatasetWriter:
             for item in transaction.journal["main_artifacts"]
             if item["role"] == "episode_metadata"
         )
-        from .sensor_transaction_v2 import _episode_rows
+        from .sensor_transaction import _episode_rows
 
         with contextlib.closing(
             _episode_rows(self._root / locator, transaction.journal["expected_main"]["episode_index"])

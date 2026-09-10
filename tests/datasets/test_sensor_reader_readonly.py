@@ -13,7 +13,7 @@ from test_sensor_stream import FakeDataset, FakeSensor, capture, initialize_main
 
 from lerobot.configs.default import SensorWindowConfig
 from lerobot.datasets.sensor_stream import SensorDatasetWriterLock, SensorRecorderError, SensorStreamRecorder
-from lerobot.datasets.sensor_transaction import SensorTransactionError, sha256_file
+from lerobot.datasets.sensor_transaction import JOURNAL_VERSION, SensorTransactionError, sha256_file
 from lerobot.datasets.sensor_window import SensorStreamReader, SensorWindowDataset
 
 
@@ -60,10 +60,6 @@ def journal_path(root, uid):
 def test_read_operations_preserve_tree_mtime_count_and_journals(tmp_path, verify, monkeypatch):
     uid = create_episode(tmp_path)
     monkeypatch.setattr(
-        "lerobot.datasets.sensor_transaction.replay_sensor_transactions",
-        lambda *_a, **_k: pytest.fail("reader replay"),
-    )
-    monkeypatch.setattr(
         "lerobot.datasets.sensor_transaction.SensorTransaction.replay",
         lambda *_a, **_k: pytest.fail("reader repair"),
     )
@@ -107,7 +103,7 @@ def test_each_read_entry_refuses_a_new_live_writer(tmp_path):
 def add_unfinished(root, *, shared=False):
     uid = str(uuid.uuid4())
     payload = {
-        "journal_version": 2,
+        "journal_version": JOURNAL_VERSION,
         "episode_uid": uid,
         "state": "QUARANTINED",
         "expected_main": {"episode_index": 1},
@@ -189,25 +185,28 @@ def test_range_prunes_safely_with_unordered_measurements_or_missing_statistics(
     assert [group for groups in seen for group in groups] == ([5] if statistics else list(range(7)))
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_sequence_boundary_is_applied_only_when_present_in_v2(tmp_path, legacy, monkeypatch):
+def test_sequence_boundary_is_always_applied(tmp_path):
     uid = create_episode(tmp_path)
     path = journal_path(tmp_path, uid)
     payload = json.loads(path.read_text())
     payload["episode_start_sequence"] = {"gripper_force": 11}
-    if legacy:
-        payload["journal_version"] = 1
-        del payload["episode_start_sequence"]
-        del payload["main_artifacts"]
-        del payload["main_evidence"]
     path.write_text(json.dumps(payload))
-    monkeypatch.setattr(
-        "lerobot.datasets.sensor_transaction.capture_main_dataset_state",
-        lambda *_a: pytest.fail("legacy snapshot scan"),
-    )
     before = tree(tmp_path)
     reader = SensorStreamReader(tmp_path, instance="gripper_force", episode_index=0)
-    assert reader.get_window(350_000_000, 100, 10, 60).sequence.tolist() == ([10] if legacy else [11])
+    assert reader.get_window(350_000_000, 100, 10, 60).sequence.tolist() == [11]
+    assert tree(tmp_path) == before
+
+
+def test_missing_sequence_boundary_is_rejected(tmp_path):
+    uid = create_episode(tmp_path)
+    path = journal_path(tmp_path, uid)
+    payload = json.loads(path.read_text())
+    del payload["episode_start_sequence"]
+    path.write_text(json.dumps(payload))
+    before = tree(tmp_path)
+    reader = SensorStreamReader(tmp_path, instance="gripper_force", episode_index=0)
+    with pytest.raises(SensorTransactionError, match="Missing episode sequence boundary"):
+        reader.get_window(350_000_000, 100, 10, 60)
     assert tree(tmp_path) == before
 
 
@@ -252,7 +251,7 @@ def test_unverifiable_shared_global_artifact_requires_explicit_recovery(tmp_path
     journal_path(tmp_path, uid).write_text(
         json.dumps(
             {
-                "journal_version": 2,
+                "journal_version": JOURNAL_VERSION,
                 "episode_uid": uid,
                 "state": "QUARANTINED",
                 "expected_main": {"episode_index": 2},
@@ -313,18 +312,3 @@ def test_anchor_cache_reuses_decoded_sync(tmp_path, monkeypatch):
     first = reader.frame_anchor(0, 0)
     monkeypatch.setattr(pq, "ParquetFile", lambda *_a, **_k: pytest.fail("reopening cached Sync"))
     assert reader.frame_anchor(0, 1) == first
-
-
-def test_v1_shared_conflict_requires_explicit_recovery(tmp_path):
-    uid = create_episode(tmp_path)
-    path = journal_path(tmp_path, uid)
-    payload = json.loads(path.read_text())
-    payload["journal_version"] = 1
-    del payload["main_artifacts"]
-    del payload["main_evidence"]
-    path.write_text(json.dumps(payload))
-    add_unfinished(tmp_path, shared=True)
-    before = tree(tmp_path)
-    with pytest.raises(SensorTransactionError, match="Cannot prove a v1"):
-        SensorStreamReader(tmp_path, episodes=[0])
-    assert tree(tmp_path) == before

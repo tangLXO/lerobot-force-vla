@@ -1,9 +1,9 @@
 # Sensor production validation
 
 The six-stage implementation preserves Sensor/SensorizedRobot APIs, existing policy state
-inputs and Sidecar v1 final schemas/layout. Transaction v2 provides **process-crash recoverable
-+ replayable on-disk state**; it does not provide power-loss durability or concurrent
-Reader/Writer isolation.
+inputs and Sidecar v1 final schemas/layout. Transaction journal format v1 provides
+**process-crash recoverable + replayable on-disk state**; it does not provide power-loss durability
+or concurrent Reader/Writer isolation.
 
 The published commit IDs below reflect the final message-only history normalization. Their
 validation-relevant source trees are identical to the commits used for the recorded runs.
@@ -32,7 +32,7 @@ changing the final worktree; each snapshot was tested against the preceding stag
 | --- | --- |
 | 1 | 118 passed; local commit `a7cde76a` |
 | 2 | 252 passed in the final independent snapshot; local commit `21c79b7b` |
-| 3 | 343 passed initially; two copied v1 expectations were corrected to v2; all 24 spool tests then passed (346 distinct cases in the resulting gate) |
+| 3 | 343 passed initially; two copied predecessor-journal expectations were corrected to the finalized transaction behavior; all 24 spool tests then passed (346 distinct cases) |
 | 4 | 1,385 passed, including earlier stages and 1,000 independent oracle cases |
 | 5 | 1,412 passed, including Windows spawn/batch/cache, split-first factory and config tests |
 | 6 | 1,479 passed, 5 platform skips; combined final verification completed |
@@ -134,8 +134,8 @@ intermediate index tree was compared with its tested independent snapshot before
 | Commit | Scope |
 | --- | --- |
 | `a7cde76a` | Core causal reads and recorder sequence ownership |
-| `21c79b7b` | Bounded Raw/Sync spool and lifecycle, retaining Transaction v1 |
-| `15bfa5ea` | Transaction v2, sealing and crash recovery |
+| `21c79b7b` | Bounded Raw/Sync spool and lifecycle, retaining the predecessor transaction implementation |
+| `15bfa5ea` | Finalized transaction implementation, sealing and crash recovery |
 | `bd24c1f5` | Strict read-only Reader and causal range windows |
 | `df8af560` | Worker-local cache, batch windows and factory integration |
 | `5b2465ea` | Hub subset, diagnostics, documentation and benchmark |

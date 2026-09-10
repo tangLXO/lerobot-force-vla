@@ -67,8 +67,10 @@ DEVICE=cuda make test-end-to-end
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
 - **Sensor persistence**: follow [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) and
   [`SENSOR_INTEGRATION_GUIDE.md`](./SENSOR_INTEGRATION_GUIDE.md). Preserve Sidecar v1 final schemas/layout;
-  Transaction v2 guarantees process-crash recovery and replayable on-disk state, not power-loss durability.
+  transaction journal format v1 guarantees process-crash recovery and replayable on-disk state, not
+  power-loss durability.
   Reader paths are strictly read-only. Recovery belongs to a Writer/RecoveryManager holding the writer lock;
-  v1 historical recovery is explicit. Keep runtime diagnostics out of stable manifests. Validate bounded Raw
-  and Sync memory, subprocess recovery, read-only tree/mtime invariants, window oracle, Hub subset closure
-  and Windows spawn/batch behavior. Use structural I/O assertions in CI; benchmark speedup is not a hard gate.
+  recovery discovers only the active pointer and uncleaned staging, never historical journals. Keep runtime
+  diagnostics out of stable manifests. Validate bounded Raw and Sync memory, subprocess recovery, read-only
+  tree/mtime invariants, window oracle, Hub subset closure and Windows spawn/batch behavior. Use structural
+  I/O assertions in CI; benchmark speedup is not a hard gate.

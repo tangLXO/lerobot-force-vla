@@ -6,14 +6,12 @@
 
 import json
 import re
-from contextlib import closing
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
 from .sensor_stream import SensorRecorderError, _process_is_alive
-from .sensor_transaction import SensorTransactionError, sha256_file
-from .sensor_transaction_v2 import _episode_rows, capture_logical_evidence
+from .sensor_transaction import SensorTransactionError, capture_logical_evidence, sha256_file
 
 
 def check_no_live_writer(root: Path) -> None:
@@ -82,72 +80,25 @@ def verify_sidecar(path: Path, record: dict, uid: str, *, full: bool, frame_coun
         raise SensorTransactionError("Sensor artifact changed during verification.")
 
 
-def _legacy_logical_view(transaction):
-    """Discover one v1 logical range via footer pruning, never old snapshot hashes."""
-    expected, root = transaction.journal["expected_main"], transaction.root
-    index = expected["episode_index"]
-    metadata_path, metadata_row = None, None
-    for path in (root / "meta/episodes").rglob("*.parquet"):
-        with closing(_episode_rows(path, index)) as rows:
-            for row in rows:
-                if metadata_row is not None:
-                    raise SensorTransactionError("Duplicate v1 main episode identity.")
-                metadata_path, metadata_row = path, row
-    if metadata_row is None:
-        raise SensorTransactionError("Missing v1 main episode metadata.")
-    info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
-    artifacts = [
-        {"path": metadata_path.relative_to(root).as_posix(), "role": "episode_metadata"},
-        {
-            "path": info["data_path"].format(
-                chunk_index=metadata_row["data/chunk_index"], file_index=metadata_row["data/file_index"]
-            ),
-            "role": "data",
-        },
-    ]
-    for key, feature in info.get("features", {}).items():
-        if feature.get("dtype") == "video":
-            artifacts.append(
-                {
-                    "path": info["video_path"].format(
-                        video_key=key,
-                        chunk_index=metadata_row[f"videos/{key}/chunk_index"],
-                        file_index=metadata_row[f"videos/{key}/file_index"],
-                    ),
-                    "role": "video",
-                }
-            )
-    # A temporary in-memory view is not a journal upgrade or an inferred sequence boundary.
-    from .sensor_transaction import SensorTransaction
-
-    return SensorTransaction(root, {**transaction.journal, "main_artifacts": artifacts})
-
-
-def verify_main_readonly(transaction, *, shared_conflict=False):
+def verify_main_readonly(transaction):
     root = transaction.root.resolve()
     check_no_live_writer(root)
-    legacy = transaction.journal["journal_version"] == 1
-    if legacy and shared_conflict:
-        raise SensorTransactionError(
-            "Cannot prove a v1 logical range is unchanged in a conflicting shared artifact."
-        )
-    view = _legacy_logical_view(transaction) if legacy else transaction
     paths = {
         resolve_artifact(root, item["path"])
-        for item in view.journal["main_artifacts"]
+        for item in transaction.journal["main_artifacts"]
         if item["role"] in ("data", "episode_metadata", "video", "info", "tasks", "stats")
     }
     paths.add(root / "meta/info.json")
     before = {path: file_stamp(path) for path in paths}
     try:
         evidence = capture_logical_evidence(
-            view, path_resolver=lambda relative: resolve_artifact(root, relative)
+            transaction, path_resolver=lambda relative: resolve_artifact(root, relative)
         )
     except (OSError, ValueError, KeyError) as exc:
         raise SensorTransactionError(
             "Main episode evidence is incomplete or corrupt; explicit recovery is required."
         ) from exc
-    if not legacy and evidence != transaction.journal.get("main_evidence"):
+    if evidence != transaction.journal.get("main_evidence"):
         raise SensorTransactionError("Main episode logical evidence mismatch.")
     if before != {path: file_stamp(path) for path in paths}:
         raise SensorTransactionError("Shared main artifact changed during verification.")
@@ -156,10 +107,9 @@ def verify_main_readonly(transaction, *, shared_conflict=False):
 
 
 def main_artifact_paths(transaction):
-    view = _legacy_logical_view(transaction) if transaction.journal["journal_version"] == 1 else transaction
     paths = {
         resolve_artifact(transaction.root.resolve(), item["path"])
-        for item in view.journal["main_artifacts"]
+        for item in transaction.journal["main_artifacts"]
         if item["role"] != "temporary"
     }
     paths.add(transaction.root.resolve() / "meta/info.json")

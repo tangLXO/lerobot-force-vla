@@ -114,8 +114,8 @@ class SensorStreamReader:
             index = tx.journal["expected_main"]["episode_index"]
             if index in self._index_to_uid:
                 raise SensorTransactionError(f"Duplicate committed sensor episode_index {index}.")
-            shared = self._has_shared_conflict(tx, pending)
-            verify_main_readonly(tx, shared_conflict=shared)
+            self._check_shared_conflicts(tx, pending)
+            verify_main_readonly(tx)
             paths = self._verify_selected_sidecars(tx)
             metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
             if (
@@ -138,35 +138,28 @@ class SensorStreamReader:
         self.episode_uid = self._resolve_episode_uid(episode_uid, episode_index, required=False)
         check_no_live_writer(self.root)
 
-    def _has_shared_conflict(self, transaction, unfinished):
+    def _check_shared_conflicts(self, transaction, unfinished):
         if not unfinished:
-            return False
+            return
         selected = main_artifact_paths(transaction)
-        shared = False
         for other in unfinished:
             if other.episode_uid == transaction.episode_uid:
                 continue
             artifacts = other.journal.get("main_artifacts")
             if artifacts is None:
                 raise SensorTransactionError(
-                    "Unfinished legacy transaction has no artifact locators; explicit recovery is required."
+                    "Unfinished transaction has no artifact locators; explicit recovery is required."
                 )
-            touched = {
-                resolve_artifact(self.root, item["path"]) for item in artifacts if item["role"] != "temporary"
-            }
-            if selected & touched:
-                # Logical rows prove data and episode metadata. Video time ranges,
-                # global metadata and diagnostic stamps cannot prove unchanged content.
-                if any(
-                    resolve_artifact(self.root, item["path"]) in selected
-                    and item["role"] not in ("data", "episode_metadata", "temporary")
-                    for item in artifacts
-                ):
-                    raise SensorTransactionError(
-                        "Cannot prove shared main artifact content is unchanged; explicit recovery is required."
-                    )
-                shared = True
-        return shared
+            # Logical rows prove data and episode metadata. Video time ranges,
+            # global metadata and diagnostic stamps cannot prove unchanged content.
+            if any(
+                resolve_artifact(self.root, item["path"]) in selected
+                and item["role"] not in ("data", "episode_metadata", "temporary")
+                for item in artifacts
+            ):
+                raise SensorTransactionError(
+                    "Cannot prove shared main artifact content is unchanged; explicit recovery is required."
+                )
 
     def _verify_selected_sidecars(self, transaction):
         layout, uid = self.manifest["storage_layout"], transaction.episode_uid
@@ -248,12 +241,10 @@ class SensorStreamReader:
 
     def _boundary(self, uid, instance):
         transaction = self._transactions[uid]
-        if transaction.journal["journal_version"] == 1:
-            return np.iinfo(np.int64).min
         try:
             return int(transaction.journal["episode_start_sequence"][instance])
         except (KeyError, TypeError, ValueError) as exc:
-            raise SensorTransactionError("Missing v2 episode sequence boundary.") from exc
+            raise SensorTransactionError("Missing episode sequence boundary.") from exc
 
     def resolve_max_age(self, uid, instance, requested):
         age = (

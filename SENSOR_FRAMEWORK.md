@@ -173,10 +173,11 @@ can permit safe trimming, including late measurements during final merge.
 
 The persistence guarantee is **process-crash recoverable + replayable on-disk state**, without
 power-loss durability or concurrent Reader/Writer isolation. Sidecar v1 final schemas/layout stay
-fixed; Transaction v2 uses a fixed active pointer, registered artifact locators and episode-local
-logical evidence. Only Writer/Recovery holding the writer lock may recover. Readers are strictly
-read-only, refuse live Writers and validate selected shared artifact ranges. See
-[`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) for verification modes, explicit v1 recovery,
-Hub subset localization, batch/cache behavior and runtime diagnostics.
+fixed; transaction journal format v1 uses a fixed active pointer, registered artifact locators and
+episode-local logical evidence. Only Writer/Recovery holding the writer lock may recover. Readers
+are strictly read-only, refuse live Writers and validate selected shared artifact ranges. See
+[`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) for verification modes,
+active-transaction recovery, Hub subset localization, batch/cache behavior and runtime diagnostics.
+Earlier prototype journals are not part of the supported format and have no migration path.
 
 Create `x518/calibration.py` only when calibration has substantial independent behavior. Create `x518/protocol.py` only when register maps, packet parsing, CRC, or transport protocol code warrants a separate module. Do not create empty abstraction files or speculative sensor-category directories.
