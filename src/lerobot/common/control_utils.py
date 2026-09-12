@@ -34,7 +34,7 @@ else:
     DeepDiff = None
 
 if TYPE_CHECKING:
-    from lerobot.datasets import LeRobotDataset
+    from lerobot.datasets import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.lerobot_types import PolicyAction
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.robots import Robot
@@ -123,7 +123,7 @@ def sanity_check_dataset_name(repo_id, policy_cfg):
 
 
 def sanity_check_dataset_robot_compatibility(
-    dataset: LeRobotDataset, robot: Robot, fps: int, features: dict
+    dataset: LeRobotDataset | LeRobotDatasetMetadata, robot: Robot, fps: int, features: dict
 ) -> None:
     """
     Checks if a dataset's metadata is compatible with the current robot and recording setup.
@@ -132,7 +132,7 @@ def sanity_check_dataset_robot_compatibility(
     dataset against the current configuration to ensure that appended data will be consistent.
 
     Args:
-        dataset: The `LeRobotDataset` instance to check.
+        dataset: The `LeRobotDataset` or read-only `LeRobotDatasetMetadata` instance to check.
         robot: The `Robot` instance representing the current hardware setup.
         fps: The current recording frequency (frames per second).
         features: The dictionary of features for the current recording session.
@@ -144,10 +144,11 @@ def sanity_check_dataset_robot_compatibility(
 
     from lerobot.utils.constants import DEFAULT_FEATURES
 
+    dataset_meta = getattr(dataset, "meta", dataset)
     fields = [
-        ("robot_type", dataset.meta.robot_type, robot.robot_type),
-        ("fps", dataset.fps, fps),
-        ("features", dataset.features, {**features, **DEFAULT_FEATURES}),
+        ("robot_type", dataset_meta.robot_type, robot.robot_type),
+        ("fps", dataset_meta.fps, fps),
+        ("features", dataset_meta.features, {**features, **DEFAULT_FEATURES}),
     ]
 
     mismatches = []

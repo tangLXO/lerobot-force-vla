@@ -50,9 +50,9 @@ def test_subscriber_overflow_is_latched_without_blocking_publish() -> None:
 
 def test_static_capacity_and_max_age_resolution() -> None:
     cfg = SensorConfig(expected_sample_rate_hz=200, recorder_queue_duration_s=1.25)
-    assert cfg.resolve_max_age_ms(state_features_present=True) == 15
+    assert cfg.resolve_max_age_ms(frame_features_present=True) == 15
     assert cfg.resolve_recorder_queue_capacity() == 250
 
     overridden = SensorConfig(expected_sample_rate_hz=200, max_age_ms=7, recorder_queue_capacity=3)
-    assert overridden.resolve_max_age_ms(state_features_present=True) == 7
+    assert overridden.resolve_max_age_ms(frame_features_present=True) == 7
     assert overridden.resolve_recorder_queue_capacity() == 3

@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import logging
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 from lerobot.datasets.sensor_stream import (
@@ -48,6 +49,29 @@ SENSOR_FATAL_ERRORS = (
     SensorQueueOverflowError,
     SensorRecorderError,
 )
+
+
+def process_robot_observation(processors: ProcessorContext, observation: dict) -> dict:
+    """Run observation processing plus the optional sensor modality invariant."""
+    process = getattr(processors, "process_observation", None)
+    if callable(process):
+        return process(observation)
+    processed = processors.robot_observation_processor(observation)
+    validator = getattr(processors, "observation_validator", None)
+    if validator is not None:
+        validator(observation, processed)
+    return processed
+
+
+def current_sensor_capture_metadata(ctx: RolloutContext) -> dict | None:
+    """Return an immutable snapshot paired with the latest raw observation."""
+    robot = ctx.hardware.robot_wrapper.inner
+    if not isinstance(robot, SensorizedRobot):
+        return None
+    metadata = getattr(ctx.data, "current_capture_metadata", None)
+    if metadata is None:
+        raise SensorRecorderError("A sensorized observation is missing its capture metadata snapshot.")
+    return deepcopy(metadata)
 
 
 class RolloutStrategy(abc.ABC):
@@ -84,6 +108,7 @@ class RolloutStrategy(abc.ABC):
         self._interpolator: ActionInterpolator | None = None
         self._warmup_flushed: bool = False
         self._cached_obs_processed: dict | None = None
+        self._cached_capture_metadata: dict | None = None
 
     def _init_engine(self, ctx: RolloutContext) -> None:
         """Attach the inference engine and action interpolator, then start the backend.
@@ -117,8 +142,9 @@ class RolloutStrategy(abc.ABC):
         if self._interpolator is not None:
             self._interpolator.reset()
         self._cached_obs_processed = None
+        self._cached_capture_metadata = None
 
-    def _process_observation_and_notify(self, processors: ProcessorContext, obs_raw: dict) -> dict:
+    def _process_observation_and_notify(self, ctx: RolloutContext, obs_raw: dict) -> dict:
         """Run the observation processor and notify the engine — throttled to policy ticks.
 
         Callers are responsible for calling ``robot.get_observation()`` every loop
@@ -136,9 +162,10 @@ class RolloutStrategy(abc.ABC):
         because reset makes ``needs_new_action()`` return True on the next call.
         """
         if self._cached_obs_processed is None or self._interpolator.needs_new_action():
-            obs_processed = processors.robot_observation_processor(obs_raw)
+            obs_processed = process_robot_observation(ctx.processors, obs_raw)
             self._engine.notify_observation(obs_processed)
             self._cached_obs_processed = obs_processed
+            self._cached_capture_metadata = current_sensor_capture_metadata(ctx)
         return self._cached_obs_processed
 
     def _handle_warmup(self, use_torch_compile: bool, timer: CycleTimer) -> bool:
@@ -180,6 +207,7 @@ class RolloutStrategy(abc.ABC):
         if self._interpolator is not None:
             self._interpolator.reset()
         self._cached_obs_processed = None
+        self._cached_capture_metadata = None
         robot = ctx.hardware.robot_wrapper.inner
         if isinstance(robot, SensorizedRobot):
             robot.latch_fatal_error(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
@@ -473,7 +501,12 @@ def sensor_safe_observation(ctx: RolloutContext) -> dict:
             raise
     check_sensor_health(ctx)
     try:
-        return ctx.hardware.robot_wrapper.get_observation()
+        observation = ctx.hardware.robot_wrapper.get_observation()
+        robot = ctx.hardware.robot_wrapper.inner
+        ctx.data.current_capture_metadata = (
+            deepcopy(robot.last_capture_metadata) if isinstance(robot, SensorizedRobot) else None
+        )
+        return observation
     except SENSOR_FATAL_ERRORS as exc:
         strategy = getattr(ctx.runtime, "active_strategy", None)
         if strategy is not None:
@@ -510,18 +543,15 @@ def send_sensor_safe_action(ctx: RolloutContext, action) -> None:
 def add_dataset_frame(ctx: RolloutContext, frame: dict, capture_metadata: dict | None = None) -> None:
     """Add one main frame and its matching Sync row."""
     dataset = ctx.data.dataset
-    dataset.add_frame(frame)
     recorder = getattr(ctx.data, "sensor_recorder", None)
+    if recorder is not None and capture_metadata is None:
+        raise SensorRecorderError("A sensorized Dataset frame is missing its capture metadata snapshot.")
+
+    dataset.add_frame(frame)
     if recorder is None:
         return
-    robot = ctx.hardware.robot_wrapper.inner
-    metadata = capture_metadata
-    if metadata is None and isinstance(robot, SensorizedRobot):
-        metadata = robot.last_capture_metadata
-    if metadata is None:
-        raise SensorRecorderError("A sensorized Dataset frame is missing capture metadata.")
     try:
-        recorder.record_sync(None, metadata)
+        recorder.record_sync(None, capture_metadata)
     except SENSOR_FATAL_ERRORS as exc:
         strategy = getattr(ctx.runtime, "active_strategy", None)
         if strategy is not None:

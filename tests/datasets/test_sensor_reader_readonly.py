@@ -56,6 +56,16 @@ def journal_path(root, uid):
     return root / "meta/sensor_transactions" / f"{uid}.json"
 
 
+def downgrade_manifest_to_v1(root):
+    path = root / "meta/sensor_streams.json"
+    payload = json.loads(path.read_text())
+    payload["sidecar_schema_version"] = 1
+    payload.pop("frame_view", None)
+    for stream in payload["streams"].values():
+        stream["state_features"] = stream.pop("frame_features")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 @pytest.mark.parametrize("verify", ["fast", "full"])
 def test_read_operations_preserve_tree_mtime_count_and_journals(tmp_path, verify, monkeypatch):
     uid = create_episode(tmp_path)
@@ -71,6 +81,48 @@ def test_read_operations_preserve_tree_mtime_count_and_journals(tmp_path, verify
     result = reader.get_window(350_000_000, 100, 10, 60)
     assert result.sequence.tolist() == [10]
     assert reader.episode_uid == uid
+    assert tree(tmp_path) == before
+
+
+def test_v1_reader_remains_read_only_and_does_not_synthesize_tactile(tmp_path):
+    create_episode(tmp_path)
+    downgrade_manifest_to_v1(tmp_path)
+
+    class Base:
+        root = tmp_path
+        episodes = [0]
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _index):
+            return {"episode_index": 0, "frame_index": 0, "observation.state": [1.0, 2.0, 3.0]}
+
+    before = tree(tmp_path)
+    wrapper = SensorWindowDataset(Base(), {"gripper_force": SensorWindowConfig(100, 10, max_age_ms=60)})
+    item = wrapper[0]
+
+    assert wrapper.reader.manifest["sidecar_schema_version"] == 1
+    assert "observation.tactile" not in item
+    assert "gripper_force" in item["sensor_windows"]
+    assert tree(tmp_path) == before
+
+
+@pytest.mark.parametrize("version", [None, 3])
+def test_reader_rejects_missing_or_unknown_sidecar_schema_version(tmp_path, version):
+    create_episode(tmp_path)
+    path = tmp_path / "meta/sensor_streams.json"
+    payload = json.loads(path.read_text())
+    if version is None:
+        del payload["sidecar_schema_version"]
+    else:
+        payload["sidecar_schema_version"] = version
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    before = tree(tmp_path)
+
+    with pytest.raises(ValueError, match="sidecar_schema_version|Unsupported Sensor Sidecar"):
+        SensorStreamReader(tmp_path)
+
     assert tree(tmp_path) == before
 
 

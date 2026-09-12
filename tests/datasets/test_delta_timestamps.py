@@ -11,14 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
 )
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
 from tests.fixtures.constants import DUMMY_MOTOR_FEATURES
 
 
@@ -138,3 +142,42 @@ def test_delta_indices(valid_delta_timestamps_factory, delta_indices_factory):
     expected_delta_indices = delta_indices_factory(min_max_range=min_max_range)
     actual_delta_indices = get_delta_indices(delta_timestamps, fps)
     assert expected_delta_indices == actual_delta_indices
+
+
+def test_current_tactile_view_never_gets_generic_observation_history():
+    cfg = SimpleNamespace(
+        observation_delta_indices=[-2, -1, 0],
+        action_delta_indices=None,
+        reward_delta_indices=None,
+    )
+    metadata = SimpleNamespace(
+        fps=10,
+        features={OBS_STATE: {}, OBS_TACTILE: {}},
+    )
+
+    delta_timestamps = resolve_delta_timestamps(
+        cfg,
+        metadata,
+        rename_map={OBS_TACTILE: OBS_TACTILE},
+    )
+
+    assert delta_timestamps == {OBS_STATE: [-0.2, -0.1, 0.0]}
+
+
+@pytest.mark.parametrize(
+    "rename_map",
+    [
+        {OBS_TACTILE: OBS_STATE},
+        {"observation.force": OBS_TACTILE},
+    ],
+)
+def test_delta_timestamps_reject_tactile_boundary_renames(rename_map):
+    cfg = SimpleNamespace(
+        observation_delta_indices=[0],
+        action_delta_indices=None,
+        reward_delta_indices=None,
+    )
+    metadata = SimpleNamespace(fps=10, features={OBS_TACTILE: {}})
+
+    with pytest.raises(ValueError, match="tactile modality boundary"):
+        resolve_delta_timestamps(cfg, metadata, rename_map=rename_map)

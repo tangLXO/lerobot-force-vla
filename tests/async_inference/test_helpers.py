@@ -27,6 +27,7 @@ from lerobot.async_inference.helpers import (  # noqa: E402
     FPSTracker,
     TimedAction,
     TimedObservation,
+    map_robot_keys_to_lerobot_features,
     observations_similar,
     prepare_image,
     prepare_raw_observation,
@@ -34,7 +35,7 @@ from lerobot.async_inference.helpers import (  # noqa: E402
     resize_robot_observation_image,
 )
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_TACTILE
 
 # ---------------------------------------------------------------------
 # FPSTracker
@@ -330,6 +331,48 @@ def test_prepare_raw_observation():
     # Check that images are tensors
     assert isinstance(laptop_img, torch.Tensor)
     assert isinstance(phone_img, torch.Tensor)
+
+
+def test_sensorized_async_mapping_keeps_tactile_out_of_baseline_state() -> None:
+    class SensorizedStub:
+        observation_features = {
+            "joint.pos": float,
+            "sensor.force.left.normal_force": float,
+            "sensor.force.right.normal_force": float,
+        }
+
+        @staticmethod
+        def route_observation_dataset_features(features):
+            state = dict(features[OBS_STATE])
+            state["names"] = ["joint.pos"]
+            state["shape"] = (1,)
+            return {
+                OBS_STATE: state,
+                OBS_TACTILE: {
+                    "dtype": "float32",
+                    "shape": (2,),
+                    "names": [
+                        "sensor.force.left.normal_force",
+                        "sensor.force.right.normal_force",
+                    ],
+                },
+            }
+
+    features = map_robot_keys_to_lerobot_features(SensorizedStub())
+    assert features[OBS_STATE]["shape"] == (1,)
+    assert features[OBS_TACTILE]["shape"] == (2,)
+
+    prepared = prepare_raw_observation(
+        {
+            "joint.pos": 0.5,
+            "sensor.force.left.normal_force": 1.0,
+            "sensor.force.right.normal_force": 2.0,
+        },
+        features,
+        {},
+    )
+    assert prepared[OBS_STATE].shape == (1, 1)
+    assert OBS_TACTILE not in prepared
 
 
 def test_raw_observation_to_observation_basic():

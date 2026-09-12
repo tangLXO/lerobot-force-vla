@@ -23,7 +23,16 @@ from lerobot.configs import PreTrainedConfig
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.transforms import ImageTransforms
-from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFIX, OBS_STATE, REWARD
+from lerobot.utils.constants import (
+    ACTION,
+    IMAGENET_STATS,
+    OBS_IMAGE,
+    OBS_PREFIX,
+    OBS_STATE,
+    OBS_TACTILE,
+    REWARD,
+)
+from lerobot.utils.feature_utils import validate_sensor_feature_rename_map
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
@@ -56,6 +65,8 @@ def resolve_delta_timestamps(
             }
             returns `None` if the resulting dict is empty.
     """
+    validate_sensor_feature_rename_map(rename_map)
+
     # Only policies that opt into modality-specific history (currently Pi05 with MEM)
     # define these; everything else falls back to the shared observation indices.
     explicit_image_indices = getattr(cfg, "image_observation_delta_indices", None)
@@ -70,6 +81,10 @@ def resolve_delta_timestamps(
     delta_timestamps = {}
     matched_image_keys = []
     for key in ds_meta.features:
+        # Tactile is a current-frame-only view. High-frequency and causal
+        # history stays in SensorWindowDataset rather than generic frame deltas.
+        if key == OBS_TACTILE:
+            continue
         policy_key = (rename_map or {}).get(key, key)
         if policy_key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]

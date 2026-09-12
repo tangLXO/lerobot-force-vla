@@ -1,11 +1,14 @@
 # Sensor Dataset Sidecar Format
 
-Status: **Sidecar v1 / transaction journal format v1**
+Status: **Sidecar schema v2 / storage layout v1 / transaction journal format v1**
 
 This document defines the native-rate Sensor Sidecar stored beside an ordinary LeRobot
-Dataset. The main Dataset remains fixed-FPS: selected scalar Sensor features are part of
-`observation.state`, while raw-rate acquisition and real capture timing are stored only in the
-Sidecar. Sliding windows are reconstructed and are never persisted.
+Dataset. The main Dataset remains fixed-FPS. Under Sidecar schema v2,
+`observation.state = float32[D_robot]` contains only Robot proprioception/joint/gripper state,
+and the current-force view is the independent
+`observation.tactile = float32[2] = [force_left, force_right]`. Raw-rate acquisition, real
+capture timing, and force history remain only in the Sidecar. Sliding windows are reconstructed
+and are never persisted in a Dataset frame.
 
 ## Layout and identity
 
@@ -29,25 +32,81 @@ dataset_root/
 └── .sensor-writer.lock
 ```
 
-Physical paths are examples of the version-1 `per_episode_parquet` adapter. Code must resolve
-them from the templates in `sensor_streams.json`, not embed them independently.
+Physical paths are examples of storage-layout version 1's `per_episode_parquet` adapter. Code
+must resolve them from the templates in `sensor_streams.json`, not embed them independently.
 
 ## Dataset-level manifest
 
 `meta/sensor_streams.json` is the stable resume contract. It contains:
 
-- Sidecar schema and layout versions plus Raw, Sync, metadata, and journal path templates;
+- `sidecar_schema_version: 2`, `storage_layout.version: 1`, and the Raw, Sync, metadata, and
+  journal path templates;
 - ordered stream instances;
 - ordered semantic and native schemas (`name`, `dtype`, `unit`, scalar `shape`);
-- ordered relative `state_features` selection;
+- ordered relative `frame_features` selection;
 - native value/payload capabilities;
 - the host-monotonic measurement/availability clock fields;
-- logical Raw/Sync schemas and causal selection rules.
+- logical Raw/Sync schemas and causal selection rules;
+- for a non-raw-only v2 root, one `frame_view` binding the ordered sources to
+  `observation.tactile`.
+
+The locked two-force profile is represented as follows (the instance name is installation-defined
+and is not otherwise constrained):
+
+```json
+{
+  "sidecar_schema_version": 2,
+  "streams": {
+    "gripper_force": {
+      "frame_features": [
+        "left.normal_force",
+        "right.normal_force"
+      ]
+    }
+  },
+  "frame_view": {
+    "dataset_key": "observation.tactile",
+    "dtype": "float32",
+    "shape": [2],
+    "alignment": "frame_anchor_ns",
+    "sources": [
+      {
+        "instance": "gripper_force",
+        "feature": "left.normal_force",
+        "qualified_name": "sensor.gripper_force.left.normal_force"
+      },
+      {
+        "instance": "gripper_force",
+        "feature": "right.normal_force",
+        "qualified_name": "sensor.gripper_force.right.normal_force"
+      }
+    ]
+  }
+}
+```
+
+The generic routing helper is width-agnostic, but this Sidecar v2 profile accepts either zero
+selected sources or exactly the two ordered scalar features `left.normal_force` and
+`right.normal_force`, both with unit `N`. With zero sources, every stream is raw-only,
+`streams.*.frame_features` is empty, and `frame_view` plus `observation.tactile` are omitted.
+Any wider/different current-frame modality requires a future profile/schema version.
 
 The manifest never contains a particular device, driver, firmware, channel mapping,
 calibration, resolved timing/queue values, observed sampling rate, sequence gaps, or error
 statistics. Those are episode facts. Resume requires an exact match of the stable manifest,
-including feature and state-selection order.
+including feature and frame-selection order.
+
+Sidecar v1 is historical and retains its original meaning: force may already be embedded in its
+main Dataset `observation.state`. A v1/v2 Reader may read Raw, Sync, and causal windows, but it
+must not split a v1 state online or synthesize `observation.tactile`. A v2 Writer creates or
+resumes only a v2 root. Existing v1 roots, missing versions, and unknown versions are rejected
+before Dataset resume, writer-lock acquisition, or recovery; v1 users must choose a new root.
+After local or metadata-only Hub localization, resuming with configured Sensors requires an
+existing v2 manifest, so a Sidecar cannot begin halfway through an older main Dataset. Conversely,
+a root that already has a Sidecar cannot be resumed without the configured Sensors, which would
+append main frames without matching Sync rows.
+Hub localization validates the small manifest/version closure before downloading journals or
+large Raw artifacts. No in-place v1-to-v2 migration is defined.
 
 ## Episode metadata
 
@@ -60,7 +119,7 @@ count, and per-stream episode facts:
 - observed sample rate.
 
 Different episodes may use different hardware or calibration only when the stable semantic
-schema, units/dtypes, namespace, and state selection still match the Dataset manifest.
+schema, units/dtypes, namespace, and frame selection still match the Dataset manifest.
 
 ## Raw Parquet
 
@@ -94,6 +153,20 @@ the episode; it may not become `COMMITTED`.
 
 Buffered rollout modes must keep frame data and capture metadata together. A discarded buffer
 creates neither a main frame nor a Sync row.
+
+For every recorded v2 frame, the tactile values and Sync reference must originate from the same
+single causal Sensor selection made for that `frame_anchor_ns`:
+
+```text
+selected SensorSample
+├── calibrated values -> observation.tactile
+└── sequence/timestamps/status -> Sync stream reference
+```
+
+Routing, observation processors, frame packing, and Sync writing may not select or read the
+Sensor again. Consequently `observation.tactile` is the ordered float32 view of the calibrated
+values in the Raw row(s) identified by that frame's Sync reference. A newer concurrently
+published Raw sample is eligible only for a later frame.
 
 ## Transaction journal
 
@@ -184,12 +257,16 @@ The returned fields are `values [T,D]`, `valid_mask`, `target_timestamp_ns`,
 `source_timestamp_ns`, `sequence`, and `age_ns`.
 
 `SensorWindowDataset` aligns each requested window to the corresponding recorded Sync
-`frame_anchor_ns` and adds `item["sensor_windows"][instance]`. DataLoader windows require a
+`frame_anchor_ns`, preserves the base item's current `observation.tactile`, and adds
+`item["sensor_windows"][instance]`. DataLoader windows require a
 positive target rate and a finite resolved max-age at initialization; explicit window max-age 0
 is legal. Ragged native-rate access is Reader-only. Phase one provides no temporal
 encoder. Policies that do not explicitly declare window support reject enabled windows, while
-the default path remains the standard `observation.state` interface used by ACT, π0, and
-SmolVLA.
+baseline policy feature inference excludes `observation.tactile` and remains state + images.
+Current force can be enabled only by a future explicit policy feature declaration; force history
+is available only through `sensor_windows`. Rename maps may neither move tactile into state nor
+move another feature into tactile, and Dataset delta-timestamp expansion never turns the current
+tactile vector into a frame history.
 
 `SensorStreamReader(..., verify="fast")` checks selected main logical evidence, small JSON digests,
 and Sidecar size/footer/schema/row count. `verify="full"` additionally hashes and validates all

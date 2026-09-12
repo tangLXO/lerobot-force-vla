@@ -93,7 +93,7 @@ def test_default_arrival_is_generated_under_publication_lock(monkeypatch):
 
 @pytest.mark.parametrize("required", [True, False])
 def test_sequence_reset_fault_is_latched_until_recorder_releases(required):
-    sensor = FakeSensor(SensorConfig(required=required, state_features=[]))
+    sensor = FakeSensor(SensorConfig(required=required, frame_features=[]))
     lease = sensor.acquire_recorder()
     subscription = sensor.subscribe(10)
     publish(sensor, 1, 1)
@@ -109,7 +109,7 @@ def test_sequence_reset_fault_is_latched_until_recorder_releases(required):
 
 @pytest.mark.parametrize("required", [True, False])
 def test_only_required_recorded_stream_latches_reconnect_failure(required):
-    sensor = FakeSensor(SensorConfig(required=required, state_features=[]))
+    sensor = FakeSensor(SensorConfig(required=required, frame_features=[]))
     lease = sensor.acquire_recorder()
     assert sensor._notify_reconnect_required(ConnectionError("lost")) is required
     assert (lease.error is not None) is required

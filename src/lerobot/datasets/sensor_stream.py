@@ -28,6 +28,7 @@ import pyarrow as pa
 from lerobot.sensors import Sensor, SensorFeature, SensorSubscription
 from lerobot.sensors.diagnostics import SensorQueueDiagnostics
 from lerobot.sensors.sensor import SensorRecorderLease
+from lerobot.utils.constants import OBS_TACTILE
 from lerobot.utils.errors import DeviceNotConnectedError
 
 from .sensor_spool import SensorParquetSpoolWriter
@@ -39,7 +40,8 @@ from .sensor_transaction import (
     validate_episode_uid,
 )
 
-SIDECAR_SCHEMA_VERSION = 1
+SIDECAR_SCHEMA_VERSION = 2
+SUPPORTED_SIDECAR_SCHEMA_VERSIONS = frozenset({1, SIDECAR_SCHEMA_VERSION})
 logger = logging.getLogger(__name__)
 
 
@@ -58,24 +60,91 @@ def _feature_schema(features: dict[str, SensorFeature]) -> list[dict[str, Any]]:
     ]
 
 
+def validate_sidecar_schema_version(manifest: dict[str, Any], *, writable: bool = False) -> int:
+    """Validate the logical Sidecar contract independently of storage-format versions."""
+    if "sidecar_schema_version" not in manifest:
+        raise ValueError("Sensor Sidecar manifest is missing sidecar_schema_version.")
+    version = manifest["sidecar_schema_version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError(f"Invalid Sensor Sidecar schema version: {version!r}.")
+    if version not in SUPPORTED_SIDECAR_SCHEMA_VERSIONS:
+        supported = sorted(SUPPORTED_SIDECAR_SCHEMA_VERSIONS)
+        raise ValueError(
+            f"Unsupported Sensor Sidecar schema version {version}; supported read-only versions are "
+            f"{supported}."
+        )
+    if writable and version != SIDECAR_SCHEMA_VERSION:
+        raise ValueError(
+            f"Cannot resume Sensor Sidecar schema v{version} with the v{SIDECAR_SCHEMA_VERSION} writer. "
+            "Record into a new Dataset root; v1 data remains read-only."
+        )
+    return version
+
+
+def preflight_sensor_stream_writer(root: Path) -> dict[str, Any] | None:
+    """Validate and return an existing writable Sidecar manifest before any mutation."""
+    manifest_path = Path(root) / "meta" / "sensor_streams.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validate_sidecar_schema_version(manifest, writable=True)
+    return manifest
+
+
+def _frame_view_manifest(sources: list[tuple[str, str, SensorFeature]]) -> dict[str, Any] | None:
+    """Build the Sidecar-v2 current-force binding, or omit it for raw-only capture."""
+    if not sources:
+        return None
+    relative_names = [feature for _instance, feature, _schema in sources]
+    required_names = ["left.normal_force", "right.normal_force"]
+    if relative_names != required_names:
+        raise ValueError(
+            "Sidecar v2 tactile profile requires global frame_features to be empty or exactly "
+            f"{required_names} in that order; got {relative_names}."
+        )
+    invalid_units = [
+        f"{instance}.{feature}={schema.unit!r}" for instance, feature, schema in sources if schema.unit != "N"
+    ]
+    if invalid_units:
+        raise ValueError(
+            f"Sidecar v2 tactile profile requires force sources in semantic unit 'N'; got {invalid_units}."
+        )
+    return {
+        "dataset_key": OBS_TACTILE,
+        "dtype": "float32",
+        "shape": [2],
+        "alignment": "frame_anchor_ns",
+        "sources": [
+            {
+                "instance": instance,
+                "feature": feature,
+                "qualified_name": f"sensor.{instance}.{feature}",
+            }
+            for instance, feature, _schema in sources
+        ],
+    }
+
+
 def build_sensor_stream_manifest(sensors: dict[str, Sensor]) -> dict[str, Any]:
     """Build the stable Dataset-level contract without hardware provenance."""
     streams: dict[str, Any] = {}
+    frame_sources: list[tuple[str, str, SensorFeature]] = []
     for instance, sensor in sensors.items():
         selected = (
-            list(sensor.features) if sensor.config.state_features is None else sensor.config.state_features
+            list(sensor.features) if sensor.config.frame_features is None else sensor.config.frame_features
         )
         unknown = set(selected) - set(sensor.features)
         if unknown:
-            raise ValueError(f"Sensor {instance!r} state_features contains unknown paths: {sorted(unknown)}.")
+            raise ValueError(f"Sensor {instance!r} frame_features contains unknown paths: {sorted(unknown)}.")
+        frame_sources.extend((instance, name, sensor.features[name]) for name in selected)
         streams[instance] = {
             "semantic_features": _feature_schema(sensor.features),
             "native_features": _feature_schema(sensor.native_features),
-            "state_features": list(selected),
+            "frame_features": list(selected),
             "native_values_capable": bool(sensor.native_features),
             "native_payload_capable": True,
         }
-    return {
+    manifest = {
         "sidecar_schema_version": SIDECAR_SCHEMA_VERSION,
         "storage_layout": {
             "type": "per_episode_parquet",
@@ -99,6 +168,10 @@ def build_sensor_stream_manifest(sensors: dict[str, Sensor]) -> dict[str, Any]:
             "default_max_age_ms": "ceil(3000/static_sample_rate_hz)",
         },
     }
+    frame_view = _frame_view_manifest(frame_sources)
+    if frame_view is not None:
+        manifest["frame_view"] = frame_view
+    return manifest
 
 
 def ensure_sensor_stream_manifest(root: Path, sensors: dict[str, Sensor]) -> dict[str, Any]:
@@ -108,9 +181,10 @@ def ensure_sensor_stream_manifest(root: Path, sensors: dict[str, Sensor]) -> dic
     expected = build_sensor_stream_manifest(sensors)
     if path.exists():
         actual = json.loads(path.read_text(encoding="utf-8"))
+        validate_sidecar_schema_version(actual, writable=True)
         if actual != expected:
             raise ValueError(
-                "Sensor semantic schema or state feature selection differs from sensor_streams.json."
+                "Sensor semantic schema or frame feature selection differs from sensor_streams.json."
             )
         return actual
     _atomic_json(path, expected)
@@ -193,6 +267,7 @@ class SensorStreamRecorder:
             if re.fullmatch(r"[a-z][a-z0-9_]*", instance) is None:
                 raise ValueError(f"Invalid Sensor instance namespace: {instance!r}.")
             sensor.config.resolve_recorder_queue_capacity()
+        preflight_sensor_stream_writer(self.root)
         self._writer_lock = SensorDatasetWriterLock(self.root)
         try:
             recovered = TransactionRecoveryManager(self.root).recover(writer_lock=self._writer_lock)
@@ -712,10 +787,10 @@ class SensorStreamRecorder:
             streams[instance] = {
                 "provenance": sensor.provenance,
                 "resolved_max_age_ms": sensor.config.resolve_max_age_ms(
-                    state_features_present=bool(
+                    frame_features_present=bool(
                         sensor.features
-                        if sensor.config.state_features is None
-                        else sensor.config.state_features
+                        if sensor.config.frame_features is None
+                        else sensor.config.frame_features
                     )
                 ),
                 "resolved_recorder_queue_capacity": sensor.config.resolve_recorder_queue_capacity(),
@@ -810,10 +885,10 @@ class SensorStreamRecorder:
                         timestamp, arrival, valid, hardware_sequence, status = raw
                         selected = (
                             sensor.features
-                            if sensor.config.state_features is None
-                            else sensor.config.state_features
+                            if sensor.config.frame_features is None
+                            else sensor.config.frame_features
                         )
-                        max_age = sensor.config.resolve_max_age_ms(state_features_present=bool(selected))
+                        max_age = sensor.config.resolve_max_age_ms(frame_features_present=bool(selected))
                         if (
                             not valid
                             or ref["hardware_sequence"] != hardware_sequence

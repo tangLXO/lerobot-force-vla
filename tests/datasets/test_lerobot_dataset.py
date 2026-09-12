@@ -34,6 +34,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.dataset_writer import DatasetWriter
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
 
 SIMPLE_FEATURES = {
@@ -614,6 +615,52 @@ def test_getitem_works_after_finalize(tmp_path):
     item = dataset[0]
     assert "state" in item
     assert "task" in item
+
+
+def test_state_and_tactile_round_trip_as_independent_float32_vectors(tmp_path) -> None:
+    root = tmp_path / "state_tactile_round_trip"
+    features = {
+        OBS_STATE: {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [f"joint_{index}.pos" for index in range(6)],
+        },
+        OBS_TACTILE: {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": [
+                "sensor.gripper_force.left.normal_force",
+                "sensor.gripper_force.right.normal_force",
+            ],
+        },
+    }
+    dataset = LeRobotDataset.create(
+        repo_id=DUMMY_REPO_ID,
+        fps=DEFAULT_FPS,
+        features=features,
+        root=root,
+        use_videos=False,
+    )
+    dataset.add_frame(
+        {
+            "task": "Dummy task",
+            OBS_STATE: torch.arange(6, dtype=torch.float32),
+            OBS_TACTILE: torch.tensor([1.5, 2.5], dtype=torch.float32),
+        }
+    )
+    dataset.save_episode()
+    dataset.finalize()
+
+    reopened = LeRobotDataset(DUMMY_REPO_ID, root=root, download_videos=False)
+    item = reopened[0]
+    assert tuple(item[OBS_STATE].shape) == (6,)
+    assert tuple(item[OBS_TACTILE].shape) == (2,)
+    assert item[OBS_STATE].dtype == torch.float32
+    assert item[OBS_TACTILE].dtype == torch.float32
+    torch.testing.assert_close(item[OBS_STATE], torch.arange(6, dtype=torch.float32))
+    torch.testing.assert_close(item[OBS_TACTILE], torch.tensor([1.5, 2.5], dtype=torch.float32))
+    assert tuple(reopened.meta.stats[OBS_STATE]["mean"].shape) == (6,)
+    assert tuple(reopened.meta.stats[OBS_TACTILE]["mean"].shape) == (2,)
 
 
 def test_getitem_after_finalize_with_delta_timestamps(tmp_path):

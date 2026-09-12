@@ -30,13 +30,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
 from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.datasets import (
     LeRobotDataset,
+    LeRobotDatasetMetadata,
     aggregate_pipeline_dataset_features,
     create_initial_features,
 )
-from lerobot.datasets.sensor_stream import SensorStreamRecorder
+from lerobot.datasets.sensor_stream import SensorStreamRecorder, preflight_sensor_stream_writer
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
@@ -50,7 +52,12 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import SensorizedRobot, attach_sensors, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
-from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
+from lerobot.utils.feature_utils import (
+    combine_feature_dicts,
+    hw_to_dataset_features,
+    validate_sensor_feature_rename_map,
+)
 from lerobot.utils.import_utils import _peft_available, require_package
 
 from .configs import RolloutConfig
@@ -185,6 +192,77 @@ def _align_state_feature_order(
     return reordered
 
 
+def _validate_policy_state_shape(
+    policy_config: PreTrainedConfig,
+    dataset_features: dict[str, dict],
+    *,
+    enforce_sensorized_v2: bool = False,
+) -> None:
+    """Reject checkpoints whose proprioception shape belongs to another schema contract."""
+    # Keep custom upstream policy/processor state contracts untouched. This
+    # strict check is only for a SensorizedRobot using the Sidecar v2 contract,
+    # including its valid raw-only profile with no tactile Dataset column.
+    if not enforce_sensorized_v2:
+        return
+    expected = (getattr(policy_config, "input_features", None) or {}).get(OBS_STATE)
+    if expected is None:
+        return
+    live = dataset_features.get(OBS_STATE)
+    if live is None:
+        raise ValueError(
+            f"Checkpoint expects {OBS_STATE!r} with shape {tuple(expected.shape)}, but the robot exposes no state."
+        )
+    expected_shape = tuple(expected.shape)
+    live_shape = tuple(live["shape"])
+    if expected_shape == live_shape:
+        return
+    schema_hint = ""
+    tactile = dataset_features.get(OBS_TACTILE)
+    tactile_width = int(tactile["shape"][0]) if tactile is not None else 2
+    if len(expected_shape) == len(live_shape) == 1 and expected_shape[0] == live_shape[0] + tactile_width:
+        schema_hint = (
+            " This checkpoint appears to use the Sidecar v1 force-in-state contract; v2 keeps force only "
+            f"in {OBS_TACTILE!r}. Use a v2 checkpoint or a separate v1 runtime/root."
+        )
+    raise ValueError(
+        f"Checkpoint/live {OBS_STATE!r} shape mismatch: checkpoint={expected_shape}, live={live_shape}."
+        f"{schema_hint} State is never truncated or padded during rollout."
+    )
+
+
+def _resolve_observation_feature_schemas(
+    robot,
+    robot_observation_processor: RobotProcessorPipeline,
+    policy_action_names: list[str] | None,
+    *,
+    use_videos: bool,
+) -> tuple[dict[str, type | tuple], dict[str, dict]]:
+    """Resolve live observation schemas without connecting hardware."""
+    all_obs_features = robot.observation_features
+    observation_features_hw = {
+        key: value
+        for key, value in all_obs_features.items()
+        if isinstance(value, tuple) or (value is float and key.endswith((".pos", ".vel")))
+    }
+    observation_features_hw = _align_state_feature_order(
+        observation_features_hw,
+        policy_action_names,
+    )
+    if isinstance(robot, SensorizedRobot):
+        robot.validate_tactile_v2_profile()
+        for source in robot.current_frame_feature_names:
+            observation_features_hw[source] = all_obs_features[source]
+
+    observation_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=robot_observation_processor,
+        initial_features=create_initial_features(observation=observation_features_hw),
+        use_videos=use_videos,
+    )
+    if isinstance(robot, SensorizedRobot):
+        observation_dataset_features = robot.route_observation_dataset_features(observation_dataset_features)
+    return observation_features_hw, observation_dataset_features
+
+
 # ---------------------------------------------------------------------------
 # Sub-contexts
 # ---------------------------------------------------------------------------
@@ -239,6 +317,14 @@ class ProcessorContext:
     teleop_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction]
     robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction]
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation]
+    observation_validator: Callable[[RobotObservation, RobotObservation], None] | None = None
+
+    def process_observation(self, observation: RobotObservation) -> RobotObservation:
+        """Run the observation pipeline and its optional modality invariant."""
+        processed = self.robot_observation_processor(observation)
+        if self.observation_validator is not None:
+            self.observation_validator(observation, processed)
+        return processed
 
 
 @dataclass
@@ -251,6 +337,7 @@ class DatasetContext:
     ordered_action_keys: list[str] = field(default_factory=list)
     sensor_recorder: SensorStreamRecorder | None = None
     sensor_recording_enabled: bool = True
+    current_capture_metadata: dict | None = None
 
 
 @dataclass
@@ -313,6 +400,7 @@ def build_rollout_context(
     The order is policy-first / hardware-last so a bad ``--policy.path``
     fails fast without touching the robot.
     """
+    validate_sensor_feature_rename_map(cfg.rename_map)
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
@@ -373,12 +461,107 @@ def build_rollout_context(
         robot_action_processor = robot_action_processor or _r
         robot_observation_processor = robot_observation_processor or _o
 
-    # --- 3. Hardware (heaviest side-effect, deferred) -----------------
-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+    # --- 3. Static robot/schema validation (no hardware connection) ----
     robot = attach_sensors(make_robot_from_config(cfg.robot), cfg.sensors)
-    if isinstance(robot, SensorizedRobot) and cfg.dataset is not None:
-        for sensor in robot.sensors.values():
-            sensor.config.resolve_recorder_queue_capacity()
+    resume_metadata = None
+    if cfg.dataset is not None:
+        if cfg.resume:
+            resume_metadata = LeRobotDatasetMetadata(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+            )
+            existing_sensor_manifest = preflight_sensor_stream_writer(resume_metadata.root)
+            if isinstance(robot, SensorizedRobot) and existing_sensor_manifest is None:
+                raise ValueError(
+                    "Cannot add a Sensor Sidecar while resuming a Dataset that has no "
+                    "sensor_streams.json manifest. Record into a new Dataset root."
+                )
+            if existing_sensor_manifest is not None and not isinstance(robot, SensorizedRobot):
+                raise ValueError(
+                    "Cannot resume a Sensor Sidecar Dataset without the configured sensors; "
+                    "doing so would append main frames without matching Sync rows."
+                )
+        if isinstance(robot, SensorizedRobot):
+            for sensor in robot.sensors.values():
+                sensor.config.resolve_recorder_queue_capacity()
+
+    policy_action_names = getattr(policy_config, "action_feature_names", None)
+    policy_action_names = list(policy_action_names) if policy_action_names else None
+    observation_features_hw, observation_dataset_features = _resolve_observation_feature_schemas(
+        robot,
+        robot_observation_processor,
+        policy_action_names,
+        use_videos=cfg.dataset.video if cfg.dataset else True,
+    )
+    _validate_policy_state_shape(
+        policy_config,
+        observation_dataset_features,
+        enforce_sensorized_v2=isinstance(robot, SensorizedRobot),
+    )
+
+    # --- 4. Remaining static features + resume compatibility ----------
+    # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
+    # action target; velocity and torque channels (when present) are kept in
+    # the raw observation but excluded from the policy-facing tensors.
+    # Keep both joint-position (.pos) and base-velocity (.vel) action features so
+    # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
+    # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
+    # a no-op for them. Without the .vel keys the base velocities are silently
+    # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
+    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
+
+    # The action side is always needed: sync inference reads action names from
+    # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
+    action_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=teleop_action_processor,
+        initial_features=create_initial_features(action=action_features_hw),
+        use_videos=cfg.dataset.video if cfg.dataset else True,
+    )
+    dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
+    if cfg.dataset is not None:
+        # Include strategy columns before resume validation and hardware acquisition.
+        dataset_features.update(cfg.strategy.extra_dataset_features())
+    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
+    if isinstance(robot, SensorizedRobot):
+        hw_features = robot.route_observation_dataset_features(hw_features)
+    raw_action_keys = list(action_features_hw.keys())
+    ordered_action_keys = _resolve_action_key_order(
+        policy_action_names,
+        raw_action_keys,
+    )
+
+    # Validate visual features if no rename_map is active
+    rename_map = cfg.rename_map
+    if not rename_map:
+        expected_visuals = {
+            k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
+        }
+        provided_visuals = {
+            f"observation.images.{k}" for k, v in robot.observation_features.items() if isinstance(v, tuple)
+        }
+        policy_subset = expected_visuals.issubset(provided_visuals)
+        hw_subset = provided_visuals.issubset(expected_visuals)
+        if not (policy_subset or hw_subset):
+            raise ValueError(
+                f"Visual feature mismatch between policy and robot hardware.\n"
+                f"Policy expects: {expected_visuals}\n"
+                f"Robot provides: {provided_visuals}\n"
+                f"Use --rename_map to map camera names, e.g. "
+                f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
+            )
+
+    if cfg.dataset is not None and cfg.resume:
+        if resume_metadata is None:  # defensive: the static resume preflight above owns this load
+            raise AssertionError("Rollout resume metadata was not loaded before feature validation.")
+        sanity_check_dataset_robot_compatibility(
+            resume_metadata,
+            robot,
+            cfg.dataset.fps,
+            dataset_features,
+        )
+
+    # --- 5. Hardware (heaviest side-effect, deferred) -----------------
+    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
 
@@ -417,84 +600,10 @@ def build_rollout_context(
     #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
     #         )
 
-    # --- 4. Features + action-key reconciliation ---------------------
-    # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
-    # action target; velocity and torque channels (when present) are kept in
-    # the raw observation but excluded from the policy-facing tensors.
-    all_obs_features = robot.observation_features
-    # ``observation_features`` values are either a tuple (camera shape) or the
-    # ``float`` type itself used as a sentinel for scalar motor features —
-    # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
-    # Keep cameras (tuple) plus both joint-position (.pos) and base-velocity (.vel)
-    # scalar state features. LeKiwi's observation.state is 9-dim (6 arm .pos +
-    # x/y/theta.vel) and the policy was trained/normalized on all 9; the old .pos-only
-    # filter fed a 6-dim state into a 9-dim normalizer → RuntimeError (size 6 vs 9).
-    # Pure-arm robots have no .vel state keys, so this is a no-op for them.
-    observation_features_hw = {
-        k: v
-        for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and (k.endswith((".pos", ".vel")) or k.startswith("sensor.")))
-    }
-    policy_action_names = getattr(policy_config, "action_feature_names", None)
-    observation_features_hw = _align_state_feature_order(
-        observation_features_hw,
-        list(policy_action_names) if policy_action_names else None,
-    )
-    # Keep both joint-position (.pos) and base-velocity (.vel) action features so
-    # mobile manipulators command the base too (e.g. LeKiwi: 6 arm .pos +
-    # x/y/theta.vel = 9-dim action). Pure-arm robots have no .vel keys, so this is
-    # a no-op for them. Without the .vel keys the base velocities are silently
-    # dropped from dataset_features[ACTION]/ordered_action_keys and the base never moves.
-    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith((".pos", ".vel"))}
-
-    # The action side is always needed: sync inference reads action names from
-    # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.
-    action_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=teleop_action_processor,
-        initial_features=create_initial_features(action=action_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
-    # Observation-side aggregation is needed because of build_dataset_frame
-    observation_dataset_features = aggregate_pipeline_dataset_features(
-        pipeline=robot_observation_processor,
-        initial_features=create_initial_features(observation=observation_features_hw),
-        use_videos=cfg.dataset.video if cfg.dataset else True,
-    )
-    dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
-    hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-    raw_action_keys = list(action_features_hw.keys())
-    ordered_action_keys = _resolve_action_key_order(
-        list(policy_action_names) if policy_action_names else None,
-        raw_action_keys,
-    )
-
-    # Validate visual features if no rename_map is active
-    rename_map = cfg.rename_map
-    if not rename_map:
-        expected_visuals = {
-            k for k, v in policy_config.input_features.items() if v.type == FeatureType.VISUAL
-        }
-        provided_visuals = {
-            f"observation.images.{k}" for k, v in robot.observation_features.items() if isinstance(v, tuple)
-        }
-        policy_subset = expected_visuals.issubset(provided_visuals)
-        hw_subset = provided_visuals.issubset(expected_visuals)
-        if not (policy_subset or hw_subset):
-            raise ValueError(
-                f"Visual feature mismatch between policy and robot hardware.\n"
-                f"Policy expects: {expected_visuals}\n"
-                f"Robot provides: {provided_visuals}\n"
-                f"Use --rename_map to map camera names, e.g. "
-                f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
-            )
-
-    # --- 5. Dataset -------------
+    # --- 6. Dataset -------------
     dataset = None
     if cfg.dataset is not None:
         logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
-        # Strategy-owned columns join the robot/policy features above the resume/create
-        # split, so ``ctx.data.dataset_features`` describes the same schema on both paths.
-        dataset_features.update(cfg.strategy.extra_dataset_features())
         if cfg.resume:
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
@@ -539,7 +648,7 @@ def build_rollout_context(
 
     if dataset is not None:
         logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
-    # --- 6. Policy pre/post processors (needs dataset stats if any) ---
+    # --- 7. Policy pre/post processors (needs dataset stats if any) ---
     dataset_stats = None
     if dataset is not None:
         dataset_stats = rename_stats(
@@ -572,7 +681,7 @@ def build_rollout_context(
             "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
         )
 
-    # --- 7. Inference strategy (needs policy + pre/post + hardware) --
+    # --- 8. Inference strategy (needs policy + pre/post + hardware) --
     logger.info(
         "Creating inference engine (type=%s)...",
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
@@ -608,7 +717,7 @@ def build_rollout_context(
             robot.disconnect()
         raise
 
-    # --- 8. Assemble ---------------------------------------------------
+    # --- 9. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")
     return RolloutContext(
         runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
@@ -625,6 +734,9 @@ def build_rollout_context(
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
+            observation_validator=(
+                robot.assert_current_frame_values if isinstance(robot, SensorizedRobot) else None
+            ),
         ),
         data=DatasetContext(
             dataset=dataset,

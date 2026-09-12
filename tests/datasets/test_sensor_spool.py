@@ -113,7 +113,7 @@ def test_startup_barrier_includes_required_raw_only_and_ignores_old_history(tmp_
     initialize_main(tmp_path)
     sensor = FakeSensor()
     sensor.config.required = required
-    sensor.config.state_features = []
+    sensor.config.frame_features = []
     sensor.config.startup_timeout_s = 0.02
     publish(sensor, time.perf_counter_ns())
     recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})

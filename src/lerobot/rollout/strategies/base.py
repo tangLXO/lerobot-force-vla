@@ -67,7 +67,7 @@ class BaseStrategy(RolloutStrategy):
                 with timer.section("observe"):
                     obs = sensor_safe_observation(ctx)
                 with timer.section("process_obs"):
-                    obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                    obs_processed = self._process_observation_and_notify(ctx, obs)
 
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue

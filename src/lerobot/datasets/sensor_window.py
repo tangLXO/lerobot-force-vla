@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 
 from lerobot.configs.default import SensorWindowConfig
 
+from .sensor_stream import validate_sidecar_schema_version
 from .sensor_transaction import (
     SensorTransaction,
     SensorTransactionError,
@@ -67,6 +68,7 @@ class SensorStreamReader:
         self.verify = verify
         check_no_live_writer(self.root)
         self.manifest = json.loads((self.root / "meta/sensor_streams.json").read_text(encoding="utf-8"))
+        validate_sidecar_schema_version(self.manifest)
         layout = self.manifest.get("storage_layout", {})
         if layout.get("type") != "per_episode_parquet" or layout.get("version") != 1:
             raise ValueError(f"Unsupported sensor storage layout: {layout}.")

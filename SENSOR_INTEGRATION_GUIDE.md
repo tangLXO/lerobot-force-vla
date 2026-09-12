@@ -1,6 +1,6 @@
 # Sensor Backend Integration Guide
 
-Status: **Implementation Guide**
+Status: **Implementation Guide — Sidecar v2**
 
 > 本文是新增非视觉传感器 backend 的实施指南。
 > [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) 是锁定的最高规范；两者发生冲突时，
@@ -113,6 +113,16 @@ class DeviceSensorConfig(SensorConfig):
 ```
 
 配置层负责描述和验证“用户想连接什么设备”，但不能在 `__post_init__()` 中访问硬件。
+
+公共字段 `frame_features` 决定哪些 semantic scalar 会参与固定 FPS 的 current-frame view：
+
+- `None`：按 backend `features` 顺序选择全部 semantic features；
+- 非空列表：选择并固定给定相对 feature 的顺序；
+- `[]`：只录 Raw/Sync，不创建 current-frame Dataset feature。
+
+`state_features` 是历史 Sidecar v1 字段，在 v2 中不是兼容 alias。只要
+`frame_features` 不是 `[]`，stream 就必须为 required，并且必须能够解析有限的
+`max_age_ms`。
 
 ### 必须做到
 
@@ -435,11 +445,32 @@ run_<device_name>_hardware_smoke_test.bat
 - 写 Dataset；
 - 根据某个实验决定 action。
 
-Robot 集成使用 `SensorizedRobot` 组合，持有 `sensors`，把 `sensor.features` 合并进
-`observation_features`，并把 `SensorSample.values` 合并进 `get_observation()`。
-当前标量 Sensor feature 进入既有 `observation.state`，并在 `names` 中保留完整
-`sensor.<instance>.<feature_path>` 限定名；
-在存在独立触觉 encoder 之前，不创建 `observation.tactile`。
+Robot 集成使用 `SensorizedRobot` 组合并持有 `sensors`。Sidecar v2 是一次正式 Dataset
+schema breaking change：
+
+```text
+v1  observation.state = float32[D_robot + selected_force]
+v2  observation.state = float32[D_robot]
+    observation.tactile = float32[2] = [force_left, force_right]
+```
+
+wrapper 的 `get_observation()` 先固定 `frame_anchor_ns`，然后对每个 Sensor 只调用一次
+`read_latest_before()`。同一个局部 `SensorSample` 同时提供
+`sensor.<instance>.<feature_path>` qualified values 和 capture metadata 中的
+sequence/timestamps/status。后续 processor、routing、frame packing、Sync 写入不得再次读取
+Sensor；并发到达的新 Raw sample 只能供下一帧选择。
+
+schema routing 根据 wrapper 声明的 source 删除 state 中相应项，并创建独立
+`observation.tactile`，不能靠 `sensor.*` 前缀猜测。routing helper 本身支持任意宽度；正式
+Sidecar v2 current-force profile 另行要求全局恰好两路、相对路径依次为
+`left.normal_force` 和 `right.normal_force`、unit 为 `N`。全部 stream 都是 raw-only 时不创建
+tactile。更宽的触觉、六轴 F/T 或多指 current view 需要未来 schema/profile version。
+
+processor 不得 rename、drop 或数值变换本帧 selected source；共享校验也禁止通过 rename map
+把 tactile 移入 state，或把其他 feature 移入 tactile。state 和 tactile 不得重复保存 force。
+baseline policy 的自动 input feature 推导默认排除 tactile；只有未来 policy/config 显式声明
+tactile 并实现 encoder/fusion 后才可使用。当前阶段不修改 ACT、π0、π0.5、SmolVLA 或 OpenPI
+模型逻辑。
 
 采集由独立 Recorder 使用有界 Raw/Sync spool 完成；默认每 4096 行或 0.5 秒 flush，运行指标不进入
 稳定 manifest。required raw-only 流也参加启动屏障，optional 不阻塞。停止时拒绝新 Sync、unsubscribe、
@@ -448,6 +479,10 @@ Robot 集成使用 `SensorizedRobot` 组合，持有 `sensors`，把 `sensor.fea
 恢复能力限定为 **process-crash recoverable + replayable on-disk state**，不承诺掉电持久性。
 Reader 的 fast/full 验证都严格只读；恢复交给持写锁的 Writer 或 `TransactionRecoveryManager`。
 恢复仅发现 active pointer 和未清理 staging，不扫描历史 journal；早期原型格式不受支持且不提供迁移。
+Reader 可只读 v1/v2 Raw、Sync 与 window，但不会从历史 v1 state 在线拆力或合成 tactile；Writer 仅创建或
+续录 v2 root，v1 数据使用新 root，不做原地迁移。带 Sensor 的 resume 必须已有 v2 manifest，不能从旧主
+Dataset 中途开始 Sidecar；已有 Sidecar 的 root 也不能在未配置 Sensor 时继续追加主帧。Sidecar v2 只升级逻辑 manifest/frame-view contract，
+storage layout、Raw/Sync Arrow schema、transaction journal 与 main evidence 继续使用各自 v1 格式。
 Hub subset、Windows spawn、批量窗口、64 MiB worker-local 缓存与诊断使用方式见
 [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md)。
 
@@ -470,6 +505,7 @@ from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
 
 config = X518SensorConfig(
     host="192.168.1.100",
+    frame_features=["left.normal_force", "right.normal_force"],
     channels={
         "left.normal_force": X518ChannelConfig(channel=1),
         "right.normal_force": X518ChannelConfig(channel=2),
@@ -496,6 +532,7 @@ X518 的 Modbus 地址、双通道限制、单位码和 word swap 只属于 X518
 
 - [ ] Config 使用 `SensorConfig.register_subclass()` 注册。
 - [ ] `sample_rate_hz` 使用公共字段。
+- [ ] `frame_features` 使用 `None` / ordered list / `[]` 表达 all / selected / raw-only；没有继续使用 v1 `state_features`。
 - [ ] 配置在连接前完成类型、范围和有限值验证。
 - [ ] 硬件通道到 semantic feature 的映射可配置。
 - [ ] feature 名称不含型号、通道或单位。
@@ -506,6 +543,7 @@ X518 的 Modbus 地址、双通道限制、单位码和 word swap 只属于 X518
 - [ ] 每个样本包含 `timestamp_ns`、`arrival_timestamp_ns`、`sequence`、`values`、`is_valid`。
 - [ ] invalid acquisition 也递增 framework sequence，并保留 status/error。
 - [ ] current/window 同时检查 timestamp 与 arrival timestamp 的因果性。
+- [ ] 每帧每个 Sensor 只选择一次；current values 和 Sync metadata 复用同一 `SensorSample`。
 - [ ] 读取与 History 接口的消费、等待、区间和因果语义正确。
 - [ ] `connect()` 启动后台资源，失败时完整回滚。
 - [ ] `disconnect()` 能停止线程、唤醒读取者并关闭 I/O。

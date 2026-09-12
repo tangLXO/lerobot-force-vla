@@ -1,5 +1,12 @@
 # Sensor production validation
 
+> **Historical Sidecar v1 validation report — superseded for new recordings.** The evidence
+> below is preserved without reinterpretation and validates the original contract in which
+> selected force values were part of `observation.state`. The current breaking Sidecar v2
+> contract is defined by [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) and
+> [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md): Robot-only state plus the independent
+> current `observation.tactile` view. These historical counts are not v2 acceptance results.
+
 The six-stage implementation preserves Sensor/SensorizedRobot APIs, existing policy state
 inputs and Sidecar v1 final schemas/layout. Transaction journal format v1 provides
 **process-crash recoverable + replayable on-disk state**; it does not provide power-loss durability

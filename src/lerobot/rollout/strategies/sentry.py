@@ -131,12 +131,13 @@ class SentryStrategy(RolloutStrategy):
                 with timer.section("observe"):
                     obs = sensor_safe_observation(ctx)
                 with timer.section("process_obs"):
-                    obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                    obs_processed = self._process_observation_and_notify(ctx, obs)
 
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
                 action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+                recorded_policy_endpoint = False
 
                 if action_dict is not None:
                     with timer.section("telemetry"):
@@ -157,14 +158,19 @@ class SentryStrategy(RolloutStrategy):
                             # background pusher only ever touches *finalised* episode
                             # artifacts on disk.  The two operate on disjoint state, so
                             # ``add_frame`` does not need ``_episode_lock``.
-                            add_dataset_frame(ctx, frame)
+                            add_dataset_frame(ctx, frame, self._cached_capture_metadata)
+                            recorded_policy_endpoint = True
 
                 # Episode rotation derived from video file-size target.
                 # The duration is a conservative estimate so the actual
                 # video has crossed DEFAULT_VIDEO_FILE_SIZE_IN_MB by now,
                 # keeping push_to_hub efficient (uploads complete files).
                 elapsed = time.perf_counter() - episode_start
-                if elapsed >= episode_duration_s:
+                # Never split an interpolation cycle across Sidecar episodes: the
+                # cached observation/capture belongs to the episode in which the
+                # cycle began. Rotate only after its endpoint frame and Sync row
+                # have both been written.
+                if elapsed >= episode_duration_s and recorded_policy_endpoint:
                     self._checked_save_episode(dataset, ctx)
                     logger.info(
                         "Episode saved (total: %d, elapsed: %.1fs)",

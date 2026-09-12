@@ -16,13 +16,15 @@
 
 import json
 import re
-from unittest.mock import patch
+import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 pytest.importorskip("deepdiff", reason="deepdiff is required (install lerobot[hardware])")
 
+from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.processor import make_default_processors
 from lerobot.robots import make_robot_from_config
@@ -32,6 +34,7 @@ from lerobot.scripts.lerobot_record import RecordConfig, record, record_loop
 from lerobot.scripts.lerobot_replay import DatasetReplayConfig, ReplayConfig, replay
 from lerobot.scripts.lerobot_teleoperate import TeleoperateConfig, teleoperate
 from lerobot.sensors import Sensor, SensorConfig, SensorFeature
+from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, OBS_STATE, OBS_TACTILE
 from tests.fixtures.constants import DUMMY_REPO_ID
 from tests.mocks.mock_robot import MockRobotConfig
 from tests.mocks.mock_teleop import MockTeleopConfig
@@ -51,7 +54,7 @@ class _RecorderFailureSensor(Sensor):
     """Optional raw-only sensor used to exercise recorder abort cleanup."""
 
     def __init__(self) -> None:
-        super().__init__(SensorConfig(expected_sample_rate_hz=100, required=False, state_features=[]))
+        super().__init__(SensorConfig(expected_sample_rate_hz=100, required=False, frame_features=[]))
         self.connected = False
 
     @property
@@ -69,10 +72,60 @@ class _RecorderFailureSensor(Sensor):
         self.connected = False
 
 
+class _FrameForceSensor(Sensor):
+    """Deterministic current-force source for record schema tests."""
+
+    def __init__(self) -> None:
+        super().__init__(SensorConfig(expected_sample_rate_hz=100, max_age_ms=1000))
+        self.connected = False
+
+    @property
+    def features(self) -> dict[str, SensorFeature]:
+        return {
+            "left.normal_force": SensorFeature("float32", "N"),
+            "right.normal_force": SensorFeature("float32", "N"),
+        }
+
+    @property
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def connect(self) -> None:
+        self.connected = True
+        now_ns = time.perf_counter_ns()
+        self._publish_sample(
+            {"left.normal_force": 1.0, "right.normal_force": 2.0},
+            now_ns,
+            arrival_timestamp_ns=now_ns,
+        )
+
+    def disconnect(self) -> None:
+        self.connected = False
+
+
 def test_calibrate():
     robot_cfg = MockRobotConfig()
     cfg = CalibrateConfig(robot=robot_cfg)
     calibrate(cfg)
+
+
+def test_dataset_compatibility_check_accepts_read_only_metadata() -> None:
+    robot = make_robot_from_config(MockRobotConfig(n_motors=1))
+    expected_features = {
+        OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["motor_1.pos"]},
+        ACTION: {"dtype": "float32", "shape": (1,), "names": ["motor_1.pos"]},
+    }
+    metadata = type(
+        "MetadataView",
+        (),
+        {
+            "robot_type": robot.robot_type,
+            "fps": 30,
+            "features": {**expected_features, **DEFAULT_FEATURES},
+        },
+    )()
+
+    sanity_check_dataset_robot_compatibility(metadata, robot, 30, expected_features)
 
 
 def test_teleoperate(cadence_log):
@@ -133,6 +186,209 @@ def test_record_and_resume(tmp_path):
     assert dataset.meta.total_episodes == dataset.num_episodes == 2
     assert dataset.meta.total_frames == dataset.num_frames == 6
     assert dataset.meta.total_tasks == 1
+
+
+def test_record_routes_current_force_to_tactile_without_state_duplication(tmp_path) -> None:
+    inner_robot = make_robot_from_config(MockRobotConfig(random_values=False, static_values=[0.1, 0.2, 0.3]))
+    sensorized_robot = SensorizedRobot(inner_robot, {"gripper_force": _FrameForceSensor()})
+    recorder = MagicMock()
+    recorder.commit_prepared.side_effect = lambda dataset: dataset.save_episode()
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "record_tactile",
+        num_episodes=1,
+        episode_time_s=0.05,
+        reset_time_s=0,
+        push_to_hub=False,
+        video=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(random_values=False, static_values=[0.1, 0.2, 0.3]),
+        play_sounds=False,
+    )
+
+    with (
+        patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=sensorized_robot),
+        patch("lerobot.scripts.lerobot_record.SensorStreamRecorder", return_value=recorder),
+        patch(
+            "lerobot.scripts.lerobot_record.init_keyboard_listener",
+            return_value=(
+                None,
+                {"stop_recording": False, "exit_early": False, "rerecord_episode": False},
+            ),
+        ),
+    ):
+        original_send_action = sensorized_robot.send_action
+
+        def mutate_capture_after_observation(action):
+            sent = original_send_action(action)
+            sensorized_robot.last_capture_metadata["sensors"]["gripper_force"]["sequence"] = 999
+            return sent
+
+        sensorized_robot.send_action = mutate_capture_after_observation
+        dataset = record(cfg)
+
+    assert dataset.features[OBS_STATE]["shape"] == (3,)
+    assert dataset.features[OBS_TACTILE]["shape"] == (2,)
+    assert set(dataset.features[OBS_STATE]["names"]).isdisjoint(dataset.features[OBS_TACTILE]["names"])
+    item = dataset[0]
+    assert item[OBS_STATE].tolist() == pytest.approx([0.1, 0.2, 0.3])
+    assert item[OBS_TACTILE].tolist() == pytest.approx([1.0, 2.0])
+    captures = [call.args[1] for call in recorder.record_sync.call_args_list]
+    assert captures
+    assert all(capture["sensors"]["gripper_force"]["sequence"] == 0 for capture in captures)
+
+
+def test_record_rejects_v1_sidecar_before_dataset_resume(tmp_path) -> None:
+    root = tmp_path / "v1_resume"
+    manifest_path = root / "meta" / "sensor_streams.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({"sidecar_schema_version": 1}), encoding="utf-8")
+    sensorized_robot = SensorizedRobot(
+        make_robot_from_config(MockRobotConfig()), {"gripper_force": _FrameForceSensor()}
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=root,
+            num_episodes=1,
+            episode_time_s=0.01,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        resume=True,
+    )
+
+    with (
+        patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=sensorized_robot),
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDatasetMetadata",
+            return_value=MagicMock(root=root),
+        ),
+        patch("lerobot.scripts.lerobot_record.LeRobotDataset.resume") as resume,
+        pytest.raises(ValueError, match="Record into a new Dataset root"),
+    ):
+        record(cfg)
+
+    resume.assert_not_called()
+
+
+def test_record_rejects_sidecar_resume_without_configured_sensors(tmp_path) -> None:
+    root = tmp_path / "v2_resume_without_sensors"
+    manifest_path = root / "meta" / "sensor_streams.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({"sidecar_schema_version": 2}), encoding="utf-8")
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=root,
+            num_episodes=1,
+            episode_time_s=0.01,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        resume=True,
+    )
+
+    with (
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDatasetMetadata",
+            return_value=MagicMock(root=root),
+        ),
+        patch("lerobot.scripts.lerobot_record.LeRobotDataset.resume") as resume,
+        pytest.raises(ValueError, match="without the configured sensors"),
+    ):
+        record(cfg)
+
+    resume.assert_not_called()
+
+
+def test_record_rejects_adding_sidecar_during_dataset_resume(tmp_path) -> None:
+    root = tmp_path / "resume_without_existing_sidecar"
+    sensorized_robot = SensorizedRobot(
+        make_robot_from_config(MockRobotConfig()), {"gripper_force": _FrameForceSensor()}
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=root,
+            num_episodes=1,
+            episode_time_s=0.01,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        resume=True,
+    )
+
+    with (
+        patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=sensorized_robot),
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDatasetMetadata",
+            return_value=MagicMock(root=root),
+        ),
+        patch("lerobot.scripts.lerobot_record.LeRobotDataset.resume") as resume,
+        pytest.raises(ValueError, match="Cannot add a Sensor Sidecar.*new Dataset root"),
+    ):
+        record(cfg)
+
+    resume.assert_not_called()
+
+
+def test_record_materializes_hub_metadata_before_sidecar_resume_preflight(tmp_path) -> None:
+    root = tmp_path / "hub_v2_resume"
+    sensorized_robot = SensorizedRobot(
+        make_robot_from_config(MockRobotConfig()), {"gripper_force": _FrameForceSensor()}
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="Dummy task",
+            root=root,
+            num_episodes=1,
+            episode_time_s=0.01,
+            push_to_hub=False,
+        ),
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        resume=True,
+    )
+
+    def materialize_metadata(*_args, **_kwargs):
+        manifest_path = root / "meta" / "sensor_streams.json"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(json.dumps({"sidecar_schema_version": 2}), encoding="utf-8")
+        return MagicMock(root=root)
+
+    with (
+        patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=sensorized_robot),
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDatasetMetadata",
+            side_effect=materialize_metadata,
+        ) as metadata_loader,
+        patch(
+            "lerobot.scripts.lerobot_record.sanity_check_dataset_robot_compatibility",
+            side_effect=ValueError("synthetic main schema mismatch"),
+        ),
+        patch("lerobot.scripts.lerobot_record.LeRobotDataset.resume") as resume,
+        pytest.raises(ValueError, match="synthetic main schema mismatch"),
+    ):
+        record(cfg)
+
+    metadata_loader.assert_called_once()
+    resume.assert_not_called()
 
 
 def test_record_and_replay(tmp_path, cadence_log):

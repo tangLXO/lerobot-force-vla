@@ -619,6 +619,458 @@ def test_align_state_feature_order_is_noop_without_an_exact_name_match(policy_ac
     assert list(aligned) == feature_names
 
 
+def test_rollout_rejects_v1_force_in_state_checkpoint_shape() -> None:
+    from lerobot.configs import FeatureType, PolicyFeature
+    from lerobot.rollout.context import _validate_policy_state_shape
+    from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
+
+    policy_config = SimpleNamespace(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,))}
+    )
+    live_features = {
+        OBS_STATE: {"dtype": "float32", "shape": (6,), "names": [f"joint_{i}.pos" for i in range(6)]},
+        OBS_TACTILE: {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": ["sensor.force.left.normal_force", "sensor.force.right.normal_force"],
+        },
+    }
+
+    with pytest.raises(ValueError, match="Sidecar v1 force-in-state.*never truncated or padded"):
+        _validate_policy_state_shape(policy_config, live_features, enforce_sensorized_v2=True)
+
+
+def test_rollout_keeps_non_tactile_custom_state_shape_compatibility() -> None:
+    from lerobot.configs import FeatureType, PolicyFeature
+    from lerobot.rollout.context import _validate_policy_state_shape
+    from lerobot.utils.constants import OBS_STATE
+
+    policy_config = SimpleNamespace(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,))}
+    )
+    live_features = {
+        OBS_STATE: {"dtype": "float32", "shape": (6,), "names": [f"joint_{i}.pos" for i in range(6)]}
+    }
+
+    _validate_policy_state_shape(policy_config, live_features)
+
+
+def test_rollout_rejects_v1_force_in_state_for_raw_only_v2_profile() -> None:
+    from lerobot.configs import FeatureType, PolicyFeature
+    from lerobot.rollout.context import _validate_policy_state_shape
+    from lerobot.utils.constants import OBS_STATE
+
+    policy_config = SimpleNamespace(
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,))}
+    )
+    live_features = {
+        OBS_STATE: {"dtype": "float32", "shape": (6,), "names": [f"joint_{i}.pos" for i in range(6)]}
+    }
+
+    with pytest.raises(ValueError, match="Sidecar v1 force-in-state.*never truncated or padded"):
+        _validate_policy_state_shape(policy_config, live_features, enforce_sensorized_v2=True)
+
+
+def test_rollout_rejects_v1_state_shape_before_connecting_hardware(monkeypatch) -> None:
+    import lerobot.rollout.context as rollout_context
+    from lerobot.configs import FeatureType, PolicyFeature
+    from lerobot.robots import SensorizedRobot
+    from lerobot.rollout import BaseStrategyConfig, SyncInferenceConfig
+    from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
+
+    policy_config = SimpleNamespace(
+        type="mock",
+        pretrained_path="user/v1-policy",
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(8,))},
+        action_feature_names=None,
+    )
+    policy = MagicMock()
+    policy.to.return_value = policy
+    robot = MagicMock(spec=SensorizedRobot)
+    robot.observation_features = {
+        **{f"joint_{i}.pos": float for i in range(6)},
+        "sensor.force.left.normal_force": float,
+        "sensor.force.right.normal_force": float,
+    }
+    robot.current_frame_feature_names = (
+        "sensor.force.left.normal_force",
+        "sensor.force.right.normal_force",
+    )
+    live_features = {
+        OBS_STATE: {"dtype": "float32", "shape": (6,), "names": [f"joint_{i}.pos" for i in range(6)]},
+        OBS_TACTILE: {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": list(robot.current_frame_feature_names),
+        },
+    }
+    robot.route_observation_dataset_features.return_value = live_features
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(
+        rollout_context,
+        "aggregate_pipeline_dataset_features",
+        lambda **_: live_features,
+    )
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        dataset=None,
+        strategy=BaseStrategyConfig(),
+        rename_map=None,
+    )
+
+    with pytest.raises(ValueError, match="Sidecar v1 force-in-state"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=MagicMock(),
+            robot_action_processor=MagicMock(),
+            robot_observation_processor=MagicMock(),
+        )
+
+    robot.validate_tactile_v2_profile.assert_called_once_with()
+    robot.connect.assert_not_called()
+
+
+def test_rollout_rejects_v1_sidecar_resume_before_connecting_hardware(monkeypatch, tmp_path) -> None:
+    import json
+
+    import lerobot.rollout.context as rollout_context
+    from lerobot.rollout import SentryStrategyConfig, SyncInferenceConfig
+
+    manifest_path = tmp_path / "meta" / "sensor_streams.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps({"sidecar_schema_version": 1}), encoding="utf-8")
+    policy_config = SimpleNamespace(type="mock", pretrained_path="user/policy")
+    policy = MagicMock()
+    policy.to.return_value = policy
+    robot = MagicMock()
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(
+        rollout_context,
+        "LeRobotDatasetMetadata",
+        lambda *_args, **_kwargs: SimpleNamespace(root=tmp_path),
+    )
+    resume = MagicMock()
+    monkeypatch.setattr(rollout_context.LeRobotDataset, "resume", resume)
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        dataset=SimpleNamespace(root=tmp_path, repo_id="test/v1", video=False),
+        strategy=SentryStrategyConfig(),
+        resume=True,
+        rename_map=None,
+    )
+
+    with pytest.raises(ValueError, match="Record into a new Dataset root"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=MagicMock(),
+            robot_action_processor=MagicMock(),
+            robot_observation_processor=MagicMock(),
+        )
+
+    robot.connect.assert_not_called()
+    resume.assert_not_called()
+
+
+def test_rollout_materializes_hub_metadata_before_sidecar_resume_preflight(monkeypatch, tmp_path) -> None:
+    import json
+
+    import lerobot.rollout.context as rollout_context
+    from lerobot.robots import SensorizedRobot
+    from lerobot.rollout import SentryStrategyConfig, SyncInferenceConfig
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    root = tmp_path / "hub_v2_resume"
+    policy_config = SimpleNamespace(
+        type="mock",
+        pretrained_path="user/policy",
+        input_features={},
+        action_feature_names=None,
+    )
+    policy = MagicMock()
+    policy.to.return_value = policy
+    robot = MagicMock(spec=SensorizedRobot)
+    robot.robot_type = "mock"
+    robot.sensors = {}
+    robot.observation_features = {"joint.pos": float}
+    robot.action_features = {"joint.pos": float}
+    observation_hw = {"joint.pos": float}
+    observation_features = {OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    action_features = {ACTION: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    events = []
+
+    def materialize_metadata(*_args, **_kwargs):
+        events.append("metadata")
+        manifest_path = root / "meta" / "sensor_streams.json"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text(json.dumps({"sidecar_schema_version": 2}), encoding="utf-8")
+        return SimpleNamespace(root=root)
+
+    original_preflight = rollout_context.preflight_sensor_stream_writer
+
+    def checked_preflight(preflight_root):
+        events.append("preflight")
+        assert preflight_root == root
+        return original_preflight(preflight_root)
+
+    def reject_incompatible_resume(*_args, **_kwargs):
+        events.append("compatibility")
+        raise ValueError("synthetic main schema mismatch")
+
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(rollout_context, "LeRobotDatasetMetadata", materialize_metadata)
+    monkeypatch.setattr(rollout_context, "preflight_sensor_stream_writer", checked_preflight)
+    monkeypatch.setattr(
+        rollout_context,
+        "_resolve_observation_feature_schemas",
+        lambda *_args, **_kwargs: (observation_hw, observation_features),
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "aggregate_pipeline_dataset_features",
+        lambda **_: action_features,
+    )
+    robot.route_observation_dataset_features.return_value = observation_features
+    monkeypatch.setattr(
+        rollout_context,
+        "sanity_check_dataset_robot_compatibility",
+        reject_incompatible_resume,
+    )
+    resume = MagicMock()
+    monkeypatch.setattr(rollout_context.LeRobotDataset, "resume", resume)
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        dataset=SimpleNamespace(root=root, repo_id="test/v2", video=False, fps=30),
+        strategy=SentryStrategyConfig(),
+        resume=True,
+        rename_map=None,
+    )
+
+    with pytest.raises(ValueError, match="synthetic main schema mismatch"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=MagicMock(),
+            robot_action_processor=MagicMock(),
+            robot_observation_processor=MagicMock(),
+        )
+
+    assert events == ["metadata", "preflight", "compatibility"]
+    robot.connect.assert_not_called()
+    resume.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("sensorized", "materialize_manifest", "match"),
+    [
+        (False, True, "without the configured sensors"),
+        (True, False, "Cannot add a Sensor Sidecar"),
+    ],
+)
+def test_rollout_remote_resume_rejects_sidecar_presence_mismatch_before_hardware(
+    monkeypatch, tmp_path, sensorized, materialize_manifest, match
+) -> None:
+    import json
+
+    import lerobot.rollout.context as rollout_context
+    from lerobot.robots import SensorizedRobot
+    from lerobot.rollout import SentryStrategyConfig, SyncInferenceConfig
+
+    root = tmp_path / "remote_resume"
+    policy_config = SimpleNamespace(type="mock", pretrained_path="user/policy")
+    policy = MagicMock()
+    policy.to.return_value = policy
+    robot = MagicMock(spec=SensorizedRobot) if sensorized else MagicMock()
+    if sensorized:
+        robot.sensors = {}
+
+    def materialize_metadata(*_args, **_kwargs):
+        if materialize_manifest:
+            manifest_path = root / "meta" / "sensor_streams.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(json.dumps({"sidecar_schema_version": 2}), encoding="utf-8")
+        return SimpleNamespace(root=root)
+
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(rollout_context, "LeRobotDatasetMetadata", materialize_metadata)
+    resume = MagicMock()
+    monkeypatch.setattr(rollout_context.LeRobotDataset, "resume", resume)
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        dataset=SimpleNamespace(root=root, repo_id="test/remote", video=False),
+        strategy=SentryStrategyConfig(),
+        resume=True,
+        rename_map=None,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=MagicMock(),
+            robot_action_processor=MagicMock(),
+            robot_observation_processor=MagicMock(),
+        )
+
+    robot.connect.assert_not_called()
+    resume.assert_not_called()
+
+
+@pytest.mark.parametrize("strategy_kind", ["dagger", "custom"])
+def test_rollout_checks_strategy_resume_schema_before_connecting_hardware(
+    monkeypatch, tmp_path, strategy_kind
+) -> None:
+    import lerobot.rollout.context as rollout_context
+    from lerobot.rollout import DAggerStrategyConfig, SyncInferenceConfig
+    from lerobot.rollout.configs import RolloutStrategyConfig
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    class CustomStrategyConfig(RolloutStrategyConfig):
+        dataset_mode = "optional"
+
+        def extra_dataset_features(self):
+            return {"custom_score": {"dtype": "float32", "shape": (1,), "names": None}}
+
+    strategy = DAggerStrategyConfig() if strategy_kind == "dagger" else CustomStrategyConfig()
+    policy_config = SimpleNamespace(
+        type="mock",
+        pretrained_path="user/policy",
+        input_features={},
+        action_feature_names=None,
+    )
+    policy = MagicMock()
+    policy.to.return_value = policy
+    robot = MagicMock()
+    robot.robot_type = "mock"
+    robot.observation_features = {"joint.pos": float}
+    robot.action_features = {"joint.pos": float}
+    observation_hw = {"joint.pos": float}
+    observation_features = {OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    action_features = {ACTION: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    captured = {}
+
+    def reject_incompatible_resume(_metadata, _robot, _fps, features):
+        captured.update(features)
+        raise ValueError("synthetic resume feature mismatch")
+
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(
+        rollout_context,
+        "_resolve_observation_feature_schemas",
+        lambda *_args, **_kwargs: (observation_hw, observation_features),
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "aggregate_pipeline_dataset_features",
+        lambda **_: action_features,
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "LeRobotDatasetMetadata",
+        lambda *_args, **_kwargs: SimpleNamespace(root=tmp_path),
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "sanity_check_dataset_robot_compatibility",
+        reject_incompatible_resume,
+    )
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        dataset=SimpleNamespace(root=tmp_path, repo_id="test/dagger", video=False, fps=30),
+        strategy=strategy,
+        resume=True,
+        rename_map=None,
+    )
+
+    with pytest.raises(ValueError, match="synthetic resume feature mismatch"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=MagicMock(),
+            robot_action_processor=MagicMock(),
+            robot_observation_processor=MagicMock(),
+        )
+
+    for key, feature in strategy.extra_dataset_features().items():
+        assert captured[key] == feature
+    robot.connect.assert_not_called()
+
+
+def test_add_dataset_frame_requires_explicit_sensor_capture_metadata() -> None:
+    from lerobot.datasets.sensor_stream import SensorRecorderError
+    from lerobot.rollout.strategies.core import add_dataset_frame
+
+    dataset = MagicMock()
+    recorder = MagicMock()
+    ctx = SimpleNamespace(
+        data=SimpleNamespace(
+            dataset=dataset,
+            sensor_recorder=recorder,
+            current_capture_metadata={"sensors": {"force": {"sequence": 99}}},
+        )
+    )
+
+    with pytest.raises(SensorRecorderError, match="capture metadata snapshot"):
+        add_dataset_frame(ctx, {"observation.state": torch.zeros(1)}, None)
+
+    dataset.add_frame.assert_not_called()
+    recorder.record_sync.assert_not_called()
+
+
+def test_processor_context_runs_observation_validator_after_pipeline() -> None:
+    from lerobot.rollout.context import ProcessorContext
+
+    validator = MagicMock()
+    processors = ProcessorContext(
+        teleop_action_processor=MagicMock(),
+        robot_action_processor=MagicMock(),
+        robot_observation_processor=lambda observation: {**observation, "processed": True},
+        observation_validator=validator,
+    )
+    raw = {"joint.pos": 1.0}
+
+    processed = processors.process_observation(raw)
+
+    assert processed == {"joint.pos": 1.0, "processed": True}
+    validator.assert_called_once_with(raw, processed)
+
+
 def test_estimate_max_episode_seconds_no_video():
     from lerobot.rollout.strategies import estimate_max_episode_seconds
 
@@ -890,6 +1342,70 @@ def test_sentry_records_once_per_interpolation_cycle():
     assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
 
 
+def test_sentry_rotates_only_after_recorded_interpolation_endpoint() -> None:
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=4)
+    strategy = _make_sentry(ctx, 2)
+    strategy._episode_duration_s = 0.0
+    strategy._checked_save_episode = MagicMock()
+    strategy._register_saved_episode = MagicMock()
+    strategy._save_tail_episode = MagicMock()
+
+    strategy.run(ctx)
+
+    assert dataset.add_frame.call_count == 2
+    assert strategy._checked_save_episode.call_count == dataset.add_frame.call_count
+
+
+def test_interpolated_rollout_binds_tactile_frame_to_matching_sync_capture() -> None:
+    from lerobot.robots import SensorizedRobot
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=4)
+    sensorized = SensorizedRobot(MagicMock(observation_features={}), {})
+    ctx.hardware.robot_wrapper.inner = sensorized
+    ctx.data.dataset_features = {
+        **_LOOP_FEATURES,
+        "observation.tactile": {
+            "dtype": "float32",
+            "shape": (2,),
+            "names": [
+                "sensor.force.left.normal_force",
+                "sensor.force.right.normal_force",
+            ],
+        },
+    }
+    recorder = MagicMock(is_active=True, has_prepared_episode=False)
+    ctx.data.sensor_recorder = recorder
+    ticks = {"n": 0}
+
+    def get_observation():
+        ticks["n"] += 1
+        tick = ticks["n"]
+        sensorized.last_capture_metadata = {
+            "observation_start_ns": tick * 10 - 2,
+            "frame_anchor_ns": tick * 10,
+            "observation_complete_ns": tick * 10 + 2,
+            "hardware_observation_timestamps": None,
+            "sensors": {"force": {"sequence": tick}},
+        }
+        if tick >= 4:
+            ctx.runtime.shutdown_event.set()
+        return {
+            "m.pos": float(tick),
+            "sensor.force.left.normal_force": float(tick),
+            "sensor.force.right.normal_force": float(tick + 100),
+        }
+
+    ctx.hardware.robot_wrapper.get_observation.side_effect = get_observation
+
+    _make_sentry(ctx, 2).run(ctx)
+
+    frames = [call.args[0] for call in dataset.add_frame.call_args_list]
+    captures = [call.args[1] for call in recorder.record_sync.call_args_list]
+    assert len(frames) == len(captures) == 2
+    for frame, capture in zip(frames, captures, strict=True):
+        assert frame["observation.tactile"][0] == capture["sensors"]["force"]["sequence"]
+
+
 def test_sentry_runs_inference_once_per_cycle_and_reuses_processed_observation():
     ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=8)
 
@@ -1020,6 +1536,26 @@ def test_dagger_continuous_records_once_per_interpolation_cycle():
     assert _recorded_actions(dataset) == [1.0, 2.0, 3.0, 4.0]
     for call in dataset.add_frame.call_args_list:
         assert call.args[0]["intervention"].item() is False
+
+
+def test_dagger_rotates_only_after_recorded_interpolation_endpoint(monkeypatch) -> None:
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+    from lerobot.utils.action_interpolator import ActionInterpolator
+
+    ctx, dataset = _make_loop_ctx(fps=200.0, multiplier=2, num_ticks=4)
+    dataset.has_pending_frames.return_value = False
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True, num_episodes=1))
+    strategy._engine = ctx.policy.inference
+    strategy._interpolator = ActionInterpolator(multiplier=2)
+    strategy._episode_duration_s = 0.0
+    save_episode = MagicMock()
+    monkeypatch.setattr("lerobot.rollout.strategies.dagger.save_dataset_episode", save_episode)
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.add_frame.call_count == 2
+    assert save_episode.call_count == dataset.add_frame.call_count
 
 
 @pytest.mark.parametrize("correction_ticks", [1, 2, 3])

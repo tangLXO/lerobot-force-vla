@@ -127,7 +127,7 @@ class HighlightStrategy(RolloutStrategy):
                     with timer.section("observe"):
                         obs = sensor_safe_observation(ctx)
                     with timer.section("process_obs"):
-                        obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                        obs_processed = self._process_observation_and_notify(ctx, obs)
 
                     if self._handle_warmup(cfg.use_torch_compile, timer):
                         continue
@@ -197,7 +197,7 @@ class HighlightStrategy(RolloutStrategy):
                                                 )
                                         self._recording_live.set()
                                     else:
-                                        add_dataset_frame(ctx, frame)
+                                        add_dataset_frame(ctx, frame, self._cached_capture_metadata)
                                         with self._episode_lock:
                                             save_dataset_episode(ctx)
                                         logger.info("Episode saved (total: %d)", dataset.num_episodes)
@@ -210,7 +210,7 @@ class HighlightStrategy(RolloutStrategy):
 
                                 if not frame_consumed:
                                     if self._recording_live.is_set():
-                                        add_dataset_frame(ctx, frame)
+                                        add_dataset_frame(ctx, frame, self._cached_capture_metadata)
                                     else:
                                         if getattr(ctx.data, "sensor_recorder", None) is None:
                                             ring.append(frame)
@@ -219,7 +219,7 @@ class HighlightStrategy(RolloutStrategy):
                                                 {
                                                     "__dataset_frame__": frame,
                                                     "__sensor_capture_metadata__": deepcopy(
-                                                        ctx.hardware.robot_wrapper.inner.last_capture_metadata
+                                                        self._cached_capture_metadata
                                                     ),
                                                 }
                                             )

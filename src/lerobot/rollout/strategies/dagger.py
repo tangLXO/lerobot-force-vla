@@ -73,7 +73,9 @@ from ..context import RolloutContext
 from .core import (
     RolloutStrategy,
     add_dataset_frame,
+    current_sensor_capture_metadata,
     estimate_max_episode_seconds,
+    process_robot_observation,
     safe_push_to_hub,
     save_dataset_episode,
     send_next_action,
@@ -409,6 +411,7 @@ class DAggerStrategy(RolloutStrategy):
                     phase = events.phase
                     with timer.section("observe"):
                         obs = sensor_safe_observation(ctx)
+                    recorded_autonomous_endpoint = False
 
                     # --- CORRECTING: human teleop control ---
                     # TODO(Steven): teleop runs at the same FPS as the policy. To
@@ -416,7 +419,7 @@ class DAggerStrategy(RolloutStrategy):
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         with timer.section("process_obs"):
-                            obs_processed = ctx.processors.robot_observation_processor(obs)
+                            obs_processed = process_robot_observation(ctx.processors, obs)
                         with timer.section("teleop"):
                             teleop_action = teleop.get_action()
                             processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
@@ -438,7 +441,7 @@ class DAggerStrategy(RolloutStrategy):
                                     "task": task_str,
                                     "intervention": np.array([True], dtype=bool),
                                 }
-                                add_dataset_frame(ctx, frame)
+                                add_dataset_frame(ctx, frame, current_sensor_capture_metadata(ctx))
                         correction_tick += 1
 
                     # --- PAUSED: hold position ---
@@ -450,7 +453,7 @@ class DAggerStrategy(RolloutStrategy):
                     # --- AUTONOMOUS: policy control ---
                     else:
                         with timer.section("process_obs"):
-                            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                            obs_processed = self._process_observation_and_notify(ctx, obs)
 
                         if self._handle_warmup(cfg.use_torch_compile, timer):
                             continue
@@ -470,13 +473,18 @@ class DAggerStrategy(RolloutStrategy):
                                         "task": task_str,
                                         "intervention": np.array([False], dtype=bool),
                                     }
-                                    add_dataset_frame(ctx, frame)
+                                    add_dataset_frame(ctx, frame, self._cached_capture_metadata)
+                                    recorded_autonomous_endpoint = True
 
                     # Episode rotation derived from the video file-size target.
                     # Saving is deferred while a correction is ongoing so the
                     # episode boundary lands on a clean autonomous frame.
                     elapsed = time.perf_counter() - episode_start
-                    if elapsed >= episode_duration_s and phase != DAggerPhase.CORRECTING:
+                    if (
+                        elapsed >= episode_duration_s
+                        and phase != DAggerPhase.CORRECTING
+                        and recorded_autonomous_endpoint
+                    ):
                         with self._episode_lock:
                             save_dataset_episode(ctx)
                         episodes_since_push += 1
@@ -623,7 +631,7 @@ class DAggerStrategy(RolloutStrategy):
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         with timer.section("process_obs"):
-                            obs_processed = ctx.processors.robot_observation_processor(obs)
+                            obs_processed = process_robot_observation(ctx.processors, obs)
                         with timer.section("teleop"):
                             teleop_action = teleop.get_action()
                             processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
@@ -648,6 +656,7 @@ class DAggerStrategy(RolloutStrategy):
                                         "task": task_str,
                                         "intervention": np.array([True], dtype=bool),
                                     },
+                                    current_sensor_capture_metadata(ctx),
                                 )
                         correction_tick += 1
 
@@ -660,7 +669,7 @@ class DAggerStrategy(RolloutStrategy):
                     # --- AUTONOMOUS: policy control (no recording) ---
                     else:
                         with timer.section("process_obs"):
-                            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                            obs_processed = self._process_observation_and_notify(ctx, obs)
 
                         if self._handle_warmup(cfg.use_torch_compile, timer):
                             continue

@@ -15,13 +15,18 @@ import pytest
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sensor_stream import (
+    SIDECAR_SCHEMA_VERSION,
     SensorQueueOverflowError,
     SensorRecorderError,
     SensorStreamRecorder,
+    preflight_sensor_stream_writer,
 )
 from lerobot.datasets.sensor_transaction import TransactionState
 from lerobot.datasets.sensor_window import SensorStreamReader
+from lerobot.robots.sensorized_robot import SensorizedRobot
 from lerobot.sensors import Sensor, SensorConfig, SensorFeature
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
+from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
 
 
 class FakeSensor(Sensor):
@@ -61,6 +66,15 @@ class IncompatibleFakeSensor(FakeSensor):
     def features(self):
         return {
             "left.normal_force": SensorFeature("float64", "N"),
+            "right.normal_force": SensorFeature("float32", "N"),
+        }
+
+
+class WrongUnitFakeSensor(FakeSensor):
+    @property
+    def features(self):
+        return {
+            "left.normal_force": SensorFeature("float32", "kg"),
             "right.normal_force": SensorFeature("float32", "N"),
         }
 
@@ -180,6 +194,12 @@ def test_native_rate_raw_and_sync_commit_and_read(tmp_path) -> None:
     assert all(not thread.is_alive() for thread in threads)
     journal = json.loads((tmp_path / "meta" / "sensor_transactions" / f"{uid}.json").read_text())
     assert journal["state"] == TransactionState.COMMITTED
+    assert journal["journal_version"] == 1
+    assert journal["main_evidence"]["version"] == 1
+    episode_metadata = json.loads(
+        (tmp_path / "meta" / "sensor_episodes" / f"{uid}.json").read_text(encoding="utf-8")
+    )
+    assert episode_metadata["sidecar_schema_version"] == 2
 
     reader = SensorStreamReader(tmp_path, instance="gripper_force", episode_index=0)
     rows = reader.read_raw()
@@ -250,6 +270,105 @@ def test_transaction_commits_against_real_lerobot_dataset(tmp_path) -> None:
     ]
 
 
+def test_persisted_tactile_and_sync_reuse_selection_before_concurrent_publish(tmp_path) -> None:
+    class ProprioRobot:
+        name = "fake"
+        robot_type = "fake"
+        id = "robot"
+        cameras = {}
+        observation_features = {"joint.pos": float}
+        action_features = {}
+        is_connected = True
+        is_calibrated = True
+
+        def get_observation(self):
+            return {"joint.pos": 0.5}
+
+    root = tmp_path / "causal-frame"
+    sensor = FakeSensor()
+    robot = SensorizedRobot(ProprioRobot(), {"gripper_force": sensor})
+    robot.validate_tactile_v2_profile()
+    features = robot.route_observation_dataset_features(
+        hw_to_dataset_features(robot.observation_features, "observation", use_video=False)
+    )
+    dataset = LeRobotDataset.create(
+        repo_id="test/sensor-causal-frame",
+        fps=30,
+        root=root,
+        features=features,
+    )
+    recorder = SensorStreamRecorder(root, {"gripper_force": sensor})
+    recorder.start_episode(0, dataset=dataset)
+
+    timestamp_a = time.perf_counter_ns()
+    sample_a = sensor._publish_sample(
+        {"left.normal_force": 1.0, "right.normal_force": 2.0},
+        timestamp_a,
+        arrival_timestamp_ns=timestamp_a,
+    )
+    raw_a = robot.get_observation()
+    capture_a = {
+        **robot.last_capture_metadata,
+        "sensors": {
+            name: dict(reference) for name, reference in robot.last_capture_metadata["sensors"].items()
+        },
+    }
+
+    # B arrives after A was selected but before frame packing and Sync writing. Its
+    # measurement time is the old anchor, so arrival causality alone excludes it from frame 0.
+    timestamp_b = capture_a["frame_anchor_ns"]
+    arrival_b = time.perf_counter_ns()
+    assert arrival_b > capture_a["frame_anchor_ns"]
+    sample_b = sensor._publish_sample(
+        {"left.normal_force": 10.0, "right.normal_force": 20.0},
+        timestamp_b,
+        arrival_timestamp_ns=arrival_b,
+    )
+
+    robot.assert_current_frame_values(raw_a, dict(raw_a))
+    frame_a = build_dataset_frame(dataset.features, raw_a, "observation")
+    dataset.add_frame({**frame_a, "task": "test"})
+    recorder.record_sync(0, capture_a)
+
+    raw_b = robot.get_observation()
+    capture_b = {
+        **robot.last_capture_metadata,
+        "sensors": {
+            name: dict(reference) for name, reference in robot.last_capture_metadata["sensors"].items()
+        },
+    }
+    robot.assert_current_frame_values(raw_b, dict(raw_b))
+    frame_b = build_dataset_frame(dataset.features, raw_b, "observation")
+    dataset.add_frame({**frame_b, "task": "test"})
+    recorder.record_sync(1, capture_b)
+
+    recorder.save_episode(dataset, task_info=["test"])
+    recorder.close()
+    dataset.finalize()
+
+    reopened = LeRobotDataset("test/sensor-causal-frame", root=root)
+    reader = SensorStreamReader(root, instance="gripper_force", episode_index=0, verify="full")
+    raw_rows = reader.read_raw()
+    sync_rows = reader.read_sync()
+    raw_by_sequence = {row["sequence"]: row for row in raw_rows}
+
+    assert reopened.features[OBS_STATE]["names"] == ["joint.pos"]
+    assert reopened[0][OBS_TACTILE].tolist() == pytest.approx([1.0, 2.0])
+    assert reopened[1][OBS_TACTILE].tolist() == pytest.approx([10.0, 20.0])
+    assert [row["sequence"] for row in raw_rows] == [sample_a.sequence, sample_b.sequence]
+    assert sync_rows[0]["sensors"]["gripper_force"]["sequence"] == sample_a.sequence
+    assert sync_rows[1]["sensors"]["gripper_force"]["sequence"] == sample_b.sequence
+    assert raw_by_sequence[sample_b.sequence]["arrival_timestamp_ns"] > sync_rows[0]["frame_anchor_ns"]
+
+    for frame_index, expected in enumerate(([1.0, 2.0], [10.0, 20.0])):
+        sequence = sync_rows[frame_index]["sensors"]["gripper_force"]["sequence"]
+        selected_values = raw_by_sequence[sequence]["values"]
+        assert reopened[frame_index][OBS_TACTILE].tolist() == pytest.approx(expected)
+        assert expected == pytest.approx(
+            [selected_values["left.normal_force"], selected_values["right.normal_force"]]
+        )
+
+
 def test_manifest_is_stable_but_episode_provenance_is_dynamic(tmp_path) -> None:
     initialize_main(tmp_path)
     sensor = FakeSensor()
@@ -260,20 +379,41 @@ def test_manifest_is_stable_but_episode_provenance_is_dynamic(tmp_path) -> None:
     manifest_text = json.dumps(manifest)
     assert "FakeSensor" not in manifest_text
     assert "device_id" not in manifest_text
-    assert manifest["streams"]["gripper_force"]["state_features"] == [
+    assert manifest["sidecar_schema_version"] == SIDECAR_SCHEMA_VERSION == 2
+    assert manifest["storage_layout"]["version"] == 1
+    assert manifest["raw_schema"] == "typed_semantic_and_native_structs_v1"
+    assert manifest["sync_schema"] == "one_row_per_main_dataset_frame_v1"
+    assert manifest["streams"]["gripper_force"]["frame_features"] == [
         "left.normal_force",
         "right.normal_force",
     ]
+    assert manifest["frame_view"] == {
+        "dataset_key": "observation.tactile",
+        "dtype": "float32",
+        "shape": [2],
+        "alignment": "frame_anchor_ns",
+        "sources": [
+            {
+                "instance": "gripper_force",
+                "feature": "left.normal_force",
+                "qualified_name": "sensor.gripper_force.left.normal_force",
+            },
+            {
+                "instance": "gripper_force",
+                "feature": "right.normal_force",
+                "qualified_name": "sensor.gripper_force.right.normal_force",
+            },
+        ],
+    }
 
     with pytest.raises(ValueError, match="differs from sensor_streams.json"):
         SensorStreamRecorder(tmp_path, {"gripper_force": IncompatibleFakeSensor()})
     assert not (tmp_path / ".sensor-writer.lock").exists()
 
 
-def test_state_subset_does_not_drop_raw_semantic_or_opt_in_payload(tmp_path) -> None:
+def test_frame_view_does_not_drop_raw_semantic_or_opt_in_payload(tmp_path) -> None:
     initialize_main(tmp_path)
     sensor = FakeSensor()
-    sensor.config.state_features = ["right.normal_force"]
     sensor.config.record_native_payload = True
     recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
     recorder.start_episode(0)
@@ -294,7 +434,107 @@ def test_state_subset_does_not_drop_raw_semantic_or_opt_in_payload(tmp_path) -> 
     row = reader.read_raw()[0]
     assert row["values"] == {"left.normal_force": 1.0, "right.normal_force": 2.0}
     assert row["native_payload"] == b"native"
-    assert reader.manifest["streams"]["gripper_force"]["state_features"] == ["right.normal_force"]
+    assert reader.manifest["streams"]["gripper_force"]["frame_features"] == [
+        "left.normal_force",
+        "right.normal_force",
+    ]
+
+
+def test_v2_frame_view_supports_ordered_sources_across_instances(tmp_path) -> None:
+    initialize_main(tmp_path)
+    left, right = FakeSensor(), FakeSensor()
+    left.config.frame_features = ["left.normal_force"]
+    right.config.frame_features = ["right.normal_force"]
+
+    recorder = SensorStreamRecorder(tmp_path, {"left_force": left, "right_force": right})
+    manifest = recorder.manifest
+    recorder.close()
+
+    assert manifest["frame_view"]["sources"] == [
+        {
+            "instance": "left_force",
+            "feature": "left.normal_force",
+            "qualified_name": "sensor.left_force.left.normal_force",
+        },
+        {
+            "instance": "right_force",
+            "feature": "right.normal_force",
+            "qualified_name": "sensor.right_force.right.normal_force",
+        },
+    ]
+
+
+def test_v2_raw_only_manifest_omits_frame_view(tmp_path) -> None:
+    initialize_main(tmp_path)
+    sensor = FakeSensor()
+    sensor.config.frame_features = []
+
+    recorder = SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
+    manifest = recorder.manifest
+    recorder.close()
+
+    assert manifest["streams"]["gripper_force"]["frame_features"] == []
+    assert "frame_view" not in manifest
+
+
+@pytest.mark.parametrize(
+    "frame_features",
+    [["left.normal_force"], ["right.normal_force", "left.normal_force"]],
+)
+def test_v2_profile_rejects_partial_or_reordered_frame_features(tmp_path, frame_features) -> None:
+    initialize_main(tmp_path)
+    sensor = FakeSensor()
+    sensor.config.frame_features = frame_features
+
+    with pytest.raises(ValueError, match="Sidecar v2 tactile profile"):
+        SensorStreamRecorder(tmp_path, {"gripper_force": sensor})
+
+    assert not (tmp_path / ".sensor-writer.lock").exists()
+    assert not (tmp_path / "meta/sensor_streams.json").exists()
+
+
+def test_v2_profile_requires_newtons(tmp_path) -> None:
+    initialize_main(tmp_path)
+
+    with pytest.raises(ValueError, match="semantic unit 'N'"):
+        SensorStreamRecorder(tmp_path, {"gripper_force": WrongUnitFakeSensor()})
+
+    assert not (tmp_path / ".sensor-writer.lock").exists()
+
+
+def test_v2_writer_rejects_v1_before_lock_or_recovery(tmp_path, monkeypatch) -> None:
+    initialize_main(tmp_path)
+    (tmp_path / "meta/sensor_streams.json").write_text(
+        json.dumps({"sidecar_schema_version": 1}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "lerobot.datasets.sensor_stream.TransactionRecoveryManager.recover",
+        lambda *_args, **_kwargs: pytest.fail("v1 writer must fail before recovery"),
+    )
+
+    with pytest.raises(ValueError, match="new Dataset root"):
+        SensorStreamRecorder(tmp_path, {"gripper_force": FakeSensor()})
+
+    assert not (tmp_path / ".sensor-writer.lock").exists()
+
+
+def test_writer_preflight_is_read_only_when_sidecar_is_absent(tmp_path) -> None:
+    root = tmp_path / "new-root"
+
+    preflight_sensor_stream_writer(root)
+
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("manifest", [{}, {"sidecar_schema_version": 3}])
+def test_writer_rejects_missing_or_unknown_schema_before_lock(tmp_path, manifest) -> None:
+    initialize_main(tmp_path)
+    (tmp_path / "meta/sensor_streams.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sidecar_schema_version|Unsupported Sensor Sidecar"):
+        SensorStreamRecorder(tmp_path, {"gripper_force": FakeSensor()})
+
+    assert not (tmp_path / ".sensor-writer.lock").exists()
 
 
 def test_writer_lock_refuses_a_live_writer(tmp_path) -> None:
@@ -324,7 +564,7 @@ def test_writer_lock_recovers_a_dead_process(monkeypatch, tmp_path) -> None:
 def test_recorder_capacity_is_validated_before_dataset_mutation(tmp_path) -> None:
     initialize_main(tmp_path)
     sensor = FakeSensor()
-    sensor.config = SensorConfig(required=False, state_features=[])
+    sensor.config = SensorConfig(required=False, frame_features=[])
 
     with pytest.raises(ValueError, match="recorder_queue_capacity"):
         SensorStreamRecorder(tmp_path, {"raw_only": sensor})

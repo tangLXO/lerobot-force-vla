@@ -53,6 +53,7 @@ from .core import (
     RolloutStrategy,
     add_dataset_frame,
     discard_dataset_episode,
+    process_robot_observation,
     safe_push_to_hub,
     save_dataset_episode,
     send_next_action,
@@ -263,7 +264,7 @@ class EpisodicStrategy(RolloutStrategy):
             with timer.section("observe"):
                 obs = sensor_safe_observation(ctx)
             with timer.section("process_obs"):
-                obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                obs_processed = self._process_observation_and_notify(ctx, obs)
 
             if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, timer):
                 continue
@@ -280,7 +281,11 @@ class EpisodicStrategy(RolloutStrategy):
                     with timer.section("record"):
                         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                         action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                        add_dataset_frame(ctx, {**obs_frame, **action_frame, "task": single_task})
+                        add_dataset_frame(
+                            ctx,
+                            {**obs_frame, **action_frame, "task": single_task},
+                            self._cached_capture_metadata,
+                        )
 
             timer.wait()
             timestamp = time.perf_counter() - start_t
@@ -323,7 +328,7 @@ class EpisodicStrategy(RolloutStrategy):
                 send_sensor_safe_action(ctx, robot_action)
 
                 if display_data:
-                    obs_processed = processors.robot_observation_processor(obs)
+                    obs_processed = process_robot_observation(processors, obs)
                     log_visualization_data(
                         display_mode,
                         observation=obs_processed,

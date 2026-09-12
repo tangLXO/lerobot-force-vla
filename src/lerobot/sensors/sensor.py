@@ -389,8 +389,8 @@ class Sensor(abc.ABC):
         if not samples:
             raise RuntimeError(f"{type(self).__name__} has not produced a sample yet.")
         if max_age_ms is None:
-            selected = self.features if self.config.state_features is None else self.config.state_features
-            max_age_ms = self.config.resolve_max_age_ms(state_features_present=bool(selected))
+            selected = self.features if self.config.frame_features is None else self.config.frame_features
+            max_age_ms = self.config.resolve_max_age_ms(frame_features_present=bool(selected))
         else:
             self._validate_finite_number("max_age_ms", max_age_ms, allow_zero=True)
         sample = latest_causal_sample(samples, target_timestamp_ns, max_age_ms)

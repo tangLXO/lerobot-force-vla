@@ -42,7 +42,7 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
     history_duration_s: float = 2.0
     startup_timeout_s: float = 5.0
     required: bool = True
-    state_features: list[str] | None = None
+    frame_features: list[str] | None = None
     recorder_queue_duration_s: float = 2.0
     recorder_queue_capacity: int | None = None
     record_native_values: bool = True
@@ -51,7 +51,7 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
     recorder_flush_interval_s: float = 0.5
 
     def __post_init__(self) -> None:
-        """Validate static timing, queue, and state-selection settings."""
+        """Validate static timing, queue, and current-frame selection settings."""
         for name in ("sample_rate_hz", "expected_sample_rate_hz"):
             value = getattr(self, name)
             if value is not None:
@@ -68,30 +68,30 @@ class SensorConfig(draccus.ChoiceRegistry, abc.ABC):  # type: ignore  # TODO: ad
             type(self.recorder_queue_capacity) is not int or self.recorder_queue_capacity <= 0
         ):
             raise ValueError("recorder_queue_capacity must be a positive integer or None.")
-        if self.state_features is not None:
-            if any(not isinstance(name, str) or not name for name in self.state_features):
-                raise ValueError("state_features entries must be non-empty relative feature paths.")
-            if len(self.state_features) != len(set(self.state_features)):
-                raise ValueError("state_features must not contain duplicates.")
-            if self.state_features and not self.required:
-                raise ValueError("A sensor contributing state_features must be required.")
+        if self.frame_features is not None:
+            if any(not isinstance(name, str) or not name for name in self.frame_features):
+                raise ValueError("frame_features entries must be non-empty relative feature paths.")
+            if len(self.frame_features) != len(set(self.frame_features)):
+                raise ValueError("frame_features must not contain duplicates.")
+            if self.frame_features and not self.required:
+                raise ValueError("A sensor contributing frame_features must be required.")
         elif not self.required:
-            raise ValueError("state_features=None selects all features, so the sensor must be required.")
+            raise ValueError("frame_features=None selects all features, so the sensor must be required.")
 
     def static_sample_rate_hz(self) -> float | None:
         """Return the pre-connection rate usable for static resolution."""
         return self.expected_sample_rate_hz or self.sample_rate_hz
 
-    def resolve_max_age_ms(self, *, state_features_present: bool) -> float | None:
+    def resolve_max_age_ms(self, *, frame_features_present: bool) -> float | None:
         """Resolve the immutable current/window staleness threshold."""
         if self.max_age_ms is not None:
             return self.max_age_ms
         rate_hz = self.static_sample_rate_hz()
         if rate_hz is not None:
             return float(math.ceil(3000.0 / rate_hz))
-        if state_features_present:
+        if frame_features_present:
             raise ValueError(
-                "A sensor contributing observation.state requires max_age_ms or a static sample rate."
+                "A sensor contributing a current Dataset frame view requires max_age_ms or a static sample rate."
             )
         return None
 

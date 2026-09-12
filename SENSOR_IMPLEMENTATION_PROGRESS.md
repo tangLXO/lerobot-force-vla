@@ -1,5 +1,12 @@
 # Sensor production implementation
 
+> **Historical Sidecar v1 delivery record — superseded for new recordings.** The results and
+> commit references below intentionally retain the original v1 meaning, where selected force
+> values were appended to `observation.state`. Current work uses the breaking Sidecar v2 contract
+> in [`SENSOR_FRAMEWORK.md`](./SENSOR_FRAMEWORK.md) and
+> [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md): Robot-only state plus the independent
+> current `observation.tactile` view. This file is not a v2 validation claim.
+
 Scope: six ordered stages from the user attachment, preserving Sidecar v1 final layout,
 Sensor/SensorizedRobot APIs, state inputs, and process-crash recovery (no power-loss guarantee).
 The initial user edits to AGENTS.md and three untracked Sensor documents are retained.

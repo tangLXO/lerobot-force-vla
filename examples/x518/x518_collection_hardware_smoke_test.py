@@ -20,6 +20,7 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.scripts import lerobot_record as entry
 from lerobot.sensors.x518 import X518ChannelConfig, X518SensorConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
 
 
 class ReadOnlyFollower(SO101Follower):
@@ -92,6 +93,7 @@ def main():
                 expected_unit="kg",
                 expected_sample_rate_hz=200,
                 max_age_ms=100,
+                frame_features=["left.normal_force", "right.normal_force"],
                 channels={
                     "left.normal_force": X518ChannelConfig(channel=1),
                     "right.normal_force": X518ChannelConfig(channel=2),
@@ -155,8 +157,18 @@ def main():
     data = LeRobotDataset(cfg.dataset.repo_id, root=args.root, video_backend="pyav")
     reader = SensorStreamReader(args.root, instance="gripper_force", verify="full")
     assert data.num_episodes == 2
-    assert tuple(data.features["observation.state"]["shape"]) == (8,)
+    assert tuple(data.features[OBS_STATE]["shape"]) == (6,)
+    assert tuple(data.features[OBS_TACTILE]["shape"]) == (2,)
+    assert data.features[OBS_TACTILE]["dtype"] == "float32"
+    assert data.features[OBS_TACTILE]["names"] == [
+        "sensor.gripper_force.left.normal_force",
+        "sensor.gripper_force.right.normal_force",
+    ]
+    assert set(data.features[OBS_STATE]["names"]).isdisjoint(data.features[OBS_TACTILE]["names"])
     assert tuple(data.features["action"]["shape"]) == (6,)
+    assert reader.manifest["sidecar_schema_version"] == 2
+    assert reader.manifest["frame_view"]["dataset_key"] == OBS_TACTILE
+    assert reader.manifest["frame_view"]["shape"] == [2]
     episodes = []
     offset = 0
     for episode in range(2):
@@ -171,7 +183,8 @@ def main():
                 row["frame_anchor_ns"], 5, target_hz=200, max_age_ms=100, episode_index=episode
             )
             assert bool(window.valid_mask[-1])
-            np.testing.assert_allclose(item["observation.state"][-2:].numpy(), window.values[-1])
+            assert int(window.sequence[-1]) == row["sensors"]["gripper_force"]["sequence"]
+            np.testing.assert_allclose(item[OBS_TACTILE].numpy(), window.values[-1])
             ages.append(float(window.age_ns[-1]) / 1e6)
         episodes.append(
             {
@@ -195,7 +208,9 @@ def main():
         "resume": "passed",
         "full_verification": "passed",
         "all_video_frames_decoded": True,
-        "state_matches_causal_raw": True,
+        "state_is_robot_only": True,
+        "tactile_matches_sync_reference": True,
+        "force_history_is_sidecar_only": True,
         "episodes": episodes,
     }
     (args.root / "hardware_validation.json").write_text(json.dumps(result, indent=2))

@@ -1,6 +1,6 @@
 # Sensor Framework Naming and Layering
 
-Status: **Locked**
+Status: **Locked — Sidecar v2 tactile frame-view contract**
 
 This document is the source of truth for sensor-framework work in this repository. Follow it unless the user explicitly asks to revise the convention.
 
@@ -64,7 +64,7 @@ left.normal_force
 right.normal_force
 ```
 
-Runtime and Dataset state names are qualified exactly once by the configured stream instance:
+Runtime source names and Dataset tactile names are qualified exactly once by the configured stream instance:
 
 ```text
 sensor.<instance>.<feature_path>
@@ -85,10 +85,27 @@ Feature rules:
 - Define locations from stable robot/URDF component and coordinate-frame names, never from camera or operator viewpoint.
 - Do not put `x518`, `channel_0`, `ch1`, serial ports, or similar hardware details in `RobotObservation` feature keys.
 
-At the current integration stage, selected scalar Sensor features join the existing
-`observation.state` vector and retain their fully qualified `sensor.*` names in its `names`
-metadata. Do not create a separate `observation.tactile` Dataset field until a policy with
-an independent temporal/tactile encoder is implemented.
+Sidecar v2 is a deliberate Dataset schema break from the historical v1 contract. In v2,
+`observation.state` contains only Robot proprioception/joint/gripper state. Selected scalar
+Sensor frame features retain their fully qualified `sensor.*` names but are routed to the
+independent current-frame vector `observation.tactile`; they must never also remain in
+`observation.state`.
+
+The generic source-to-Dataset routing step may construct an independent vector of any width.
+The locked Sidecar v2 current-force profile is narrower: either every stream is raw-only and
+no `observation.tactile` field is created, or the routed vector is exactly
+`float32[2] = [force_left, force_right]`, selected in this relative-feature order:
+
+```text
+left.normal_force
+right.normal_force
+```
+
+Both profile features use semantic unit `N`. Wider tactile arrays, six-axis force/torque data,
+or additional fingers require a future profile/schema version; do not loosen v2 or fold those
+values back into state. Baseline policies do not gain tactile merely because the Dataset carries
+it: automatic policy feature inference excludes `observation.tactile`, while a future policy may
+opt in explicitly when its encoder/fusion is implemented.
 
 ## Instance, channel, and provenance names
 
@@ -102,10 +119,11 @@ Use `channel` for the device channel field and obey the X518 protocol's native n
 
 Hardware identity must disappear from semantic feature names, but it must remain in configuration and provenance metadata (device type, firmware, calibration, raw capture metadata) for reproducibility.
 
-`state_features` contains relative feature paths. `None` selects all semantic features, an
-explicit list selects and orders a subset, and `[]` makes the stream raw-only. State order is
-the original Robot state, then Sensor config order, then `state_features` order. A stream that
-contributes state must be required.
+`frame_features` contains relative feature paths. `None` selects all semantic features, an
+explicit list selects and orders a subset, and `[]` makes the stream raw-only. The Robot state
+keeps the inner Robot's order and contains no Sensor values. Tactile source order is Sensor
+config order, then `frame_features` order. A stream that contributes a current-frame feature
+must be required. `state_features` is the historical v1 field and is not an alias in v2.
 
 ## Sample, history, and causal-time contract
 
@@ -140,13 +158,19 @@ duration.
 Sensor attachment is composition through `SensorizedRobot`; do not add Sensor fields to the
 central `RobotConfig` or change `make_robot_from_config()`. For each observation the wrapper
 records start time, obtains the inner Robot observation, immediately fixes one shared frame
-anchor, performs all causal Sensor selections against that anchor, merges selected state, and
-then records completion time.
+anchor, and performs exactly one causal selection per Sensor against that anchor. That same
+selected `SensorSample` supplies both the qualified current-frame values and the sequence/timing
+reference kept in capture metadata; routing, frame packing, and Sync writing must not read the
+Sensor again. A sample published after selection can enter Raw and a later frame, but cannot
+change this frame's tactile value or Sync reference.
 
-The main LeRobot Dataset remains fixed-FPS and compatible with existing state-consuming
-policies. Native-rate Raw data, per-frame Sync metadata, dynamic provenance, and transaction
-journals live in the Sensor Sidecar described by [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md).
-Sliding windows are reconstructed by a Reader/Adapter and are never duplicated persistently.
+The main LeRobot Dataset remains fixed-FPS. Its v2 frame contains Robot-only
+`observation.state` and, for the current-force profile, `observation.tactile`. Native-rate Raw
+data, per-frame Sync metadata, dynamic provenance, and transaction journals live in the Sensor
+Sidecar described by [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md). Sliding windows
+are reconstructed by a Reader/Adapter under `item["sensor_windows"]` and are never duplicated
+persistently in the Dataset frame. Rename processors may not move values across the canonical
+`observation.tactile` boundary.
 
 ## Layer boundaries
 
@@ -172,10 +196,15 @@ and leases until workers stop. Unknown future windows preserve Raw; explicit fin
 can permit safe trimming, including late measurements during final merge.
 
 The persistence guarantee is **process-crash recoverable + replayable on-disk state**, without
-power-loss durability or concurrent Reader/Writer isolation. Sidecar v1 final schemas/layout stay
-fixed; transaction journal format v1 uses a fixed active pointer, registered artifact locators and
-episode-local logical evidence. Only Writer/Recovery holding the writer lock may recover. Readers
-are strictly read-only, refuse live Writers and validate selected shared artifact ranges. See
+power-loss durability or concurrent Reader/Writer isolation. Sidecar schema v2 freezes the
+Robot-state/current-tactile boundary and manifest frame view. Storage-layout version 1, Raw and
+Sync Arrow schemas v1, transaction journal format v1, and main-evidence format v1 remain fixed.
+Only Writer/Recovery holding the writer lock may recover. Readers are strictly read-only, refuse
+live Writers and validate selected shared artifact ranges. Readers may inspect historical v1 and
+current v2 Raw/Sync/windows, but they do not reinterpret a v1 state vector or synthesize tactile.
+Writers create or resume v2 roots only. A Sensorized resume requires the v2 manifest to already
+exist, and an existing Sidecar cannot be resumed without its configured Sensors. There is no
+in-place v1 migration. See
 [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) for verification modes,
 active-transaction recovery, Hub subset localization, batch/cache behavior and runtime diagnostics.
 Earlier prototype journals are not part of the supported format and have no migration path.

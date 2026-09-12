@@ -91,6 +91,7 @@ lerobot-record \\
 
 import logging
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pprint import pformat
 
@@ -104,12 +105,13 @@ from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.datasets import (
     LeRobotDataset,
+    LeRobotDatasetMetadata,
     VideoEncodingManager,
     aggregate_pipeline_dataset_features,
     create_initial_features,
     safe_stop_image_writer,
 )
-from lerobot.datasets.sensor_stream import SensorStreamRecorder
+from lerobot.datasets.sensor_stream import SensorStreamRecorder, preflight_sensor_stream_writer
 from lerobot.processor import (
     RobotAction,
     RobotObservation,
@@ -309,10 +311,15 @@ def record_loop(
         with timer.section("observe"):
             # Get robot observation
             obs = robot.get_observation()
+            capture_metadata = (
+                deepcopy(robot.last_capture_metadata) if isinstance(robot, SensorizedRobot) else None
+            )
 
         with timer.section("process_obs"):
             # Applies a pipeline to the raw robot observation, default is IdentityProcessor
             obs_processed = robot_observation_processor(obs)
+            if isinstance(robot, SensorizedRobot):
+                robot.assert_current_frame_values(obs, obs_processed)
 
             if dataset is not None:
                 observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
@@ -368,11 +375,11 @@ def record_loop(
             with timer.section("record"):
                 action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
                 frame = {**observation_frame, **action_frame, "task": single_task}
+                if sensor_recorder is not None and capture_metadata is None:
+                    raise RuntimeError("Sensor recorder requires SensorizedRobot capture metadata.")
                 dataset.add_frame(frame)
                 if sensor_recorder is not None:
-                    if not isinstance(robot, SensorizedRobot) or robot.last_capture_metadata is None:
-                        raise RuntimeError("Sensor recorder requires SensorizedRobot capture metadata.")
-                    sensor_recorder.record_sync(None, robot.last_capture_metadata)
+                    sensor_recorder.record_sync(None, capture_metadata)
 
         if display_data:
             with timer.section("telemetry"):
@@ -421,19 +428,24 @@ def record(
         robot_action_processor = robot_action_processor or _r
         robot_observation_processor = robot_observation_processor or _o
 
+    action_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=teleop_action_processor,
+        initial_features=create_initial_features(
+            action=robot.action_features
+        ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+        use_videos=cfg.dataset.video,
+    )
+    observation_dataset_features = aggregate_pipeline_dataset_features(
+        pipeline=robot_observation_processor,
+        initial_features=create_initial_features(observation=robot.observation_features),
+        use_videos=cfg.dataset.video,
+    )
+    if isinstance(robot, SensorizedRobot):
+        robot.validate_tactile_v2_profile()
+        observation_dataset_features = robot.route_observation_dataset_features(observation_dataset_features)
     dataset_features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
-            use_videos=cfg.dataset.video,
-        ),
-        aggregate_pipeline_dataset_features(
-            pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
-            use_videos=cfg.dataset.video,
-        ),
+        action_dataset_features,
+        observation_dataset_features,
     )
 
     dataset = None
@@ -447,6 +459,27 @@ def record(
 
     try:
         if cfg.resume:
+            resume_metadata = LeRobotDatasetMetadata(
+                cfg.dataset.repo_id,
+                root=cfg.dataset.root,
+            )
+            existing_sensor_manifest = preflight_sensor_stream_writer(resume_metadata.root)
+            if isinstance(robot, SensorizedRobot) and existing_sensor_manifest is None:
+                raise ValueError(
+                    "Cannot add a Sensor Sidecar while resuming a Dataset that has no "
+                    "sensor_streams.json manifest. Record into a new Dataset root."
+                )
+            if existing_sensor_manifest is not None and not isinstance(robot, SensorizedRobot):
+                raise ValueError(
+                    "Cannot resume a Sensor Sidecar Dataset without the configured sensors; "
+                    "doing so would append main frames without matching Sync rows."
+                )
+            sanity_check_dataset_robot_compatibility(
+                resume_metadata,
+                robot,
+                cfg.dataset.fps,
+                dataset_features,
+            )
             num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
             dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
@@ -462,7 +495,6 @@ def record(
                 if num_cameras > 0
                 else 0,
             )
-            sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             # Reject eval_ prefix — for policy evaluation use lerobot-rollout
             repo_name = cfg.dataset.repo_id.split("/", 1)[-1]

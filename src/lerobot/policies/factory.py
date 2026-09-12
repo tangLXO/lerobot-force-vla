@@ -40,10 +40,11 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import (
     ACTION,
+    OBS_TACTILE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
-from lerobot.utils.feature_utils import dataset_to_policy_features
+from lerobot.utils.feature_utils import dataset_to_policy_features, validate_sensor_feature_rename_map
 from lerobot.utils.import_utils import _peft_available, require_package
 
 from .evo1.configuration_evo1 import Evo1Config
@@ -298,6 +299,8 @@ def make_policy(
     if bool(ds_meta) == bool(env_cfg):
         raise ValueError("Either one of a dataset metadata or a sim env must be provided.")
 
+    validate_sensor_feature_rename_map(rename_map)
+
     # NOTE: Currently, if you try to run vqbet with mps backend, you'll get this error.
     # TODO(aliberts, rcadene): Implement a check_backend_compatibility in policies?
     # NotImplementedError: The operator 'aten::unique_dim' is not currently implemented for the MPS device. If
@@ -332,7 +335,9 @@ def make_policy(
 
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
     if not cfg.input_features:
-        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+        cfg.input_features = {
+            key: ft for key, ft in features.items() if key not in cfg.output_features and key != OBS_TACTILE
+        }
 
     # Store action feature names for relative_exclude_joints support
     if ds_meta is not None and hasattr(cfg, "action_feature_names"):

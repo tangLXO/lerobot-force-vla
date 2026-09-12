@@ -27,7 +27,35 @@ import numpy as np
 
 from lerobot.configs import FeatureType, PolicyFeature
 
-from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STR
+from .constants import ACTION, DEFAULT_FEATURES, OBS_ENV_STATE, OBS_STR, OBS_TACTILE
+
+
+def validate_sensor_feature_rename_map(rename_map: dict[str, str] | None) -> None:
+    """Protect the canonical tactile modality boundary from feature renames.
+
+    ``observation.tactile`` is the current-frame sensor view. Mapping it to a
+    different feature (especially ``observation.state``), or mapping another
+    feature into it, would silently change that data contract. The identity
+    mapping remains valid so generated/configured rename maps do not need a
+    special case.
+    """
+    if not rename_map:
+        return
+
+    tactile_target = rename_map.get(OBS_TACTILE)
+    if OBS_TACTILE in rename_map and tactile_target != OBS_TACTILE:
+        raise ValueError(
+            f"Cannot rename canonical sensor feature {OBS_TACTILE!r} to {tactile_target!r}. "
+            "The tactile modality boundary cannot be used for implicit fusion or state packing."
+        )
+
+    tactile_sources = [source for source, target in rename_map.items() if target == OBS_TACTILE]
+    invalid_sources = [source for source in tactile_sources if source != OBS_TACTILE]
+    if invalid_sources:
+        raise ValueError(
+            f"Cannot rename feature(s) {invalid_sources!r} to canonical sensor feature {OBS_TACTILE!r}. "
+            "The tactile modality boundary cannot be created through a rename."
+        )
 
 
 def _validate_feature_names(features: dict[str, dict]) -> None:

@@ -95,7 +95,10 @@ def main():
     class Force(Sensor):
         @property
         def features(self):
-            return {"left.normal_force": SensorFeature("float32", "N")}
+            return {
+                "left.normal_force": SensorFeature("float32", "N"),
+                "right.normal_force": SensorFeature("float32", "N"),
+            }
 
         @property
         def is_connected(self):
@@ -150,7 +153,9 @@ def main():
     sensor = Force(SensorConfig(sample_rate_hz=100, max_age_ms=100))
     recorder = SensorStreamRecorder(root, {"force": sensor})
     recorder.start_episode(0)
-    sensor._publish_sample({"left.normal_force": 1.0}, 100, arrival_timestamp_ns=101)
+    sensor._publish_sample(
+        {"left.normal_force": 1.0, "right.normal_force": 2.0}, 100, arrival_timestamp_ns=101
+    )
     for i in range(2):
         recorder.record_sync(
             i,

@@ -64,7 +64,11 @@ def visualize_action_queue_size(action_queue_size: list[int]) -> None:
 
 
 def map_robot_keys_to_lerobot_features(robot: Robot) -> dict[str, dict]:
-    return hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=False)
+    features = hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=False)
+    route_features = getattr(robot, "route_observation_dataset_features", None)
+    if callable(route_features):
+        features = route_features(features)
+    return features
 
 
 def is_image_key(k: str) -> bool:

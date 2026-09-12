@@ -66,9 +66,13 @@ DEVICE=cuda make test-end-to-end
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
 - **Sensor persistence**: follow [`SENSOR_DATASET_FORMAT.md`](./SENSOR_DATASET_FORMAT.md) and
-  [`SENSOR_INTEGRATION_GUIDE.md`](./SENSOR_INTEGRATION_GUIDE.md). Preserve Sidecar v1 final schemas/layout;
-  transaction journal format v1 guarantees process-crash recovery and replayable on-disk state, not
-  power-loss durability.
+  [`SENSOR_INTEGRATION_GUIDE.md`](./SENSOR_INTEGRATION_GUIDE.md). Preserve the Sidecar v2 logical contract:
+  `observation.state` is Robot-only, `observation.tactile` is the aligned two-force current view, and
+  history remains only in `sensor_windows`. Use `frame_features`; do not revive the historical v1
+  `state_features` field or duplicate force in state and tactile. Storage layout, Raw/Sync Arrow schemas,
+  transaction journal and main evidence remain version 1. The journal guarantee is process-crash recovery
+  and replayable on-disk state, not power-loss durability. Readers may inspect v1/v2 Sidecars without
+  reinterpreting v1 state; Writers create/resume v2 roots only.
   Reader paths are strictly read-only. Recovery belongs to a Writer/RecoveryManager holding the writer lock;
   recovery discovers only the active pointer and uncleaned staging, never historical journals. Keep runtime
   diagnostics out of stable manifests. Validate bounded Raw and Sync memory, subprocess recovery, read-only

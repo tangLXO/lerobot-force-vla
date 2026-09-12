@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from lerobot.configs import PipelineFeatureType, PolicyFeature
+from lerobot.utils.feature_utils import validate_sensor_feature_rename_map
 
 from .pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
@@ -39,6 +40,9 @@ class RenameObservationsProcessorStep(ObservationProcessorStep):
     """
 
     rename_map: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        validate_sensor_feature_rename_map(self.rename_map)
 
     def observation(self, observation):
         processed_obs = {}

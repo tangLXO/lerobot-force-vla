@@ -38,9 +38,21 @@ def recorded_dataset(tmp_path):
         "test/sensor-batch",
         root=tmp_path / "dataset",
         fps=30,
-        features={"observation.state": {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}},
+        features={
+            "observation.state": {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]},
+            "observation.tactile": {
+                "dtype": "float32",
+                "shape": (2,),
+                "names": [
+                    "sensor.left.left.normal_force",
+                    "sensor.right.right.normal_force",
+                ],
+            },
+        },
     )
     sensors = {name: FakeSensor() for name in ("left", "right")}
+    sensors["left"].config.frame_features = ["left.normal_force"]
+    sensors["right"].config.frame_features = ["right.normal_force"]
     for sensor in sensors.values():
         sensor.config.recorder_flush_rows = 2
     recorder = SensorStreamRecorder(dataset.root, sensors)
@@ -57,7 +69,13 @@ def recorded_dataset(tmp_path):
             metadata = capture(timestamp + 2, timestamp, episode * 4 + frame)
             selected = metadata["sensors"].pop("gripper_force")
             metadata["sensors"] = {name: dict(selected) for name in sensors}
-            dataset.add_frame({"observation.state": np.array([frame], dtype=np.float32), "task": "test"})
+            dataset.add_frame(
+                {
+                    "observation.state": np.array([frame], dtype=np.float32),
+                    "observation.tactile": np.array([frame, episode], dtype=np.float32),
+                    "task": "test",
+                }
+            )
             recorder.record_sync(frame, metadata)
         recorder.save_episode(dataset, task_info=["test"])
     recorder.close()
@@ -91,6 +109,8 @@ def test_batch_matches_single_with_duplicates_out_of_order_and_cross_episode(
     assert [int(item["index"]) for item in batch] == indices
     for expected, actual in zip(single, batch, strict=True):
         assert_windows_equal(expected["sensor_windows"], actual["sensor_windows"])
+        np.testing.assert_array_equal(expected["observation.tactile"], actual["observation.tactile"])
+        assert actual["observation.tactile"].shape == (2,)
     batch[0]["sensor_windows"]["left"]["values"][0, 0] = 12345
     assert batch[2]["sensor_windows"]["left"]["values"][0, 0] != 12345
     assert wrapper.__getitems__([]) == []

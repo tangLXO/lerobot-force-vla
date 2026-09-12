@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType
@@ -28,7 +29,7 @@ from lerobot.processor import (
 )
 from lerobot.processor.converters import create_transition, identity_transition
 from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
-from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_IMAGES, OBS_STATE, OBS_TACTILE
 from tests.conftest import assert_contract_is_typed
 
 
@@ -119,6 +120,28 @@ def test_empty_rename_map():
     assert processed_obs.keys() == observation.keys()
     torch.testing.assert_close(processed_obs["key1"], observation["key1"])
     assert processed_obs["key2"] == observation["key2"]
+
+
+@pytest.mark.parametrize(
+    "rename_map",
+    [
+        {OBS_TACTILE: OBS_STATE},
+        {OBS_TACTILE: "observation.force"},
+        {"observation.force": OBS_TACTILE},
+    ],
+)
+def test_tactile_modality_boundary_cannot_be_renamed(rename_map):
+    with pytest.raises(ValueError, match="tactile modality boundary"):
+        RenameObservationsProcessorStep(rename_map=rename_map)
+
+
+def test_tactile_identity_rename_is_allowed():
+    processor = RenameObservationsProcessorStep(rename_map={OBS_TACTILE: OBS_TACTILE})
+    observation = {OBS_TACTILE: torch.tensor([1.0, 2.0])}
+
+    result = processor(create_transition(observation=observation))
+
+    torch.testing.assert_close(result[TransitionKey.OBSERVATION][OBS_TACTILE], observation[OBS_TACTILE])
 
 
 def test_none_observation():

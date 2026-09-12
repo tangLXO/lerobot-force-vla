@@ -10,6 +10,7 @@ from pathlib import Path
 
 from huggingface_hub import HfApi
 
+from .sensor_stream import validate_sidecar_schema_version
 from .sensor_transaction import SensorTransaction, SensorTransactionError, validate_episode_uid
 from .sensor_verification import resolve_artifact
 
@@ -57,6 +58,7 @@ def ensure_sensor_subset(root, episodes, total_episodes, download, *, refresh=Fa
     if not manifest_path.exists():
         return
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    validate_sidecar_schema_version(manifest)
     layout = manifest.get("storage_layout", {})
     if layout.get("type") != "per_episode_parquet" or layout.get("version") != 1:
         raise ValueError("Unsupported Sensor Hub storage layout.")

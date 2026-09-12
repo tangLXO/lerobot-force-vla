@@ -163,6 +163,44 @@ def test_complete_local_subset_needs_no_hub_requests(recorded_dataset):
     ensure_sensor_subset(recorded_dataset.root, [2], 3, lambda *_a: pytest.fail("unnecessary Hub download"))
 
 
+def test_v1_manifest_remains_supported_for_subset_localization(recorded_dataset, tmp_path):
+    source, destination = recorded_dataset.root, tmp_path / "v1-subset"
+    copy_paths(
+        source,
+        destination,
+        list(filter_repo_objects(all_paths(source), allow_patterns=METADATA_DOWNLOAD_PATTERNS)),
+    )
+    manifest_path = destination / "meta/sensor_streams.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sidecar_schema_version"] = 1
+    manifest.pop("frame_view", None)
+    for stream in manifest["streams"].values():
+        stream["state_features"] = stream.pop("frame_features")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def fetch(names):
+        copy_paths(source, destination, names)
+
+    ensure_sensor_subset(destination, [1], 3, fetch)
+    reader = SensorStreamReader(destination, episodes=[1])
+    assert reader.manifest["sidecar_schema_version"] == 1
+    assert reader.committed_episode_indices == (1,)
+
+
+@pytest.mark.parametrize("version", [None, 3])
+def test_manifest_version_is_rejected_before_journal_or_raw_download(tmp_path, version):
+    root = tmp_path / "unsupported-version"
+    (root / "meta").mkdir(parents=True)
+    manifest = {} if version is None else {"sidecar_schema_version": version}
+    (root / "meta/sensor_streams.json").write_text(json.dumps(manifest), encoding="utf-8")
+    downloaded = []
+
+    with pytest.raises(ValueError, match="sidecar_schema_version|Unsupported Sensor Sidecar"):
+        ensure_sensor_subset(root, [0], 1, lambda names: downloaded.extend(names))
+
+    assert downloaded == []
+
+
 def test_missing_download_is_an_explicit_error(recorded_dataset, tmp_path):
     source, destination = recorded_dataset.root, tmp_path / "subset"
     uid = uid_for(source, 0)

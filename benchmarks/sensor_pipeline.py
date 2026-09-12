@@ -24,16 +24,25 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sensor_stream import SensorStreamRecorder
 from lerobot.datasets.sensor_window import SensorWindowDataset
 from lerobot.sensors import Sensor, SensorConfig, SensorFeature
+from lerobot.utils.constants import OBS_STATE, OBS_TACTILE
 
 
 class SyntheticSensor(Sensor):
-    def __init__(self):
-        super().__init__(SensorConfig(sample_rate_hz=1000, max_age_ms=5, recorder_flush_rows=4096))
+    def __init__(self, feature_name):
+        self.feature_name = feature_name
+        super().__init__(
+            SensorConfig(
+                sample_rate_hz=1000,
+                max_age_ms=5,
+                recorder_flush_rows=4096,
+                frame_features=[feature_name],
+            )
+        )
         self.connected = False
 
     @property
     def features(self):
-        return {"contact.normal_force": SensorFeature("float32", "N")}
+        return {self.feature_name: SensorFeature("float32", "N")}
 
     @property
     def is_connected(self):
@@ -56,14 +65,22 @@ def generate(root, duration_s):
         root=root,
         fps=30,
         features={
-            "observation.state": {
+            OBS_STATE: {
+                "dtype": "float32",
+                "shape": (6,),
+                "names": [f"joint_{index}.pos" for index in range(6)],
+            },
+            OBS_TACTILE: {
                 "dtype": "float32",
                 "shape": (2,),
-                "names": ["sensor.left.contact.normal_force", "sensor.right.contact.normal_force"],
-            }
+                "names": ["sensor.left.left.normal_force", "sensor.right.right.normal_force"],
+            },
         },
     )
-    sensors = {name: SyntheticSensor() for name in ("left", "right")}
+    sensors = {
+        "left": SyntheticSensor("left.normal_force"),
+        "right": SyntheticSensor("right.normal_force"),
+    }
     for sensor in sensors.values():
         sensor.connect()
     started = time.perf_counter()
@@ -86,7 +103,7 @@ def generate(root, duration_s):
                 timestamp = base + sample_index * 1_000_000
                 for offset, sensor in enumerate(sensors.values()):
                     sensor._publish_sample(
-                        {"contact.normal_force": math.sin(sample_index / 1000 + offset)},
+                        {sensor.feature_name: math.sin(sample_index / 1000 + offset)},
                         timestamp,
                         arrival_timestamp_ns=timestamp + 1,
                     )
@@ -96,8 +113,11 @@ def generate(root, duration_s):
             }
             dataset.add_frame(
                 {
-                    "observation.state": np.asarray(
-                        [sample.values["contact.normal_force"] for sample in selected.values()],
+                    OBS_STATE: np.full(6, frame / frames, dtype=np.float32),
+                    # The current tactile view and Sync below reuse this exact selection.
+                    # Neither path reads the Sensor again for this frame.
+                    OBS_TACTILE: np.asarray(
+                        [sample.values[sensors[name].feature_name] for name, sample in selected.items()],
                         dtype=np.float32,
                     ),
                     "task": "synthetic force benchmark",
@@ -133,6 +153,9 @@ def generate(root, duration_s):
         "logical_seconds": frames / 30,
         "frames": frames,
         "raw_rows_per_stream": total_samples,
+        "state_shape": [6],
+        "tactile_shape": [2],
+        "current_tactile_uses_sync_selection": True,
         "diagnostics": recorder.diagnostics,
     }
 
@@ -145,6 +168,7 @@ def measure(dataset, indices, *, batch_size, cache_mb):
     valid_points = 0
     for begin in range(0, len(indices), batch_size):
         items = wrapper.__getitems__(indices[begin : begin + batch_size])
+        assert all(tuple(item[OBS_TACTILE].shape) == (2,) for item in items)
         valid_points += sum(
             int(window["valid_mask"].sum()) for item in items for window in item["sensor_windows"].values()
         )
