@@ -470,6 +470,36 @@ def test_record_reports_a_cadence_summary_per_episode_and_for_the_run(tmp_path, 
     assert _step_calls(run, "record") == _step_calls(run, "observe") == _ticks(run)
 
 
+def test_record_reset_preserves_compressed_visualization_setting(tmp_path):
+    dataset_cfg = DatasetRecordConfig(
+        repo_id=DUMMY_REPO_ID,
+        single_task="Dummy task",
+        root=tmp_path / "compressed_reset",
+        num_episodes=2,
+        episode_time_s=0.1,
+        reset_time_s=0.1,
+        push_to_hub=False,
+    )
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        dataset=dataset_cfg,
+        teleop=MockTeleopConfig(),
+        play_sounds=False,
+        display_data=True,
+        display_compressed_images=True,
+    )
+
+    with (
+        patch("lerobot.scripts.lerobot_record.init_visualization"),
+        patch("lerobot.scripts.lerobot_record.shutdown_visualization"),
+        patch("lerobot.scripts.lerobot_record.log_visualization_data") as log_visualization,
+    ):
+        record(cfg)
+
+    assert log_visualization.call_count > 0
+    assert all(call.kwargs["compress_images"] is True for call in log_visualization.call_args_list)
+
+
 def test_record_forwards_compressed_images_setting_to_reset_phase(tmp_path):
     robot_cfg = MockRobotConfig()
     teleop_cfg = MockTeleopConfig()
