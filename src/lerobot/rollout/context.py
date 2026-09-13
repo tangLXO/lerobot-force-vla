@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import ExitStack
 from copy import copy
 from dataclasses import dataclass, field
 from threading import Event
@@ -354,6 +355,76 @@ class RolloutContext:
     data: DatasetContext
 
 
+def _stop_rollout_inference(inference: InferenceEngine | None) -> None:
+    """Best-effort inference cleanup that never masks the triggering failure."""
+    if inference is None:
+        return
+    try:
+        inference.stop()
+    except Exception:
+        logger.exception("Failed to stop the inference engine during rollout cleanup")
+
+
+def _close_sensor_recorder(recorder: SensorStreamRecorder | None) -> None:
+    """Best-effort Sidecar cleanup, including release of the writer lock."""
+    if recorder is None:
+        return
+    try:
+        recorder.close()
+    except Exception:
+        logger.exception("Failed to close the Sensor recorder during rollout cleanup")
+
+
+def _finalize_rollout_dataset(dataset: LeRobotDataset | None) -> None:
+    """Best-effort Dataset writer cleanup, including image/video workers."""
+    if dataset is None:
+        return
+    try:
+        dataset.finalize()
+    except Exception:
+        logger.exception("Failed to finalize the Dataset during rollout cleanup")
+
+
+def _disconnect_rollout_teleop(teleop: Teleoperator | None, *, force: bool = False) -> None:
+    """Best-effort teleoperator cleanup, including a failed connect attempt."""
+    if teleop is None:
+        return
+    try:
+        if force or teleop.is_connected:
+            teleop.disconnect()
+    except Exception:
+        logger.exception("Failed to disconnect the teleoperator during rollout cleanup")
+
+
+def _disconnect_rollout_robot(robot, *, force: bool = False) -> None:
+    """Best-effort robot/Sensor cleanup, including a failed connect attempt."""
+    if robot is None:
+        return
+    try:
+        if force:
+            robot.disconnect()
+            return
+        connected = robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected)
+        if connected:
+            robot.disconnect()
+    except Exception:
+        logger.exception("Failed to disconnect the robot during rollout cleanup")
+
+
+def cleanup_rollout_context(ctx: RolloutContext) -> None:
+    """Release an assembled context after setup/strategy teardown fails.
+
+    Strategy teardown remains responsible for normal finalization and Hub pushes. This
+    idempotent safety net is used only when no strategy exists or teardown did not
+    complete, so one cleanup error cannot strand later resources.
+    """
+    _stop_rollout_inference(ctx.policy.inference)
+    _close_sensor_recorder(ctx.data.sensor_recorder)
+    _finalize_rollout_dataset(ctx.data.dataset)
+    _disconnect_rollout_teleop(ctx.hardware.teleop)
+    _disconnect_rollout_robot(ctx.hardware.robot_wrapper.inner)
+
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -561,188 +632,191 @@ def build_rollout_context(
         )
 
     # --- 5. Hardware (heaviest side-effect, deferred) -----------------
-    logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
-    robot.connect()
-    logger.info("Robot connected: %s", robot.name)
-
-    # Store the initial joint positions so we can return to a safe pose on shutdown.
-    try:
-        initial_obs = robot.get_observation()
-    except Exception:
-        if robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected):
-            robot.disconnect()
-        raise
-    initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
-    logger.info("Captured initial robot position (%d keys)", len(initial_position))
-
-    robot_wrapper = ThreadSafeRobot(robot)
-
+    # Register every resource before attempting to acquire it. Some hardware
+    # implementations can become partially connected before ``connect`` raises,
+    # and the late-bound callbacks also cover failures at every later setup stage.
     teleop = None
-    if cfg.teleop is not None:
-        logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
-        teleop = make_teleoperator_from_config(cfg.teleop)
-        teleop.connect()
-        logger.info("Teleoperator connected")
-
-    # TODO(Steven): once Teleoperator motor-control methods are standardised
-    # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
-    # the DAgger strategy on their presence here and fail fast with a helpful
-    # message instead of relying on the operator to pre-align the leader by
-    # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
-    # disabled call sites.
-    # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
-    #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
-    #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
-    #     if missing:
-    #         teleop.disconnect()
-    #         raise ValueError(
-    #             f"DAgger strategy requires a teleoperator with motor control methods "
-    #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
-    #         )
-
-    # --- 6. Dataset -------------
     dataset = None
-    if cfg.dataset is not None:
-        logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
-        if cfg.resume:
-            dataset = LeRobotDataset.resume(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                rgb_encoder=cfg.dataset.rgb_encoder,
-                depth_encoder=cfg.dataset.depth_encoder,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-                image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
-                * len(robot.cameras if hasattr(robot, "cameras") else []),
-            )
-        else:
-            repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
-            if not repo_name.startswith("rollout_"):
-                raise ValueError(
-                    "Dataset names for rollout must start with 'rollout_'. "
-                    "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
+    sensor_recorder = None
+    inference_strategy = None
+    with ExitStack() as cleanup:
+        cleanup.callback(lambda: _disconnect_rollout_robot(robot, force=True))
+        cleanup.callback(lambda: _disconnect_rollout_teleop(teleop, force=True))
+        cleanup.callback(lambda: _finalize_rollout_dataset(dataset))
+        cleanup.callback(lambda: _close_sensor_recorder(sensor_recorder))
+        cleanup.callback(lambda: _stop_rollout_inference(inference_strategy))
+
+        logger.info("Connecting robot (%s)...", cfg.robot.type if cfg.robot else "?")
+        robot.connect()
+        logger.info("Robot connected: %s", robot.name)
+
+        # Store the initial joint positions so we can return to a safe pose on shutdown.
+        initial_obs = robot.get_observation()
+        initial_position = {k: v for k, v in initial_obs.items() if k.endswith(".pos")}
+        logger.info("Captured initial robot position (%d keys)", len(initial_position))
+
+        robot_wrapper = ThreadSafeRobot(robot)
+
+        if cfg.teleop is not None:
+            logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
+            teleop = make_teleoperator_from_config(cfg.teleop)
+            teleop.connect()
+            logger.info("Teleoperator connected")
+
+        # TODO(Steven): once Teleoperator motor-control methods are standardised
+        # (``enable_torque`` / ``disable_torque`` / ``write_goal_positions``), gate
+        # the DAgger strategy on their presence here and fail fast with a helpful
+        # message instead of relying on the operator to pre-align the leader by
+        # hand.  See :func:`DAggerStrategy._apply_transition` for the matching
+        # disabled call sites.
+        # if isinstance(cfg.strategy, DAggerStrategyConfig) and teleop is not None:
+        #     required_teleop_methods = ("enable_torque", "disable_torque", "write_goal_positions")
+        #     missing = [m for m in required_teleop_methods if not callable(getattr(teleop, m, None))]
+        #     if missing:
+        #         teleop.disconnect()
+        #         raise ValueError(
+        #             f"DAgger strategy requires a teleoperator with motor control methods "
+        #             f"{required_teleop_methods}. '{type(teleop).__name__}' is missing: {missing}"
+        #         )
+
+        # --- 6. Dataset -------------
+        if cfg.dataset is not None:
+            logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
+            if cfg.resume:
+                dataset = LeRobotDataset.resume(
+                    cfg.dataset.repo_id,
+                    root=cfg.dataset.root,
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
                 )
-            cfg.dataset.stamp_repo_id()
-            target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
-            dataset = LeRobotDataset.create(
-                cfg.dataset.repo_id,
-                cfg.dataset.fps,
-                root=cfg.dataset.root,
-                robot_type=robot.name,
-                features=dataset_features,
-                use_videos=cfg.dataset.video,
-                image_writer_processes=cfg.dataset.num_image_writer_processes,
-                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
-                * len(robot.cameras if hasattr(robot, "cameras") else []),
-                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                rgb_encoder=cfg.dataset.rgb_encoder,
-                depth_encoder=cfg.dataset.depth_encoder,
-                streaming_encoding=cfg.dataset.streaming_encoding,
-                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
-                encoder_threads=cfg.dataset.encoder_threads,
-                video_files_size_in_mb=target_video_mb,
+            else:
+                repo_name = cfg.dataset.repo_id.split("/", 1)[-1]
+                if not repo_name.startswith("rollout_"):
+                    raise ValueError(
+                        "Dataset names for rollout must start with 'rollout_'. "
+                        "Use --dataset.repo_id=<user>/rollout_<name> for policy deployment datasets."
+                    )
+                cfg.dataset.stamp_repo_id()
+                target_video_mb = getattr(cfg.strategy, "target_video_file_size_mb", None)
+                dataset = LeRobotDataset.create(
+                    cfg.dataset.repo_id,
+                    cfg.dataset.fps,
+                    root=cfg.dataset.root,
+                    robot_type=robot.name,
+                    features=dataset_features,
+                    use_videos=cfg.dataset.video,
+                    image_writer_processes=cfg.dataset.num_image_writer_processes,
+                    image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
+                    * len(robot.cameras if hasattr(robot, "cameras") else []),
+                    batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
+                    video_files_size_in_mb=target_video_mb,
+                )
+
+        if dataset is not None:
+            logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
+        # --- 7. Policy pre/post processors (needs dataset stats if any) ---
+        dataset_stats = None
+        if dataset is not None:
+            dataset_stats = rename_stats(
+                dataset.meta.stats,
+                cfg.rename_map,
             )
 
-    if dataset is not None:
-        logger.info("Dataset ready: %s (%d existing episodes)", dataset.repo_id, dataset.num_episodes)
-    # --- 7. Policy pre/post processors (needs dataset stats if any) ---
-    dataset_stats = None
-    if dataset is not None:
-        dataset_stats = rename_stats(
-            dataset.meta.stats,
-            cfg.rename_map,
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_config,
+            pretrained_path=cfg.policy.pretrained_path,
+            pretrained_revision=policy_config.pretrained_revision,
+            dataset_stats=dataset_stats,
+            preprocessor_overrides={
+                "device_processor": {"device": cfg.device},
+                "rename_observations_processor": {"rename_map": cfg.rename_map},
+            },
         )
 
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy_config,
-        pretrained_path=cfg.policy.pretrained_path,
-        pretrained_revision=policy_config.pretrained_revision,
-        dataset_stats=dataset_stats,
-        preprocessor_overrides={
-            "device_processor": {"device": cfg.device},
-            "rename_observations_processor": {"rename_map": cfg.rename_map},
-        },
-    )
+        relative_action_step = next(
+            (
+                step
+                for step in getattr(preprocessor, "steps", ())
+                if isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            ),
+            None,
+        )
+        if isinstance(cfg.inference, SyncInferenceConfig) and relative_action_step is not None:
+            raise NotImplementedError(
+                "SyncInferenceEngine does not support policies with relative actions for now."
+                "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+            )
 
-    relative_action_step = next(
-        (
-            step
-            for step in getattr(preprocessor, "steps", ())
-            if isinstance(step, RelativeActionsProcessorStep) and step.enabled
-        ),
-        None,
-    )
-    if isinstance(cfg.inference, SyncInferenceConfig) and relative_action_step is not None:
-        raise NotImplementedError(
-            "SyncInferenceEngine does not support policies with relative actions for now."
-            "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
+        # --- 8. Inference strategy (needs policy + pre/post + hardware) --
+        logger.info(
+            "Creating inference engine (type=%s)...",
+            cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
+        )
+        task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
+        inference_strategy = create_inference_engine(
+            cfg.inference,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            hw_features=hw_features,
+            dataset_features=dataset_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task_str,
+            fps=cfg.fps,
+            device=cfg.device,
+            use_torch_compile=torch_compile_active,
+            compile_warmup_inferences=cfg.compile_warmup_inferences,
+            shutdown_event=shutdown_event,
         )
 
-    # --- 8. Inference strategy (needs policy + pre/post + hardware) --
-    logger.info(
-        "Creating inference engine (type=%s)...",
-        cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
-    )
-    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-    inference_strategy = create_inference_engine(
-        cfg.inference,
-        policy=policy,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        robot_wrapper=robot_wrapper,
-        hw_features=hw_features,
-        dataset_features=dataset_features,
-        ordered_action_keys=ordered_action_keys,
-        task=task_str,
-        fps=cfg.fps,
-        device=cfg.device,
-        use_torch_compile=torch_compile_active,
-        compile_warmup_inferences=cfg.compile_warmup_inferences,
-        shutdown_event=shutdown_event,
-    )
-
-    try:
         sensor_recorder = (
             SensorStreamRecorder(dataset.root, robot.sensors)
             if dataset is not None and isinstance(robot, SensorizedRobot)
             else None
         )
-    except Exception:
-        if teleop is not None and teleop.is_connected:
-            teleop.disconnect()
-        if robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected):
-            robot.disconnect()
-        raise
 
-    # --- 9. Assemble ---------------------------------------------------
-    logger.info("Rollout context assembled successfully")
-    return RolloutContext(
-        runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
-        hardware=HardwareContext(
-            robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
-        ),
-        policy=PolicyContext(
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            inference=inference_strategy,
-        ),
-        processors=ProcessorContext(
-            teleop_action_processor=teleop_action_processor,
-            robot_action_processor=robot_action_processor,
-            robot_observation_processor=robot_observation_processor,
-            observation_validator=(
-                robot.assert_current_frame_values if isinstance(robot, SensorizedRobot) else None
+        # --- 9. Assemble ---------------------------------------------------
+        ctx = RolloutContext(
+            runtime=RuntimeContext(cfg=cfg, shutdown_event=shutdown_event),
+            hardware=HardwareContext(
+                robot_wrapper=robot_wrapper, teleop=teleop, initial_position=initial_position
             ),
-        ),
-        data=DatasetContext(
-            dataset=dataset,
-            sensor_recorder=sensor_recorder,
-            dataset_features=dataset_features,
-            hw_features=hw_features,
-            ordered_action_keys=ordered_action_keys,
-        ),
-    )
+            policy=PolicyContext(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                inference=inference_strategy,
+            ),
+            processors=ProcessorContext(
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                observation_validator=(
+                    robot.assert_current_frame_values if isinstance(robot, SensorizedRobot) else None
+                ),
+            ),
+            data=DatasetContext(
+                dataset=dataset,
+                sensor_recorder=sensor_recorder,
+                dataset_features=dataset_features,
+                hw_features=hw_features,
+                ordered_action_keys=ordered_action_keys,
+            ),
+        )
+        cleanup.pop_all()
+
+    logger.info("Rollout context assembled successfully")
+    return ctx

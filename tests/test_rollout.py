@@ -1165,6 +1165,361 @@ def test_rollout_context_fields():
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
 
 
+def _configure_context_build_test(monkeypatch, tmp_path, *, sensorized: bool = False):
+    """Install a complete mocked context build whose failure stage can be varied."""
+    import lerobot.rollout.context as rollout_context
+    from lerobot.robots import SensorizedRobot
+    from lerobot.rollout import SentryStrategyConfig, SyncInferenceConfig
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    policy_config = SimpleNamespace(
+        type="mock",
+        pretrained_path="user/policy",
+        pretrained_revision="policy-revision",
+        input_features={},
+        action_feature_names=None,
+    )
+    policy = MagicMock()
+    policy.to.return_value = policy
+
+    robot = MagicMock(spec=SensorizedRobot) if sensorized else MagicMock()
+    robot.name = "mock"
+    robot.observation_features = {"joint.pos": float}
+    robot.action_features = {"joint.pos": float}
+    robot.cameras = {}
+    robot.sensors = {}
+    robot.is_connected = False
+    if sensorized:
+        robot.inner.is_connected = False
+        robot.route_observation_dataset_features.side_effect = lambda features: features
+
+    def connect_robot(*_args, **_kwargs):
+        robot.is_connected = True
+        if sensorized:
+            robot.inner.is_connected = True
+
+    def disconnect_robot():
+        robot.is_connected = False
+        if sensorized:
+            robot.inner.is_connected = False
+
+    robot.connect.side_effect = connect_robot
+    robot.disconnect.side_effect = disconnect_robot
+    robot.get_observation.return_value = {"joint.pos": 0.0}
+
+    teleop = MagicMock()
+    teleop.is_connected = False
+
+    def connect_teleop():
+        teleop.is_connected = True
+
+    def disconnect_teleop():
+        teleop.is_connected = False
+
+    teleop.connect.side_effect = connect_teleop
+    teleop.disconnect.side_effect = disconnect_teleop
+
+    dataset = MagicMock()
+    dataset.root = tmp_path
+    dataset.repo_id = "test/rollout_cleanup"
+    dataset.num_episodes = 0
+    dataset.meta.stats = {}
+
+    observation_hw = {"joint.pos": float}
+    observation_features = {OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    action_features = {ACTION: {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}}
+    monkeypatch.setattr(rollout_context, "_load_pretrained_policy", lambda _: policy)
+    monkeypatch.setattr(rollout_context, "make_robot_from_config", lambda _: robot)
+    monkeypatch.setattr(rollout_context, "attach_sensors", lambda attached, _: attached)
+    monkeypatch.setattr(rollout_context, "make_teleoperator_from_config", lambda _: teleop)
+    monkeypatch.setattr(
+        rollout_context,
+        "_resolve_observation_feature_schemas",
+        lambda *_args, **_kwargs: (observation_hw, observation_features),
+    )
+    monkeypatch.setattr(
+        rollout_context,
+        "aggregate_pipeline_dataset_features",
+        lambda **_: action_features,
+    )
+    monkeypatch.setattr(rollout_context.LeRobotDataset, "create", MagicMock(return_value=dataset))
+
+    dataset_config = SimpleNamespace(
+        repo_id="test/rollout_cleanup",
+        root=tmp_path,
+        fps=30,
+        video=False,
+        single_task="cleanup test",
+        video_encoding_batch_size=1,
+        rgb_encoder=None,
+        depth_encoder=None,
+        streaming_encoding=False,
+        encoder_queue_maxsize=1,
+        encoder_threads=1,
+        num_image_writer_processes=0,
+        num_image_writer_threads_per_camera=0,
+        stamp_repo_id=MagicMock(),
+    )
+    cfg = SimpleNamespace(
+        inference=SyncInferenceConfig(),
+        policy=policy_config,
+        use_torch_compile=False,
+        device="cpu",
+        robot=SimpleNamespace(type="mock"),
+        sensors={},
+        teleop=SimpleNamespace(type="mock"),
+        dataset=dataset_config,
+        strategy=SentryStrategyConfig(),
+        resume=False,
+        rename_map=None,
+        task="cleanup test",
+        fps=30,
+        compile_warmup_inferences=0,
+    )
+    processors = (MagicMock(), MagicMock(), MagicMock())
+    return rollout_context, cfg, robot, teleop, dataset, processors
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "dataset_created"),
+    [
+        ("teleop", False),
+        ("dataset", False),
+        ("processors", True),
+        ("inference", True),
+    ],
+)
+def test_context_build_failure_cleans_up_acquired_resources(
+    monkeypatch, tmp_path, failure_stage, dataset_created
+) -> None:
+    rollout_context, cfg, robot, teleop, dataset, processors = _configure_context_build_test(
+        monkeypatch, tmp_path
+    )
+    if failure_stage == "teleop":
+        teleop.connect.side_effect = RuntimeError("synthetic teleop failure")
+    elif failure_stage == "dataset":
+        rollout_context.LeRobotDataset.create.side_effect = RuntimeError("synthetic dataset failure")
+    elif failure_stage == "processors":
+        monkeypatch.setattr(
+            rollout_context,
+            "make_pre_post_processors",
+            MagicMock(side_effect=RuntimeError("synthetic processor failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            rollout_context,
+            "make_pre_post_processors",
+            MagicMock(return_value=(MagicMock(steps=[]), MagicMock())),
+        )
+        monkeypatch.setattr(
+            rollout_context,
+            "create_inference_engine",
+            MagicMock(side_effect=RuntimeError("synthetic inference failure")),
+        )
+
+    expected_stage = "processor" if failure_stage == "processors" else failure_stage
+    with pytest.raises(RuntimeError, match=f"synthetic {expected_stage} failure"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=processors[0],
+            robot_action_processor=processors[1],
+            robot_observation_processor=processors[2],
+        )
+
+    assert dataset.finalize.call_count == int(dataset_created)
+    teleop.disconnect.assert_called_once()
+    robot.disconnect.assert_called_once()
+
+
+def test_sensor_recorder_construction_failure_cleans_up_inference_dataset_and_hardware(
+    monkeypatch, tmp_path
+) -> None:
+    rollout_context, cfg, robot, teleop, dataset, processors = _configure_context_build_test(
+        monkeypatch, tmp_path, sensorized=True
+    )
+    inference = MagicMock()
+    monkeypatch.setattr(
+        rollout_context,
+        "make_pre_post_processors",
+        MagicMock(return_value=(MagicMock(steps=[]), MagicMock())),
+    )
+    monkeypatch.setattr(rollout_context, "create_inference_engine", MagicMock(return_value=inference))
+    monkeypatch.setattr(
+        rollout_context,
+        "SensorStreamRecorder",
+        MagicMock(side_effect=RuntimeError("synthetic recorder failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic recorder failure"):
+        rollout_context.build_rollout_context(
+            cfg,
+            threading.Event(),
+            teleop_action_processor=processors[0],
+            robot_action_processor=processors[1],
+            robot_observation_processor=processors[2],
+        )
+
+    inference.stop.assert_called_once()
+    dataset.finalize.assert_called_once()
+    teleop.disconnect.assert_called_once()
+    robot.disconnect.assert_called_once()
+
+
+def test_successful_context_build_transfers_cleanup_ownership(monkeypatch, tmp_path) -> None:
+    rollout_context, cfg, robot, teleop, dataset, processors = _configure_context_build_test(
+        monkeypatch, tmp_path
+    )
+    inference = MagicMock()
+    monkeypatch.setattr(
+        rollout_context,
+        "make_pre_post_processors",
+        MagicMock(return_value=(MagicMock(steps=[]), MagicMock())),
+    )
+    monkeypatch.setattr(rollout_context, "create_inference_engine", MagicMock(return_value=inference))
+
+    ctx = rollout_context.build_rollout_context(
+        cfg,
+        threading.Event(),
+        teleop_action_processor=processors[0],
+        robot_action_processor=processors[1],
+        robot_observation_processor=processors[2],
+    )
+
+    assert ctx.policy.inference is inference
+    inference.stop.assert_not_called()
+    dataset.finalize.assert_not_called()
+    teleop.disconnect.assert_not_called()
+    robot.disconnect.assert_not_called()
+
+
+def test_custom_strategy_columns_reach_dataset_creation(monkeypatch, tmp_path) -> None:
+    from lerobot.rollout.configs import RolloutStrategyConfig
+
+    class CustomStrategyConfig(RolloutStrategyConfig):
+        dataset_mode = "optional"
+
+        def extra_dataset_features(self):
+            return {"custom_score": {"dtype": "float32", "shape": (1,), "names": None}}
+
+    rollout_context, cfg, robot, teleop, dataset, processors = _configure_context_build_test(
+        monkeypatch, tmp_path
+    )
+    cfg.strategy = CustomStrategyConfig()
+    inference = MagicMock()
+    monkeypatch.setattr(
+        rollout_context,
+        "make_pre_post_processors",
+        MagicMock(return_value=(MagicMock(steps=[]), MagicMock())),
+    )
+    monkeypatch.setattr(rollout_context, "create_inference_engine", MagicMock(return_value=inference))
+
+    ctx = rollout_context.build_rollout_context(
+        cfg,
+        threading.Event(),
+        teleop_action_processor=processors[0],
+        robot_action_processor=processors[1],
+        robot_observation_processor=processors[2],
+    )
+
+    created_features = rollout_context.LeRobotDataset.create.call_args.kwargs["features"]
+    assert created_features == ctx.data.dataset_features
+    assert created_features["custom_score"] == {"dtype": "float32", "shape": (1,), "names": None}
+    assert "observation.state" in created_features
+    assert "action" in created_features
+    rollout_context.cleanup_rollout_context(ctx)
+    inference.stop.assert_called_once()
+    dataset.finalize.assert_called_once()
+    teleop.disconnect.assert_called_once()
+    robot.disconnect.assert_called_once()
+
+
+def test_cleanup_rollout_context_continues_after_cleanup_failure() -> None:
+    from lerobot.rollout.context import cleanup_rollout_context
+
+    inference = MagicMock()
+    recorder = MagicMock()
+    dataset = MagicMock()
+    dataset.finalize.side_effect = RuntimeError("synthetic finalize failure")
+    teleop = MagicMock(is_connected=True)
+    robot = MagicMock(is_connected=True)
+    ctx = SimpleNamespace(
+        policy=SimpleNamespace(inference=inference),
+        data=SimpleNamespace(sensor_recorder=recorder, dataset=dataset),
+        hardware=SimpleNamespace(
+            teleop=teleop,
+            robot_wrapper=SimpleNamespace(inner=robot),
+        ),
+    )
+
+    cleanup_rollout_context(ctx)
+
+    inference.stop.assert_called_once()
+    recorder.close.assert_called_once()
+    dataset.finalize.assert_called_once()
+    teleop.disconnect.assert_called_once()
+    robot.disconnect.assert_called_once()
+
+
+def _rollout_cli_config():
+    return SimpleNamespace(
+        display_data=False,
+        interactive=False,
+        strategy=SimpleNamespace(type="base"),
+        robot=SimpleNamespace(type="mock"),
+        fps=30,
+        duration=0,
+    )
+
+
+def test_rollout_cli_cleans_up_context_when_strategy_creation_fails(monkeypatch) -> None:
+    import lerobot.scripts.lerobot_rollout as rollout_script
+
+    ctx = MagicMock()
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        rollout_script,
+        "ProcessSignalHandler",
+        lambda **_: SimpleNamespace(shutdown_event=threading.Event()),
+    )
+    monkeypatch.setattr(rollout_script, "build_rollout_context", MagicMock(return_value=ctx))
+    monkeypatch.setattr(
+        rollout_script,
+        "create_strategy",
+        MagicMock(side_effect=RuntimeError("synthetic strategy failure")),
+    )
+    monkeypatch.setattr(rollout_script, "cleanup_rollout_context", cleanup)
+
+    with pytest.raises(RuntimeError, match="synthetic strategy failure"):
+        rollout_script.rollout.__wrapped__(_rollout_cli_config())
+
+    cleanup.assert_called_once_with(ctx)
+
+
+def test_rollout_cli_falls_back_to_context_cleanup_when_teardown_fails(monkeypatch) -> None:
+    import lerobot.scripts.lerobot_rollout as rollout_script
+
+    ctx = MagicMock()
+    strategy = MagicMock()
+    strategy.teardown.side_effect = RuntimeError("synthetic teardown failure")
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        rollout_script,
+        "ProcessSignalHandler",
+        lambda **_: SimpleNamespace(shutdown_event=threading.Event()),
+    )
+    monkeypatch.setattr(rollout_script, "build_rollout_context", MagicMock(return_value=ctx))
+    monkeypatch.setattr(rollout_script, "create_strategy", MagicMock(return_value=strategy))
+    monkeypatch.setattr(rollout_script, "cleanup_rollout_context", cleanup)
+
+    with pytest.raises(RuntimeError, match="synthetic teardown failure"):
+        rollout_script.rollout.__wrapped__(_rollout_cli_config())
+
+    strategy.setup.assert_called_once_with(ctx)
+    strategy.run.assert_called_once_with(ctx)
+    cleanup.assert_called_once_with(ctx)
+
+
 # ---------------------------------------------------------------------------
 # Cadence pacing through the strategies
 #

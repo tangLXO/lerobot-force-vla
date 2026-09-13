@@ -193,6 +193,7 @@ from lerobot.rollout import (
     build_rollout_context,
     create_strategy,
 )
+from lerobot.rollout.context import cleanup_rollout_context
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -239,19 +240,22 @@ def rollout(cfg: RolloutConfig):
         # propagate through the parent event.
         shutdown_event = LinkedEvent(shutdown_event)
 
-    logger.info("Building rollout context...")
-    ctx = build_rollout_context(cfg, shutdown_event)
-
-    strategy = create_strategy(cfg.strategy)
-    logger.info("Rollout strategy: %s", cfg.strategy.type)
-    logger.info(
-        "Robot: %s | FPS: %.0f | Duration: %s",
-        cfg.robot.type if cfg.robot else "?",
-        cfg.fps,
-        f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
-    )
-
+    ctx = None
+    strategy = None
+    teardown_complete = False
     try:
+        logger.info("Building rollout context...")
+        ctx = build_rollout_context(cfg, shutdown_event)
+
+        strategy = create_strategy(cfg.strategy)
+        logger.info("Rollout strategy: %s", cfg.strategy.type)
+        logger.info(
+            "Robot: %s | FPS: %.0f | Duration: %s",
+            cfg.robot.type if cfg.robot else "?",
+            cfg.fps,
+            f"{cfg.duration}s" if cfg.duration > 0 else "infinite",
+        )
+
         strategy.setup(ctx)
         if cfg.interactive:
             logger.info("Rollout setup complete — starting interactive session (robot idle until /start)")
@@ -262,9 +266,15 @@ def rollout(cfg: RolloutConfig):
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
-        strategy.teardown(ctx)
-        if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+        try:
+            if strategy is not None and ctx is not None:
+                strategy.teardown(ctx)
+                teardown_complete = True
+        finally:
+            if ctx is not None and not teardown_complete:
+                cleanup_rollout_context(ctx)
+            if cfg.display_data:
+                shutdown_visualization(cfg.display_mode)
 
     logger.info("Rollout finished")
 
