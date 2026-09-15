@@ -493,8 +493,12 @@ X518 是完整 backend 示例，但不是所有传感器的强制模板：
 ```text
 src/lerobot/sensors/x518/configuration_x518.py  # 网络参数、通道映射、配置验证
 src/lerobot/sensors/x518/protocol.py            # 私有只读 Modbus-TCP 协议
-src/lerobot/sensors/x518/sensor_x518.py         # 生命周期、采样、重连、SI 输出
+src/lerobot/sensors/x518/acquisition.py         # 两种模式共用的轮询、跳槽、重连和 SI 转换
+src/lerobot/sensors/x518/process_transport.py   # spawn、IPC、父进程退出监护
+src/lerobot/sensors/x518/diagnostics.py         # 有界运行诊断和响应频率验收
+src/lerobot/sensors/x518/sensor_x518.py          # 生命周期、屏障和父进程发布
 tests/sensors/test_x518.py                       # 无硬件单元测试
+tests/sensors/test_x518_process.py               # 真实 spawn + 本地 Modbus 模拟服务
 examples/x518/x518_hardware_smoke_test.py        # 真机只读检查
 ```
 
@@ -505,6 +509,10 @@ from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
 
 config = X518SensorConfig(
     host="192.168.1.100",
+    sample_rate_hz=400,
+    expected_sample_rate_hz=400,
+    acquisition_mode="process",  # 默认值；兼容/对照可显式设为 thread
+    acquisition_queue_capacity=1024,
     frame_features=["left.normal_force", "right.normal_force"],
     channels={
         "left.normal_force": X518ChannelConfig(channel=1),
@@ -512,12 +520,57 @@ config = X518SensorConfig(
     },
 )
 
-with X518Sensor(config) as sensor:
-    sample = sensor.async_read(timeout_ms=1000)
-    latest = sensor.read_latest(max_age_ms=100)
+if __name__ == "__main__":  # spawn 需要可导入的脚本和入口保护
+    with X518Sensor(config) as sensor:
+        sample = sensor.async_read(timeout_ms=1000)
+        latest = sensor.read_latest(max_age_ms=100)
+        print(sensor.diagnostics)
 ```
 
 X518 的 Modbus 地址、双通道限制、单位码和 word swap 只属于 X518，不能提升为通用 Sensor 规则。
+
+### 14.1 400 Hz 采集、交接和停止
+
+- 默认使用局部 `multiprocessing.get_context("spawn")`。子进程独占 Modbus 连接和转换；
+  父进程保留 History、订阅和框架序号。启动失败直接报错，不隐式降级为线程。
+- `timestamp_ns` 是子进程完整响应接收后的单调时刻；`arrival_timestamp_ns` 在父进程发布锁内赋值。
+  延迟到达的样本不能进入更早的主帧。硬件时间戳和硬件序号仍为 `None`。
+- IPC 样本队列独立于 Recorder 队列，默认 1,024 项，在 400 Hz 下约 2.56 秒。
+  样本、配置变更和订阅屏障共用有序通道；故障通知使用单独通道。私有传输序号在父进程重新编号前校验。
+- Recorder 启动时确认禁止 required 流重连的租约，订阅结束先等有序屏障，再排空 Recorder。
+  租约一直保留到事务提交或失败清理完成。出现 IPC 溢出、传输缺口或进程故障时，episode 不能提交。
+- `disconnect()` 请求停止、打断阻塞 socket、完成尾部交接，再 join 和关闭队列。
+  超时锁存故障并有界强制终止；未确认退出时保留资源所有权，不能重连复用。
+  清理应检查 `has_resources`，因为采集进程死亡后仍可能持有接收线程和 IPC 句柄。
+- 轮询使用绝对截止时间，超期槽位计入 `missed_deadlines` 并跳过，不补读、不伪造或删除相同值。
+  主循环 `CycleTimer` 使用释放 GIL 的 `time.sleep`，最后 1 ms 使用 `sleep(0)` 让出调度并重新检查截止时间。
+
+### 14.2 诊断和验收
+
+`sensor.diagnostics` 是只读快照；计数覆盖连接生命周期，分位数最多使用最近 4,096 个值。
+它分别报告设备频率、目标轮询频率、真实响应频率、父进程发布频率、响应间隔、发布延迟、
+所选样本年龄、IPC 峰值、溢出、无效尝试、传输缺口和超期槽位。
+Recorder 的运行诊断另外包含 Raw/Sync 队列峰值。完整检查报告按整个测量区间统计分位数。
+
+每个完整 10 秒响应窗口低于目标的 99% 会警告，30 秒最多一次。低频保留录制但验收失败。
+历史 `actual_sample_rate_hz` 仍按 arrival 统计；新的响应频率仅写入日志和诊断报告。
+稳定 manifest、Raw/Sync schema 和事务格式不变。400 Hz 验收覆盖真实 Modbus 响应和完整记录，
+不保证每次 ADC 转换的唯一性，也不把 400 Hz 力采样等同于 400 Hz 控制。
+
+沿用现有只读入口，输出目录必须为新目录。采集设备须已配置为 400 Hz；脚本不写频率寄存器。
+
+```powershell
+uv run python examples/x518/x518_hardware_smoke_test.py --duration-s 60 --output outputs/x518-standalone.json
+uv run python examples/x518/x518_collection_hardware_smoke_test.py --observe-only --duration-s 60 --root outputs/x518-observe
+uv run python examples/x518/x518_collection_hardware_smoke_test.py --rate-check --duration-s 60 --root outputs/x518-record
+uv run python examples/x518/x518_collection_hardware_smoke_test.py --rate-check --duration-s 600 --root outputs/x518-soak
+uv run python examples/x518/x518_collection_hardware_smoke_test.py --rate-check --streaming --duration-s 600 --root outputs/x518-soak-stream
+```
+
+上述三档 60 秒检查各做三次；两种 600 秒录制各做一次。`--acquisition-mode thread` 用于显式对照。
+完整录制的力统计只使用第一帧到最后一帧的 anchor 区间；验证覆盖全量 Raw/Sync、每个视频帧和
+每帧 tactile/Sync/window 引用。`--verify-only` 可在不访问硬件时重新验证已有目录；
+未加 `--rate-check` 的默认短检查继续覆盖重录和续录。
 
 ## 15. 完成检查清单
 

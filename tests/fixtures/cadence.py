@@ -19,6 +19,7 @@ rollout strategies, ``lerobot-record``, ``lerobot-replay``, ``lerobot-teleoperat
 """
 
 import logging
+import math
 import time
 
 import pytest
@@ -27,7 +28,7 @@ TIMER_LOGGER = "lerobot.utils.cycle_timer"
 
 
 class FakeClock:
-    """Virtual clock standing in for ``time.perf_counter`` and ``precise_sleep``.
+    """Virtual clock standing in for ``time.perf_counter`` and ``time.sleep``.
 
     ``CycleTimer``'s contract is pure arithmetic over deadlines, so exercising it
     against the wall clock only adds scheduler noise: every margin has to be wide
@@ -48,11 +49,14 @@ class FakeClock:
         """Simulate *seconds* of work inside the loop body."""
         self.now += seconds
 
-    def precise_sleep(self, seconds: float) -> None:
+    def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         # `overshoot` models a sleep that returns late — the OS descheduling the
         # process, or a coarse timer granularity.
-        self.now += seconds + self.overshoot
+        # Model a scheduler yield as 100 us, rounding upward so sub-ULP
+        # residue cannot turn an exact deadline into an extra scheduler tick.
+        elapsed = seconds if seconds > 1e-9 else 0.0001
+        self.now = math.nextafter(self.now + elapsed + self.overshoot, math.inf)
 
     def __getattr__(self, name):
         # Anything else CycleTimer's module reaches for on `time` still works.
@@ -66,7 +70,6 @@ def clock(monkeypatch):
 
     fake = FakeClock()
     monkeypatch.setattr(cycle_timer, "time", fake)
-    monkeypatch.setattr(cycle_timer, "precise_sleep", fake.precise_sleep)
     return fake
 
 

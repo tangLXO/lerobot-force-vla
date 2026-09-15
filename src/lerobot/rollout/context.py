@@ -404,7 +404,10 @@ def _disconnect_rollout_robot(robot, *, force: bool = False) -> None:
         if force:
             robot.disconnect()
             return
-        connected = robot.is_connected or (isinstance(robot, SensorizedRobot) and robot.inner.is_connected)
+        connected = robot.is_connected or (
+            isinstance(robot, SensorizedRobot)
+            and (robot.inner.is_connected or any(sensor.has_resources for sensor in robot.sensors.values()))
+        )
         if connected:
             robot.disconnect()
     except Exception:

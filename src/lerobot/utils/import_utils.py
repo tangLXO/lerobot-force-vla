@@ -147,6 +147,7 @@ _faker_available = is_package_available("faker")
 _av_available = is_package_available("av")
 
 # Misc
+_psutil_available = is_package_available("psutil")
 _pynput_available = is_package_available("pynput")
 _pygame_available = is_package_available("pygame")
 _qwen_vl_utils_available = is_package_available("qwen-vl-utils", import_name="qwen_vl_utils")

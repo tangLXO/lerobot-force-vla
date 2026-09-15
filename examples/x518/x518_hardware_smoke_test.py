@@ -20,8 +20,16 @@
 """
 
 import argparse
+import json
+import queue
+import time
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
 
 from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
+from lerobot.sensors.x518.diagnostics import summarize_capture
 
 _LEFT_FORCE = "left.normal_force"
 _RIGHT_FORCE = "right.normal_force"
@@ -48,6 +56,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=502, help="Modbus-TCP 端口")
     parser.add_argument("--unit-id", type=int, default=1, help="Modbus 从站号")
     parser.add_argument("--samples", type=_positive_int, default=10, help="连续读取的样本数")
+    parser.add_argument("--duration-s", type=float, help="Measure every acquisition over this duration")
+    parser.add_argument("--acquisition-mode", choices=("process", "thread"), default="process")
+    parser.add_argument("--sample-rate-hz", type=float, default=400)
+    parser.add_argument("--output", type=Path, help="New JSON diagnostic report path")
     parser.add_argument(
         "--timeout-ms",
         type=_positive_int,
@@ -81,12 +93,19 @@ def main() -> int:
     中文说明：建立只读连接，验证序号、时间戳、有效标志和双通道值，最后可靠释放资源。
     """
     args = _parse_args()
+    if args.duration_s is not None and (not np.isfinite(args.duration_s) or args.duration_s <= 0):
+        raise ValueError("--duration-s must be positive and finite")
+    if args.output is not None and args.output.exists():
+        raise FileExistsError(args.output)
     expected_unit = None if args.expected_unit == "any" else args.expected_unit
     config = X518SensorConfig(
         host=args.host,
         port=args.port,
         unit_id=args.unit_id,
         expected_unit=expected_unit,
+        sample_rate_hz=args.sample_rate_hz,
+        expected_sample_rate_hz=args.sample_rate_hz,
+        acquisition_mode=args.acquisition_mode,
         channels={
             _LEFT_FORCE: X518ChannelConfig(channel=1),
             _RIGHT_FORCE: X518ChannelConfig(channel=2),
@@ -110,6 +129,37 @@ def main() -> int:
             f"设备单位={settings.unit}，小数位={settings.decimal}，"
             f"设备采样率={settings.sample_rate_hz:g} Hz，字交换={settings.word_swap}"
         )
+        if args.duration_s is not None:
+            subscription = sensor.subscribe(config.resolve_recorder_queue_capacity())
+            rows = []
+            start = time.perf_counter_ns()
+            deadline = time.perf_counter() + args.duration_s
+            try:
+                while time.perf_counter() < deadline:
+                    rows.append(asdict(subscription.get(timeout=args.timeout_ms / 1000)))
+                end = time.perf_counter_ns()
+            finally:
+                sensor.unsubscribe(subscription)
+            while True:
+                try:
+                    rows.append(asdict(subscription.get_nowait()))
+                except queue.Empty:
+                    break
+            result = summarize_capture(rows, target_hz=args.sample_rate_hz, start_ns=start, end_ns=end)
+            sensor.disconnect()
+            connected = False
+            result["acquisition"] = sensor.diagnostics
+            result["queue_overflow_count"] = subscription.overflow_count
+            result["resources_released"] = not sensor.has_resources
+            result["recorder_queue"] = subscription.diagnostics.snapshot(
+                subscription.queue, overflow_count=subscription.overflow_count
+            )
+            result["passed"] &= subscription.overflow_count == 0 and sensor.diagnostics["fault"] is None
+            if args.output is not None:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(result, indent=2))
+            print(json.dumps(result, indent=2), flush=True)
+            return 0 if result["passed"] else 1
         print("\n序号 | 左通道/N | 右通道/N | timestamp_ns")
         print("-" * 66)
 
@@ -148,7 +198,7 @@ def main() -> int:
         _print_connection_hint(args.host)
         return 1
     finally:
-        if connected:
+        if connected or sensor.has_resources:
             sensor.disconnect()
 
 

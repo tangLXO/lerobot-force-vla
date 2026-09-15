@@ -29,8 +29,6 @@ import logging
 import time
 from collections.abc import Callable, Iterator
 
-from lerobot.utils.robot_utils import precise_sleep
-
 logger = logging.getLogger(__name__)
 
 
@@ -195,8 +193,8 @@ class CycleTimer:
     """
 
     #: Fraction of the cycle budget a group's wall-clock span may overshoot before
-    #: :meth:`_report_achieved_cadence` speaks up.  ``precise_sleep`` spins to its
-    #: deadline, but scheduler jitter still costs tens of microseconds per tick, so
+    #: :meth:`_report_achieved_cadence` speaks up. Sleeping releases the GIL,
+    #: but scheduler jitter still costs tens of microseconds per tick, so
     #: with no tolerance the note fires on nearly every group — a healthy 30 Hz run
     #: logged it for 556 groups out of 576.
     SPAN_TOLERANCE = 0.01
@@ -424,9 +422,14 @@ class CycleTimer:
                 "policy/recording" if self.records_data else "policy",
                 self.multiplier,
             )
-        if (sleep_t := deadline - now) > 0:
+        if deadline > now:
             sleep_start = time.perf_counter()
-            precise_sleep(sleep_t)
+            # Blocking sleep releases the GIL. Python spinning here starves
+            # high-rate acquisition/publication threads on Windows and macOS.
+            while (remaining := deadline - time.perf_counter()) > 0:
+                # Leave a small tail for scheduler yields. Positive sub-ms sleeps
+                # can overshoot on Windows; sleep(0) still releases the GIL.
+                time.sleep(max(0.0, remaining - 0.001))
             slept = time.perf_counter() - sleep_start
             stats.sleep += slept
             stats.sleep_worst = max(stats.sleep_worst, slept)

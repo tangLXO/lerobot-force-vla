@@ -68,6 +68,8 @@ class X518SensorConfig(SensorConfig):
     connect_retries: int = 5
     connect_backoff_s: float = 0.2
     expected_unit: str | None = "kg"
+    acquisition_mode: str = "process"
+    acquisition_queue_capacity: int = 1024
     channels: dict[str, X518ChannelConfig]
 
     def __post_init__(self) -> None:
@@ -76,6 +78,10 @@ class X518SensorConfig(SensorConfig):
         中文说明：在联网前一次性检查全部配置，避免后台线程启动后才暴露参数错误。
         """
         super().__post_init__()
+        if self.acquisition_mode not in ("process", "thread"):
+            raise ValueError("X518 acquisition_mode must be 'process' or 'thread'.")
+        if type(self.acquisition_queue_capacity) is not int or self.acquisition_queue_capacity <= 0:
+            raise ValueError("X518 acquisition_queue_capacity must be a positive integer.")
         if not isinstance(self.host, str) or not self.host.strip():
             raise ValueError("X518 host must be a non-empty string.")
         if type(self.port) is not int or not 1 <= self.port <= 65535:

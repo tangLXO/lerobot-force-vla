@@ -129,7 +129,7 @@ class Sensor(abc.ABC):
     def __del__(self) -> None:
         """Best-effort cleanup when explicit disconnect was omitted."""
         try:
-            if self.is_connected:
+            if self.has_resources:
                 self.disconnect()
         except Exception:  # nosec B110
             pass
@@ -148,6 +148,16 @@ class Sensor(abc.ABC):
     def provenance(self) -> dict[str, Any]:
         """Return episode-level driver provenance."""
         return {"driver": f"{type(self).__module__}.{type(self).__name__}"}
+
+    @property
+    def has_resources(self) -> bool:
+        """Whether disconnect is needed, including resources of failed workers."""
+        return self.is_connected
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        """Optional runtime-only acquisition statistics."""
+        return {}
 
     @property
     @abc.abstractmethod

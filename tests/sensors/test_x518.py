@@ -40,6 +40,7 @@ def _gripper_channels(*, left_channel: int = 1, right_channel: int = 2) -> dict[
 
 
 def _x518_config(**kwargs) -> X518SensorConfig:
+    kwargs.setdefault("acquisition_mode", "thread")
     return X518SensorConfig(channels=_gripper_channels(), **kwargs)
 
 

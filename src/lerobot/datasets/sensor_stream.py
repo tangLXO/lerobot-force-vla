@@ -329,6 +329,7 @@ class SensorStreamRecorder:
         streams = {}
         for name, spool in self._spools.copy().items():
             streams[name] = spool.diagnostics()
+            streams[name]["acquisition"] = self.sensors[name].diagnostics
             subscription = self._subscriptions.get(name)
             if subscription is not None:
                 streams[name].update(
@@ -547,6 +548,10 @@ class SensorStreamRecorder:
     def check_health(self) -> None:
         """Raise immediately on worker failure or subscriber overflow."""
         for instance, lease in self._recorder_leases.items():
+            try:
+                self.sensors[instance]._check_recorder_fault()
+            except RuntimeError as exc:
+                raise SensorRecorderError(f"Sensor {instance!r} episode fault: {exc}") from exc
             if lease.error is not None:
                 raise SensorRecorderError(f"Sensor {instance!r} episode fault: {lease.error}")
         if self._worker_errors:

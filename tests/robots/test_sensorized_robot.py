@@ -166,6 +166,36 @@ def test_required_sensor_connect_fails_fast_and_cleans_up() -> None:
     assert not sensor.is_connected
 
 
+@pytest.mark.parametrize("required", [True, False])
+def test_connect_cleanup_uses_owned_resources_after_failed_start(required):
+    class FailedStartSensor(FakeSensor):
+        owned = False
+
+        @property
+        def has_resources(self):
+            return self.owned
+
+        def connect(self):
+            self.connected = False
+            self.owned = True
+            raise RuntimeError("partial startup")
+
+        def disconnect(self):
+            self.owned = False
+
+    sensor = FailedStartSensor(SensorConfig(required=required, frame_features=[]))
+    robot = SensorizedRobot(FakeRobot(), {"ambient_force": sensor})
+    if required:
+        with pytest.raises(RuntimeError, match="partial startup"):
+            robot.connect()
+        assert not robot.inner.is_connected
+    else:
+        robot.connect()
+        assert robot.inner.is_connected
+        robot.disconnect()
+    assert not sensor.has_resources
+
+
 def test_optional_raw_only_sensor_records_unavailable_sync_without_frame_view() -> None:
     sensor = FakeSensor(
         SensorConfig(

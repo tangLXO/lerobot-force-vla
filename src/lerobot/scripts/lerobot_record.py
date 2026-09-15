@@ -632,7 +632,7 @@ def record(
             dataset.finalize()
 
         if isinstance(robot, SensorizedRobot):
-            if robot.inner.is_connected or any(sensor.is_connected for sensor in robot.sensors.values()):
+            if robot.inner.is_connected or any(sensor.has_resources for sensor in robot.sensors.values()):
                 robot.disconnect()
         elif robot.is_connected:
             robot.disconnect()

@@ -69,6 +69,22 @@ def test_cycle_timer_paces_ticks_to_base_fps(caplog, clock):
     assert not _timer_warnings(caplog)
 
 
+def test_cycle_timer_rechecks_deadline_after_early_wake_and_yields_gil(monkeypatch, clock):
+    calls = []
+
+    def early_sleep(seconds):
+        calls.append(seconds)
+        clock.advance(max(seconds / 2, 0.000001) if seconds > 0 else 0.0001)
+
+    monkeypatch.setattr(clock, "sleep", early_sleep)
+    timer = CycleTimer(30)
+    timer.tick()
+    timer.wait()
+    assert clock.now >= 1 / 30
+    assert len(calls) > 2
+    assert 0 in calls  # deadline tail uses scheduler yields, not Python spinning
+
+
 def test_cycle_timer_spaces_interpolated_commands_evenly(clock):
     # Interpolation exists to smooth motion, so every tick must be spaced by
     # 1/(fps × multiplier) — not batched at the start of each cycle.
@@ -271,7 +287,8 @@ def test_cycle_timer_run_summary_reports_effective_cadence_and_sections(caplog, 
     )
     # A correctly paced loop holds its target exactly on a virtual clock.
     # 5 gaps of 50 ms — the span sums gaps, so it is one gap short of 6 ticks' worth.
-    assert "effective cadence: 10.00 Hz policy / 20.00 Hz commands over 0.2 s measured" in summary
+    assert "effective cadence: 10.00 Hz policy / 20.00 Hz commands" in summary
+    assert timer._run.span == pytest.approx(0.25)
     # Three groups of two, the first exempt as start-up; 40 ms of work each.
     assert "cycles over the 100.0 ms work budget: 0/2 (0.0%)" in summary
     assert "work mean 40.0 ms, worst 40.0 ms" in summary

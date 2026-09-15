@@ -30,7 +30,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--duration-s", type=float, default=15)
+    parser.add_argument("--acquisition-mode", choices=("process", "thread"), default="process")
     args = parser.parse_args()
+    if not np.isfinite(args.duration_s) or args.duration_s <= 0:
+        parser.error("--duration-s must be positive and finite")
     if args.output.exists():
         raise FileExistsError(args.output)
     init_logging()
@@ -61,7 +65,9 @@ def main():
         {
             "gripper_force": X518SensorConfig(
                 host="192.168.1.100",
-                expected_sample_rate_hz=200,
+                expected_sample_rate_hz=400,
+                sample_rate_hz=400,
+                acquisition_mode=args.acquisition_mode,
                 expected_unit="kg",
                 max_age_ms=100,
                 channels={
@@ -144,9 +150,12 @@ def main():
             return sent
 
         robot.get_observation, robot.send_action = observe, send
-        print("FOLLOWING NOW: move leader gently; Esc stops; automatic stop after 15 seconds.", flush=True)
+        print(
+            f"FOLLOWING NOW: move leader gently; Esc stops; automatic stop after {args.duration_s:g} seconds.",
+            flush=True,
+        )
         t, r, o = make_default_processors()
-        teleop_loop(leader, robot, 30, t, r, o, duration=15)
+        teleop_loop(leader, robot, 30, t, r, o, duration=args.duration_s)
         result["status"] = "completed"
     except KeyboardInterrupt:
         result["status"] = "operator_stopped"
@@ -173,7 +182,8 @@ def main():
                 cleanup_errors.append(repr(exc))
         for sensor in robot.sensors.values():
             try:
-                if sensor.is_connected:
+                result["acquisition"] = sensor.diagnostics
+                if sensor.has_resources:
                     sensor.disconnect()
             except Exception as exc:
                 cleanup_errors.append(repr(exc))

@@ -1,5 +1,8 @@
 # Sensor production validation
 
+Current X518 process-acquisition / Sidecar v2 results are recorded separately in
+[X518 400 Hz validation](./SENSOR_X518_400HZ_VALIDATION.md). The historical evidence below is unchanged.
+
 > **Historical Sidecar v1 validation report — superseded for new recordings.** The evidence
 > below is preserved without reinterpretation and validates the original contract in which
 > selected force values were part of `observation.state`. The current breaking Sidecar v2
@@ -35,14 +38,14 @@ validation-relevant source trees are identical to the commits used for the recor
 Original baseline: **102 passed**. Independent delivery snapshots were reconstructed without
 changing the final worktree; each snapshot was tested against the preceding stages.
 
-| Stage | Validation |
-| --- | --- |
-| 1 | 118 passed; local commit `a7cde76a` |
-| 2 | 252 passed in the final independent snapshot; local commit `21c79b7b` |
-| 3 | 343 passed initially; two copied predecessor-journal expectations were corrected to the finalized transaction behavior; all 24 spool tests then passed (346 distinct cases) |
-| 4 | 1,385 passed, including earlier stages and 1,000 independent oracle cases |
-| 5 | 1,412 passed, including Windows spawn/batch/cache, split-first factory and config tests |
-| 6 | 1,479 passed, 5 platform skips; combined final verification completed |
+| Stage | Validation                                                                                                                                                                  |
+| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | 118 passed; local commit `a7cde76a`                                                                                                                                         |
+| 2     | 252 passed in the final independent snapshot; local commit `21c79b7b`                                                                                                       |
+| 3     | 343 passed initially; two copied predecessor-journal expectations were corrected to the finalized transaction behavior; all 24 spool tests then passed (346 distinct cases) |
+| 4     | 1,385 passed, including earlier stages and 1,000 independent oracle cases                                                                                                   |
+| 5     | 1,412 passed, including Windows spawn/batch/cache, split-first factory and config tests                                                                                     |
+| 6     | 1,479 passed, 5 platform skips; combined final verification completed                                                                                                       |
 
 Ruff, format checks and `git diff --check` pass for all **42** changed/new Python files.
 Tests check bounded Raw and Sync buffers, structural open/read/hash counts, read-only tree/mtime
@@ -83,11 +86,11 @@ sample without replacement across the complete capture. Random single-item and b
 the same indices; batch size is 32. This is a sampled reading benchmark on a full-duration
 capture, not a completed all-54,000-frame reading run.
 
-| Mode | Seconds | Frames/s | Decoded row groups | Resident decoded bytes |
-| --- | ---: | ---: | ---: | ---: |
-| Sequential | 29.57 | 34.63 | 18 | 7,870,752 |
-| Random single-item | 34.12 | 30.01 | 1,898 | 66,901,392 |
-| Random batch | 10.05 | 101.84 | 1,870 | 66,901,392 |
+| Mode               | Seconds | Frames/s | Decoded row groups | Resident decoded bytes |
+| ------------------ | ------: | -------: | -----------------: | ---------------------: |
+| Sequential         |   29.57 |    34.63 |                 18 |              7,870,752 |
+| Random single-item |   34.12 |    30.01 |              1,898 |             66,901,392 |
+| Random batch       |   10.05 |   101.84 |              1,870 |             66,901,392 |
 
 Random and batch reads each produced 204,800 valid window points. Cache residency stayed below
 67,108,864 bytes (64 MiB). Batch speedup was **3.39×**; the non-CI 5× target was not reached.
@@ -138,14 +141,14 @@ reported separately above.
 The six production stages were created as ordered commits on `codex/sensor-production`. Each
 intermediate index tree was compared with its tested independent snapshot before committing.
 
-| Commit | Scope |
-| --- | --- |
-| `a7cde76a` | Core causal reads and recorder sequence ownership |
+| Commit     | Scope                                                                                      |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| `a7cde76a` | Core causal reads and recorder sequence ownership                                          |
 | `21c79b7b` | Bounded Raw/Sync spool and lifecycle, retaining the predecessor transaction implementation |
-| `15bfa5ea` | Finalized transaction implementation, sealing and crash recovery |
-| `bd24c1f5` | Strict read-only Reader and causal range windows |
-| `df8af560` | Worker-local cache, batch windows and factory integration |
-| `5b2465ea` | Hub subset, diagnostics, documentation and benchmark |
+| `15bfa5ea` | Finalized transaction implementation, sealing and crash recovery                           |
+| `bd24c1f5` | Strict read-only Reader and causal range windows                                           |
+| `df8af560` | Worker-local cache, batch windows and factory integration                                  |
+| `5b2465ea` | Hub subset, diagnostics, documentation and benchmark                                       |
 
 Final combined regression evidence is `.cache/sensor-production-final.log` and its JUnit XML:
 **1,479 passed, 5 skipped**. The skips are unavailable Windows SIGHUP/SIGQUIT signals (four)

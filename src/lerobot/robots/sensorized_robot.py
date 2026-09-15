@@ -279,22 +279,27 @@ class SensorizedRobot:
         self.last_capture_metadata = None
         self._last_current_frame_values = None
         self._robot.connect(calibrate=calibrate)
-        connected: list[Sensor] = []
+        attempted: list[Sensor] = []
         try:
             for instance, sensor in self.sensors.items():
                 try:
+                    attempted.append(sensor)
                     sensor.connect()
-                    connected.append(sensor)
                     if sensor.config.required:
                         self._wait_until_ready(instance, sensor)
                 except Exception:
                     if sensor.config.required:
                         raise
                     logger.warning("Optional sensor %s failed to connect", instance, exc_info=True)
+                    if sensor.has_resources:
+                        sensor.disconnect()
         except Exception:
-            for sensor in reversed(connected):
-                if sensor.is_connected:
-                    sensor.disconnect()
+            for sensor in reversed(attempted):
+                if sensor.has_resources:
+                    try:
+                        sensor.disconnect()
+                    except Exception:
+                        logger.exception("Sensor cleanup failed after connection error")
             if self._robot.is_connected:
                 self._robot.disconnect()
             raise
@@ -424,7 +429,7 @@ class SensorizedRobot:
         """Disconnect sensors before releasing the inner robot."""
         first_error: Exception | None = None
         for sensor in reversed(tuple(self.sensors.values())):
-            if sensor.is_connected:
+            if sensor.has_resources:
                 try:
                     sensor.disconnect()
                 except Exception as exc:  # pragma: no cover - hardware cleanup path
