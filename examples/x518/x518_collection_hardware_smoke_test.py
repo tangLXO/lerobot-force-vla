@@ -2,13 +2,18 @@
 
 The output is diagnostic data, not teleoperated training demonstrations.
 Run with a new --root each time. No Hub upload or motor-register writes occur.
+RSS telemetry covers the parent and managed multiprocessing children captured at
+episode start; it never enumerates the Windows process table during acquisition.
 """
 
 import argparse
+import gc
 import json
+import multiprocessing
 import queue
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
@@ -75,6 +80,24 @@ class ReadOnlyLeader(SO101Leader):
             self.bus.disconnect(disable_torque=False)
 
 
+def sample_process_memory(parent, children):
+    """Read known process handles without enumerating the Windows process table.
+
+    Children are the managed multiprocessing workers captured at episode start.
+    Required acquisition workers cannot be replaced during a valid episode.
+    """
+    child_rss = 0
+    for child in children:
+        try:
+            child_rss += child.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue  # Sensor health checks own worker failure; telemetry is best effort.
+    return {
+        "parent_rss_bytes": parent.memory_info().rss,
+        "children_rss_bytes": child_rss,
+    }
+
+
 def verify_videos(data):
     """Decode every frame once, including timestamps in files shared by episodes."""
     require_package("av", extra="av-dep")
@@ -105,6 +128,13 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--duration-s", type=float, default=3)
+    parser.add_argument("--fps", type=int, default=30, help="Main Dataset rate; camera rate stays at 30 Hz")
+    parser.add_argument(
+        "--episodes", type=int, default=1, help="Episodes per session, including resume session"
+    )
+    parser.add_argument(
+        "--skip-encoder-preparation", action="store_true", help="Diagnostic baseline: use legacy lazy startup"
+    )
     parser.add_argument("--acquisition-mode", choices=("process", "thread"), default="process")
     parser.add_argument(
         "--rate-check", action="store_true", help="One measured episode; skip rerecord/resume exercise"
@@ -122,6 +152,8 @@ def main():
         require_package("psutil", extra="accelerate-dep")
     if not np.isfinite(args.duration_s) or args.duration_s <= 0:
         parser.error("--duration-s must be positive and finite")
+    if args.fps <= 0 or args.episodes <= 0:
+        parser.error("--fps and --episodes must be positive")
     if args.root.exists() and not args.verify_only:
         raise FileExistsError("Use a new output directory.")
     calibration = Path.home() / ".cache/huggingface/lerobot/calibration"
@@ -159,7 +191,8 @@ def main():
             repo_id="local/READ_ONLY_DIAGNOSTIC_NOT_FOR_TRAINING",
             root=args.root,
             single_task="READ ONLY DIAGNOSTIC: leader targets recorded but NOT executed",
-            num_episodes=1,
+            num_episodes=args.episodes,
+            fps=args.fps,
             episode_time_s=args.duration_s,
             reset_time_s=0,
             push_to_hub=False,
@@ -188,6 +221,13 @@ def main():
     discarded = False
     runtime = []
     sensors_used = []
+    gc_events = []
+
+    def trace_gc(phase, info):
+        if len(gc_events) < 256:
+            gc_events.append(
+                {"phase": phase, "generation": info["generation"], "timestamp_ns": time.perf_counter_ns()}
+            )
 
     def loop(*a, **kw):
         nonlocal discarded
@@ -196,15 +236,15 @@ def main():
         recorder = kw.get("sensor_recorder")
         monitor_stop = threading.Event()
         memory = []
+        parent = psutil.Process()
+        children = [psutil.Process(worker.pid) for worker in multiprocessing.active_children()]
 
         def monitor():
-            parent = psutil.Process()
             while not monitor_stop.is_set():
                 memory.append(
                     {
                         "elapsed_s": time.perf_counter() - started,
-                        "parent_rss_bytes": parent.memory_info().rss,
-                        "children_rss_bytes": sum(p.memory_info().rss for p in parent.children()),
+                        **sample_process_memory(parent, children),
                     }
                 )
                 monitor_stop.wait(5)
@@ -218,7 +258,14 @@ def main():
             monitor_stop.set()
             watcher.join(2)
             if recorder is not None:
-                runtime.append({"recorder": recorder.diagnostics, "memory": memory})
+                runtime.append(
+                    {
+                        "recorder": recorder.diagnostics,
+                        "memory": memory,
+                        "memory_scope": "parent_and_managed_multiprocessing_children",
+                        "monitored_child_pids": [child.pid for child in children],
+                    }
+                )
         if kw.get("dataset") is not None and not discarded and not args.rate_check:
             kw["events"]["rerecord_episode"] = True
             discarded = True
@@ -279,12 +326,18 @@ def main():
         if not result["passed"]:
             raise RuntimeError("X518 rate acceptance failed; diagnostic report retained.")
         return
+    gc.callbacks.append(trace_gc)
     try:
         with (
             patch.object(entry, "make_robot_from_config", make_follower),
             patch.object(entry, "make_teleoperator_from_config", make_leader),
             patch.object(entry, "init_keyboard_listener", keyboard),
             patch.object(entry, "record_loop", loop),
+            (
+                patch.object(LeRobotDataset, "prepare_episode_recording", lambda self, timeout_s=30: None)
+                if args.skip_encoder_preparation
+                else nullcontext()
+            ),
         ):
             if not args.verify_only:
                 entry.record(cfg)
@@ -292,6 +345,7 @@ def main():
                     cfg.resume = True
                     entry.record(cfg)
     finally:
+        gc.callbacks.remove(trace_gc)
         for arm in reversed(arms):
             arm.disconnect()
         if not args.verify_only and args.root.exists():
@@ -301,13 +355,14 @@ def main():
                         "runs": runtime,
                         "resources_released": all(not sensor.has_resources for sensor in sensors_used),
                         "final_acquisition": [sensor.diagnostics for sensor in sensors_used],
+                        "gc_events": gc_events,
                     },
                     indent=2,
                 )
             )
     data = LeRobotDataset(cfg.dataset.repo_id, root=args.root, video_backend="pyav")
     reader = SensorStreamReader(args.root, instance="gripper_force", verify="full")
-    assert data.num_episodes == (1 if args.rate_check else 2)
+    assert data.num_episodes == args.episodes * (1 if args.rate_check else 2)
     assert tuple(data.features[OBS_STATE]["shape"]) == (6,)
     assert tuple(data.features[OBS_TACTILE]["shape"]) == (2,)
     assert data.features[OBS_TACTILE]["dtype"] == "float32"
@@ -340,13 +395,35 @@ def main():
                 assert int(window["sequence"][-1]) == row["sensors"]["gripper_force"]["sequence"]
                 np.testing.assert_allclose(np.asarray(item[OBS_TACTILE]), window["values"][-1])
                 ages.append(float(window["age_ns"][-1]) / 1e6)
-        acquisition_report = summarize_capture(
-            reader.read_raw(episode_index=episode), start_ns=int(anchors[0]), end_ns=int(anchors[-1])
-        )
+        raw = reader.read_raw(episode_index=episode)
+        acquisition_report = summarize_capture(raw)
+        episode_start_ns = raw[0]["timestamp_ns"] - raw[0]["episode_time_ns"]
+        phases = {
+            "first_second": [row for row in raw if row["episode_time_ns"] < 1_000_000_000],
+            "steady": [row for row in raw if row["episode_time_ns"] >= 1_000_000_000],
+            "whole_episode": raw,
+        }
+        phase_reports = {}
+        for name, rows in phases.items():
+            phase_report = summarize_capture(rows)
+            late = [
+                row
+                for row in rows
+                if row["is_valid"] and row["arrival_timestamp_ns"] - row["timestamp_ns"] > 10_000_000
+            ]
+            phase_report["above_10_ms_count"] = len(late)
+            phase_report["above_10_ms_by_second"] = {
+                str(second): sum(row["episode_time_ns"] // 1_000_000_000 == second for row in late)
+                for second in sorted({row["episode_time_ns"] // 1_000_000_000 for row in late})
+            }
+            phase_reports[name] = phase_report
         frame_hz = float((len(anchors) - 1) * 1e9 / (anchors[-1] - anchors[0]))
         acquisition_report["checks"].update(
             {
-                "frame_rate": 29.7 <= frame_hz <= 30.3,
+                "frame_rate": data.fps * 0.99 <= frame_hz <= data.fps * 1.01,
+                "first_second_publication_p99": phase_reports["first_second"]["checks"][
+                    "publication_latency_p99"
+                ],
                 "selected_age_p99": float(np.percentile(ages, 99)) <= 15,
                 "selected_age_max": max(ages) <= 100,
             }
@@ -361,6 +438,8 @@ def main():
                 "sensor_age_ms_max": max(ages),
                 "sensor_age_ms_p99": float(np.percentile(ages, 99)),
                 "acquisition": acquisition_report,
+                "publication_phases": phase_reports,
+                "episode_start_ns": episode_start_ns,
             }
         )
         offset += len(sync)
@@ -372,6 +451,8 @@ def main():
         "diagnostic_only": True,
         "motion_executed": False,
         "streaming": args.streaming,
+        "encoder_preparation": not args.skip_encoder_preparation,
+        "requested_fps": args.fps,
         "rerecord": "not_run" if args.rate_check else "passed",
         "resume": "not_run" if args.rate_check else "passed",
         "full_verification": "passed",
