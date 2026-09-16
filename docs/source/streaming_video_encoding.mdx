@@ -23,6 +23,26 @@ This makes `save_episode()` near-instant (the video is already encoded by the ti
 
 ## 3. Performance Considerations
 
+### Preparing each episode
+
+`lerobot-record` opens every streaming camera codec before starting Sensor capture
+or the frame loop. It also collects startup garbage before capture, so a pending
+full Python garbage collection does not interrupt the first frames. Automatic
+garbage collection remains enabled. No synthetic frames are encoded, and the first
+recorded video frame still has PTS 0.
+
+Custom recording callers can invoke `dataset.prepare_episode_recording(timeout_s=30)`
+before `sensor_recorder.start_episode(...)`, then use the normal Sensor readiness
+check and frame loop. Preparation is optional for existing callers, is a no-op
+without streaming video, and can be repeated before any frames are added. Prepare
+each new episode, including after discard or resume. Initialization failure or
+timeout prevents recording; cleanup failures retain live worker resources and must
+be resolved before reusing the encoder.
+
+Preparation moves startup work outside capture; it is not a real-time latency
+guarantee. Measure publication latency over both the first second and the complete
+Sensor episode, including maximum latency and counts above the target threshold.
+
 Streaming encoding means the CPU is encoding video **during** the capture loop, not after. This creates a CPU budget that must be shared between:
 
 - **Control loop** (reading cameras, control the robot, writing non-video data)

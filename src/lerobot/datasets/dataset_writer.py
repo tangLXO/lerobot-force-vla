@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import gc
 import logging
+import math
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import datasets
@@ -199,6 +202,56 @@ class DatasetWriter:
         else:
             self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
 
+    def prepare_episode_recording(self, timeout_s: float = 30) -> None:
+        """Open streaming codecs before capture, without adding frames to the episode.
+
+        Args:
+            timeout_s: Shared deadline in seconds for all camera codecs to become ready.
+        """
+        if self._finalized:
+            raise RuntimeError("Cannot prepare a finalized writer.")
+        if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be positive and finite")
+        if self.episode_buffer is not None and self.episode_buffer["size"]:
+            raise RuntimeError("Cannot prepare an episode after frames have been added.")
+        encoder = self._streaming_encoder
+        if encoder is None or not self._meta.video_keys:
+            return
+        started = time.perf_counter()
+        newly_started = not encoder.episode_active
+        if newly_started:
+            frame_sizes = {}
+            for key in self._meta.video_keys:
+                feature = self._meta.features[key]
+                names = feature.get("names")
+                shape = feature["shape"]
+                if names is not None and "height" in names and "width" in names:
+                    frame_sizes[key] = (shape[names.index("height")], shape[names.index("width")])
+                elif len(shape) == 3 and shape[0] in (1, 3):
+                    frame_sizes[key] = (shape[1], shape[2])
+                elif len(shape) == 3 and shape[-1] in (1, 3):
+                    frame_sizes[key] = (shape[0], shape[1])
+                else:
+                    raise ValueError(f"Cannot resolve video dimensions for {key!r}: {shape}, {names}.")
+            encoder.start_episode(
+                video_keys=list(self._meta.video_keys),
+                depth_video_keys=list(self._meta.depth_keys),
+                temp_dir=self._root,
+                frame_sizes=frame_sizes,
+            )
+        encoder.wait_until_ready(timeout_s=timeout_s)
+        codecs_ready = time.perf_counter()
+        if newly_started:
+            # Imports and codec construction can bring generation 2 close to its
+            # automatic threshold. Collect before subscribing Sensors, not during
+            # the first few real frames; keep automatic GC enabled throughout.
+            gc.collect()
+        logger.info(
+            "Episode video codecs ready in %.2f ms; startup garbage collection %.2f ms",
+            (codecs_ready - started) * 1000,
+            (time.perf_counter() - codecs_ready) * 1000,
+        )
+
     def add_frame(self, frame: dict) -> None:
         """
         Add a single frame to the current episode buffer.
@@ -237,7 +290,11 @@ class DatasetWriter:
                     info["depth_unit"] = infer_depth_unit(np.asarray(frame[depth_key]).dtype)
 
         # Start streaming encoder on first frame of episode
-        if frame_index == 0 and self._streaming_encoder is not None:
+        if (
+            frame_index == 0
+            and self._streaming_encoder is not None
+            and not self._streaming_encoder.episode_active
+        ):
             self._streaming_encoder.start_episode(
                 video_keys=list(self._meta.video_keys),
                 depth_video_keys=list(self._meta.depth_keys),

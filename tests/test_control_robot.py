@@ -192,6 +192,9 @@ def test_record_routes_current_force_to_tactile_without_state_duplication(tmp_pa
     inner_robot = make_robot_from_config(MockRobotConfig(random_values=False, static_values=[0.1, 0.2, 0.3]))
     sensorized_robot = SensorizedRobot(inner_robot, {"gripper_force": _FrameForceSensor()})
     recorder = MagicMock()
+    startup_order = []
+    recorder.start_episode.side_effect = lambda *args, **kwargs: startup_order.append("sensor_start")
+    recorder.wait_until_ready.side_effect = lambda: startup_order.append("sensor_ready")
     recorder.commit_prepared.side_effect = lambda dataset: dataset.save_episode()
     dataset_cfg = DatasetRecordConfig(
         repo_id=DUMMY_REPO_ID,
@@ -213,6 +216,11 @@ def test_record_routes_current_force_to_tactile_without_state_duplication(tmp_pa
     with (
         patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=sensorized_robot),
         patch("lerobot.scripts.lerobot_record.SensorStreamRecorder", return_value=recorder),
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDataset.prepare_episode_recording",
+            autospec=True,
+            side_effect=lambda self: startup_order.append("video_ready"),
+        ),
         patch(
             "lerobot.scripts.lerobot_record.init_keyboard_listener",
             return_value=(
@@ -239,7 +247,54 @@ def test_record_routes_current_force_to_tactile_without_state_duplication(tmp_pa
     assert item[OBS_TACTILE].tolist() == pytest.approx([1.0, 2.0])
     captures = [call.args[1] for call in recorder.record_sync.call_args_list]
     assert captures
+    assert startup_order == ["video_ready", "sensor_start", "sensor_ready"]
     assert all(capture["sensors"]["gripper_force"]["sequence"] == 0 for capture in captures)
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_video_preparation_failure_prevents_capture_and_releases_hardware(tmp_path, cleanup_fails):
+    robot = SensorizedRobot(make_robot_from_config(MockRobotConfig()), {"force": _FrameForceSensor()})
+    recorder = MagicMock()
+    cfg = RecordConfig(
+        robot=MockRobotConfig(),
+        teleop=MockTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=DUMMY_REPO_ID,
+            single_task="test",
+            root=tmp_path / "failed_prepare",
+            num_episodes=1,
+            episode_time_s=0.1,
+            push_to_hub=False,
+        ),
+        play_sounds=False,
+    )
+    with (
+        patch("lerobot.scripts.lerobot_record.attach_sensors", return_value=robot),
+        patch("lerobot.scripts.lerobot_record.SensorStreamRecorder", return_value=recorder),
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDataset.prepare_episode_recording",
+            side_effect=TimeoutError("prepare"),
+        ),
+        patch("lerobot.scripts.lerobot_record.record_loop") as loop,
+        patch(
+            "lerobot.scripts.lerobot_record.LeRobotDataset.finalize",
+            side_effect=TimeoutError("cleanup") if cleanup_fails else None,
+        ),
+        patch(
+            "lerobot.scripts.lerobot_record.init_keyboard_listener",
+            return_value=(
+                None,
+                {"stop_recording": False, "exit_early": False, "rerecord_episode": False},
+            ),
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        record(cfg)
+    recorder.start_episode.assert_not_called()
+    loop.assert_not_called()
+    recorder.close.assert_called_once()
+    assert not robot.inner.is_connected
+    assert not any(sensor.is_connected for sensor in robot.sensors.values())
 
 
 def test_record_rejects_v1_sidecar_before_dataset_resume(tmp_path) -> None:

@@ -485,6 +485,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     # ── Writer-delegated methods ──────────────────────────────────────
 
+    def prepare_episode_recording(self, timeout_s: float = 30) -> None:
+        """Prepare streaming video codecs before starting Sensor or frame capture.
+
+        No frames are added. Repeated calls on an empty episode are safe; an episode
+        that already contains frames cannot be prepared. Non-streaming writers do nothing.
+
+        Args:
+            timeout_s: Shared deadline in seconds for all camera codecs to become ready.
+
+        Raises:
+            RuntimeError: If read-only, already recording, or codec initialization fails.
+            TimeoutError: If codec initialization or worker cleanup times out.
+        """
+        self._require_writer("prepare_episode_recording")
+        self.writer.prepare_episode_recording(timeout_s=timeout_s)
+
     def add_frame(self, frame: dict) -> None:
         """Add a single frame to the current episode buffer.
 

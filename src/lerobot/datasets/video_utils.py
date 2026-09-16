@@ -17,11 +17,13 @@ import contextlib
 import glob
 import importlib
 import logging
+import math
 import os
 import queue
 import shutil
 import tempfile
 import threading
+import time
 import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -771,6 +773,7 @@ class _CameraEncoderThread(threading.Thread):
         result_queue: queue.Queue,
         stop_event: threading.Event,
         encoder_threads: int | None = None,
+        frame_size: tuple[int, int] | None = None,
     ):
         super().__init__(daemon=True)
         self.video_path = video_path
@@ -781,6 +784,29 @@ class _CameraEncoderThread(threading.Thread):
         self.result_queue = result_queue
         self.stop_event = stop_event
         self.encoder_threads = encoder_threads
+        self.frame_size = frame_size
+        self.ready = threading.Event()
+        self.error: Exception | None = None
+
+    def _open_container(self, height: int, width: int):
+        """Open the actual episode codec, without submitting a synthetic frame."""
+        self.video_path.parent.mkdir(parents=True, exist_ok=True)
+        container = av.open(str(self.video_path), "w")
+        try:
+            stream = container.add_stream(
+                self.video_encoder.vcodec,
+                self.fps,
+                options=self.video_encoder.get_codec_options(self.encoder_threads, as_strings=True),
+            )
+            stream.pix_fmt = self.video_encoder.pix_fmt
+            stream.width = width
+            stream.height = height
+            stream.time_base = Fraction(1, self.fps)
+            container.start_encoding()
+        except BaseException:
+            container.close()
+            raise
+        return container, stream
 
     def run(self) -> None:
         from .compute_stats import RunningQuantileStats, auto_downsample_height_width
@@ -792,8 +818,11 @@ class _CameraEncoderThread(threading.Thread):
 
         try:
             logging.getLogger("libav").setLevel(av.logging.WARNING)
+            if self.frame_size is not None:
+                container, output_stream = self._open_container(*self.frame_size)
+                self.ready.set()
 
-            while True:
+            while not self.stop_event.is_set():
                 try:
                     frame_data = self.frame_queue.get(timeout=1)
                 except queue.Empty:
@@ -816,17 +845,10 @@ class _CameraEncoderThread(threading.Thread):
                 # Open container on first frame (to get width/height)
                 if container is None:
                     height, width = frame_data.shape[:2]
-                    Path(self.video_path).parent.mkdir(parents=True, exist_ok=True)
-                    container = av.open(str(self.video_path), "w")
-                    output_stream = container.add_stream(
-                        self.video_encoder.vcodec,
-                        self.fps,
-                        options=self.video_encoder.get_codec_options(self.encoder_threads, as_strings=True),
-                    )
-                    output_stream.pix_fmt = self.video_encoder.pix_fmt
-                    output_stream.width = width
-                    output_stream.height = height
-                    output_stream.time_base = Fraction(1, self.fps)
+                    container, output_stream = self._open_container(height, width)
+                    self.ready.set()
+                elif frame_data.shape[:2] != (output_stream.height, output_stream.width):
+                    raise ValueError("Frame dimensions do not match the prepared video stream.")
 
                 # Encode frame with explicit timestamps
                 if not self.is_depth:
@@ -876,11 +898,15 @@ class _CameraEncoderThread(threading.Thread):
                 self.result_queue.put(("ok", None))
 
         except Exception as e:
+            self.error = e
             logger.error(f"Encoder thread error: {e}")
             if container is not None:
                 with contextlib.suppress(Exception):
                     container.close()
             self.result_queue.put(("error", str(e)))
+        finally:
+            # Wake startup waiters on failure as well as success.
+            self.ready.set()
 
 
 class StreamingVideoEncoder:
@@ -930,9 +956,38 @@ class StreamingVideoEncoder:
         self._dropped_frames: dict[str, int] = {}
         self._episode_active = False
         self._closed = False
+        self._cancelling = False
+
+    @property
+    def episode_active(self) -> bool:
+        """Whether resources are owned by an episode, including failed cleanup."""
+        return self._episode_active
+
+    def wait_until_ready(self, timeout_s: float = 30) -> None:
+        """Wait for every actual codec to open, using one shared startup deadline."""
+        if isinstance(timeout_s, bool) or not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be positive and finite")
+        if not self._episode_active or self._cancelling:
+            raise RuntimeError("No usable encoder episode to prepare.")
+        deadline = time.monotonic() + timeout_s
+        try:
+            for key, thread in self._threads.items():
+                if not thread.ready.wait(max(0, deadline - time.monotonic())):
+                    raise TimeoutError(f"Encoder preparation timed out for {key!r}.")
+                if thread.error is not None:
+                    raise RuntimeError(f"Encoder preparation failed for {key!r}.") from thread.error
+                if not thread.is_alive():
+                    raise RuntimeError(f"Encoder for {key!r} stopped during preparation.")
+        except BaseException:
+            self.cancel_episode()
+            raise
 
     def start_episode(
-        self, video_keys: list[str], temp_dir: Path, depth_video_keys: list[str] | None = None
+        self,
+        video_keys: list[str],
+        temp_dir: Path,
+        depth_video_keys: list[str] | None = None,
+        frame_sizes: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         """Start encoder threads for a new episode.
 
@@ -941,15 +996,30 @@ class StreamingVideoEncoder:
             temp_dir: Base directory for temporary MP4 files
             depth_video_keys: List of video or image feature keys that carry depth maps (e.g.
                 ["observation.images.laptop_depth"]).  Defaults to ``[]`` (no depth keys).
+            frame_sizes: Optional height/width per video key, for eager codec opening.
         """
+        if self._closed or self._cancelling:
+            raise RuntimeError("Encoder is closed or has unfinished cancellation.")
         if self._episode_active:
             self.cancel_episode()
+
+        if frame_sizes is not None and set(frame_sizes) != set(video_keys):
+            raise ValueError("frame_sizes must describe every video key.")
 
         self._dropped_frames.clear()
 
         if depth_video_keys is None:
             depth_video_keys = []
 
+        self._episode_active = True
+        try:
+            self._start_threads(video_keys, temp_dir, depth_video_keys, frame_sizes)
+        except BaseException:
+            self.cancel_episode()
+            raise
+
+    def _start_threads(self, video_keys, temp_dir, depth_video_keys, frame_sizes):
+        """Register each worker before starting it so partial startup can be cancelled."""
         for video_key in video_keys:
             frame_queue: queue.Queue = queue.Queue(maxsize=self.queue_maxsize)
             result_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -957,6 +1027,7 @@ class StreamingVideoEncoder:
 
             temp_video_dir = Path(tempfile.mkdtemp(dir=temp_dir))
             video_path = temp_video_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
+            self._video_paths[video_key] = video_path
 
             encoder = self._depth_encoder if video_key in depth_video_keys else self._rgb_encoder
             encoder_thread = _CameraEncoderThread(
@@ -967,16 +1038,14 @@ class StreamingVideoEncoder:
                 result_queue=result_queue,
                 stop_event=stop_event,
                 encoder_threads=self._encoder_threads,
+                frame_size=frame_sizes[video_key] if frame_sizes is not None else None,
             )
-            encoder_thread.start()
 
             self._frame_queues[video_key] = frame_queue
             self._result_queues[video_key] = result_queue
             self._threads[video_key] = encoder_thread
             self._stop_events[video_key] = stop_event
-            self._video_paths[video_key] = video_path
-
-        self._episode_active = True
+            encoder_thread.start()
 
     def feed_frame(self, video_key: str, image: np.ndarray) -> None:
         """Feed a frame to the encoder for a specific camera.
@@ -993,7 +1062,7 @@ class StreamingVideoEncoder:
         Raises:
             RuntimeError: If the encoder thread has crashed
         """
-        if not self._episode_active:
+        if not self._episode_active or self._cancelling:
             raise RuntimeError("No active episode. Call start_episode() first.")
 
         thread = self._threads[video_key]
@@ -1028,7 +1097,7 @@ class StreamingVideoEncoder:
         Returns:
             Dict mapping video_key to (mp4_path, stats_dict_or_None)
         """
-        if not self._episode_active:
+        if not self._episode_active or self._cancelling:
             raise RuntimeError("No active episode to finish.")
 
         results = {}
@@ -1040,17 +1109,18 @@ class StreamingVideoEncoder:
 
         # Send sentinel to all queues
         for video_key in self._frame_queues:
-            self._frame_queues[video_key].put(None)
+            try:
+                self._frame_queues[video_key].put(None, timeout=5)
+            except queue.Full:
+                self.cancel_episode()
+                raise TimeoutError(f"Encoder queue for {video_key!r} did not drain.") from None
 
         # Wait for all threads and collect results
         for video_key in self._threads:
             self._threads[video_key].join(timeout=120)
             if self._threads[video_key].is_alive():
-                logger.error(f"Encoder thread for {video_key} did not finish in time")
-                self._stop_events[video_key].set()
-                self._threads[video_key].join(timeout=5)
-                results[video_key] = (self._video_paths[video_key], None)
-                continue
+                self.cancel_episode()
+                raise TimeoutError(f"Encoder thread for {video_key!r} did not finish in time.")
 
             try:
                 status, data = self._result_queues[video_key].get(timeout=5)
@@ -1069,22 +1139,33 @@ class StreamingVideoEncoder:
         """Cancel the current episode, stopping encoder threads and cleaning up."""
         if not self._episode_active:
             return
+        self._cancelling = True
 
         # Signal all threads to stop
         for video_key in self._stop_events:
             self._stop_events[video_key].set()
+            with contextlib.suppress(queue.Full):
+                self._frame_queues[video_key].put_nowait(None)
 
         # Wait for threads to finish
+        deadline = time.monotonic() + 5
         for video_key in self._threads:
-            self._threads[video_key].join(timeout=5)
+            thread = self._threads[video_key]
+            if thread.ident is not None:
+                thread.join(timeout=max(0, deadline - time.monotonic()))
 
+        alive = [key for key, thread in self._threads.items() if thread.is_alive()]
+        if alive:
+            raise TimeoutError(f"Encoder cancellation timed out; resources retained for {alive}.")
+
+        for video_path in self._video_paths.values():
             # Clean up temp MP4 files
-            video_path = self._video_paths.get(video_key)
-            if video_path is not None and video_path.exists():
+            if video_path.parent.exists():
                 shutil.rmtree(str(video_path.parent), ignore_errors=True)
 
         self._cleanup()
         self._episode_active = False
+        self._cancelling = False
 
     def close(self) -> None:
         """Close the encoder, canceling any in-progress episode."""

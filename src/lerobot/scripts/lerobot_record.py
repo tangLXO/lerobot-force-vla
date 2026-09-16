@@ -542,9 +542,10 @@ def record(
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
                 episode_index = dataset.num_episodes
                 log_say(f"Recording episode {episode_index}", cfg.play_sounds)
-                if sensor_recorder is not None:
-                    sensor_recorder.start_episode(episode_index, dataset=dataset)
                 try:
+                    dataset.prepare_episode_recording()
+                    if sensor_recorder is not None:
+                        sensor_recorder.start_episode(episode_index, dataset=dataset)
                     if sensor_recorder is not None:
                         sensor_recorder.wait_until_ready()
                     record_loop(
@@ -625,25 +626,33 @@ def record(
 
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
-        if sensor_recorder is not None:
-            sensor_recorder.close()
-
-        if dataset:
-            dataset.finalize()
-
-        if isinstance(robot, SensorizedRobot):
-            if robot.inner.is_connected or any(sensor.has_resources for sensor in robot.sensors.values()):
-                robot.disconnect()
-        elif robot.is_connected:
-            robot.disconnect()
-        if teleop and teleop.is_connected:
-            teleop.disconnect()
-
-        if listener is not None:
-            listener.stop()
-
-        if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+        # Codec cleanup can fail if native initialization is stuck. Always release
+        # hardware even when Dataset/Sensor finalization raises.
+        try:
+            try:
+                if sensor_recorder is not None:
+                    sensor_recorder.close()
+            finally:
+                if dataset is not None:
+                    dataset.finalize()
+        finally:
+            try:
+                if isinstance(robot, SensorizedRobot):
+                    if robot.inner.is_connected or any(
+                        sensor.has_resources for sensor in robot.sensors.values()
+                    ):
+                        robot.disconnect()
+                elif robot.is_connected:
+                    robot.disconnect()
+            finally:
+                try:
+                    if teleop and teleop.is_connected:
+                        teleop.disconnect()
+                finally:
+                    if listener is not None:
+                        listener.stop()
+                    if cfg.display_data:
+                        shutdown_visualization(cfg.display_mode)
 
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
