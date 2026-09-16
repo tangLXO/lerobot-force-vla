@@ -121,8 +121,8 @@ class X518Sensor(Sensor):
     def diagnostics(self) -> dict[str, Any]:
         """Return bounded, detached runtime statistics, including the last stopped run."""
         with self._publication_condition:
-            result = self._diagnostics.snapshot()
-            result.update(self._transport_stats)
+            diagnostics = self._diagnostics.detached_copy()
+            result = dict(self._transport_stats)
             result.update(
                 {
                     "acquisition_mode": self.config.acquisition_mode,
@@ -138,7 +138,10 @@ class X518Sensor(Sensor):
                     "worker_pid": self._process.pid if self._process is not None else None,
                 }
             )
-            return result
+        # Percentile computation must not hold the lock used to publish samples.
+        # Use a coherent bounded copy so capture can proceed while reports are built.
+        result.update(diagnostics.snapshot())
+        return result
 
     def _settings_changed(self, settings, rate):
         with self._publication_condition:

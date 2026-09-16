@@ -4,6 +4,7 @@
 
 import logging
 from collections import deque
+from copy import copy
 
 import numpy as np
 
@@ -67,6 +68,14 @@ class AcquisitionDiagnostics:
                 )
                 self.last_warning = stamp / 1e9
             self.window_start, self.window_count = stamp, 0
+
+    def detached_copy(self):
+        """Copy bounded timing windows under the owner's lock, without computing statistics."""
+        result = copy(self)
+        result.intervals = self.intervals.copy()
+        result.latencies = self.latencies.copy()
+        result.ages = self.ages.copy()
+        return result
 
     def snapshot(self):
         """Return a detached snapshot; percentiles cover at most 4096 recent samples."""
