@@ -1,0 +1,71 @@
+# DISABLED HARDWARE TEMPLATE: fill calibration, direction, gains and limits explicitly.
+backend: b601
+dry_run: false
+observe_only: true
+allow_motion: false
+explicit_arm: false
+close_sign: null
+b601:
+  port: null
+  baudrate: 921600
+  joint_specs: []
+  control: null
+  startup_mode: null
+sensors: {}
+teacher:
+  controller_type: ip
+  force_target_N: null
+  target_min_N: null
+  target_max_N: null
+  kp_deg_per_N: null
+  ki_deg_per_N_s: null
+  integral_deadband_N: 0.0
+  release_speed_deg_s: null
+  release_travel_deg: null
+  max_release_time_s: null
+  controller_id: force_teacher_ip
+  profile_id: unconfigured
+safety:
+  q_min_deg: null
+  q_max_deg: null
+  max_relative_target_deg: null
+  max_command_tracking_error_deg: null
+  max_close_speed_deg_s: null
+  max_open_speed_deg_s: null
+  acceleration_limit_deg_s2: null
+  hard_force_limit_left_N: null
+  hard_force_limit_right_N: null
+  force_max_age_ms: null
+  joint_feedback_max_age_ms: null
+  decision_max_age_ms: null
+  max_dt_s: null
+  fault_action: null
+  supported_object_bench: false
+  soft_q_min_deg: null
+  soft_q_max_deg: null
+  max_total_travel_deg: null
+  max_run_time_s: null
+  stall_position_tolerance_deg: null
+  stall_timeout_s: null
+runtime:
+  control_hz: 50.0
+  feedback_budget_ms: 15.0
+  tick_deadline_ms: 40.0
+  command_ttl_ms: 200.0
+  force_instance: gripper_force
+  left_feature: left.normal_force
+  right_feature: right.normal_force
+  force_metric: mean_normal
+  software_calibration_id: driver_semantic_N
+  object_id: unspecified
+  contact_condition_id: unspecified
+trace_root: outputs/force_teacher/hardware_unconfigured
+queue_capacity: 2048
+duration_s: 3.0
+fake_sample_rate_hz: 200.0
+fake_response_time_s: 0.03
+fake_relaxation_N_s: 0.0
+startup_timeout_s: 2.0
+shutdown_timeout_s: 2.0
+raw_queue_capacity: 4096
+trace_join_timeout_s: 2.0

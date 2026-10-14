@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import re
 import time
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
+from lerobot.force_control.hardware_types import JointSnapshot, SendReceipt
 from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.sensors import (
     Sensor,
@@ -417,6 +419,31 @@ class SensorizedRobot:
         self.check_health()
         return self._robot.send_action(action)
 
+    def read_joint_snapshot(self, names: Sequence[str], *, deadline_ns: int) -> JointSnapshot:
+        """Keep explicit control-path reads behind the same sensor health gate."""
+        self.check_health()
+        return self._robot.read_joint_snapshot(names, deadline_ns=deadline_ns)
+
+    def send_joint_positions_partial(
+        self, goals_deg: Mapping[str, float], *, feedback_snapshot: JointSnapshot
+    ) -> SendReceipt:
+        """Never let robot-specific partial writes bypass a latched sensor fault."""
+        self.check_health()
+        return self._robot.send_joint_positions_partial(goals_deg, feedback_snapshot=feedback_snapshot)
+
+    def send_gripper_position(self, position_deg: float, *, feedback_snapshot: JointSnapshot) -> SendReceipt:
+        self.check_health()
+        return self._robot.send_gripper_position(position_deg, feedback_snapshot=feedback_snapshot)
+
+    def fault_stop_gripper(self, *, reason: str) -> None:
+        """Narrow fault-only channel, without clearing the ordinary write latch.
+
+        The inner adapter must execute its validated stop or explicitly refuse;
+        this does not accept arbitrary positions or general motion callbacks.
+        """
+        self.latch_fatal_error(RuntimeError(reason))
+        self._robot.fault_stop_gripper(reason=reason)
+
     def calibrate(self) -> None:
         """Delegate calibration unchanged."""
         self._robot.calibrate()
@@ -444,6 +471,10 @@ class SensorizedRobot:
 
     def __getattr__(self, name: str) -> Any:
         """Delegate robot-specific compatibility helpers."""
+        if name.startswith(("send_", "_send_", "fault_")):
+            raise AttributeError(
+                f"Motion helper {name!r} requires an explicit SensorizedRobot health or fault channel"
+            )
         return getattr(self._robot, name)
 
 
