@@ -32,6 +32,7 @@ class ForceTeacher:
         self._release_endpoint_encoded = False
         self._hold_target_deg: float | None = None
         self._hold_speed_deg_s: float | None = None
+        self._contact_alignment_pending = False
         self._phase_start_ns: int | None = None
         self._phase_start_q: float | None = None
 
@@ -45,12 +46,18 @@ class ForceTeacher:
         """Requested speed for the current absolute-position move, if specified."""
         return self._hold_speed_deg_s
 
+    @property
+    def contact_alignment_pending(self) -> bool:
+        """Whether slew limits left old closing lead to remove after contact."""
+        return self._contact_alignment_pending
+
     def _reset(self) -> None:
         self._last_force_N = None
         self._first_force_submission = True
         self._release_endpoint_encoded = False
         self._hold_target_deg = None
         self._hold_speed_deg_s = None
+        self._contact_alignment_pending = False
         self._phase_start_ns = self._phase_start_q = None
         self._revision += 1
 
@@ -261,7 +268,7 @@ class ForceTeacher:
             return proposal
         cfg = self.config
         error = cfg.force_target_N - inputs.force.mean_N
-        delta_i = delta_p = delta = 0.0
+        delta_i = delta_p = delta_contact = delta = 0.0
         next_phase = self.phase
         tag = "inactive"
         if self.phase == ControlPhase.APPROACH and inputs.force.mean_N >= cfg.approach_force_threshold_N:
@@ -276,7 +283,11 @@ class ForceTeacher:
         if next_phase == ControlPhase.FORCE_TRACK:
             if abs(error) > cfg.integral_deadband_N:
                 delta_i = cfg.ki_deg_per_N_s * inputs.dt_control_s * error
-            delta = delta_i + delta_p
+            if self.phase == ControlPhase.APPROACH or self._contact_alignment_pending:
+                # Remove closing lead from the candidate, never falsify the submitted reference.
+                # An existing opening lead is retained; contact must not pull it back closed.
+                delta_contact = -max(0.0, self.close_sign * (inputs.q_prev_sent_deg - inputs.q_measured_deg))
+            delta = delta_i + delta_p + delta_contact
             tag = (
                 "deadband"
                 if abs(error) <= cfg.integral_deadband_N
@@ -311,11 +322,13 @@ class ForceTeacher:
             tag = "release"
         candidate = inputs.q_prev_sent_deg + self.close_sign * delta
         rate = delta / inputs.dt_control_s
-        if not all(math.isfinite(value) for value in (error, delta_i, delta_p, delta, candidate, rate)):
+        if not all(
+            math.isfinite(value) for value in (error, delta_i, delta_p, delta_contact, delta, candidate, rate)
+        ):
             reason = "nonfinite_control_arithmetic"
         if reason:
             next_phase = ControlPhase.FAULT
-            error = delta_i = delta_p = delta = rate = 0.0
+            error = delta_i = delta_p = delta_contact = delta = rate = 0.0
             candidate = inputs.q_prev_sent_deg
         return replace(
             proposal,
@@ -324,6 +337,7 @@ class ForceTeacher:
             error_N=error,
             delta_i_deg=delta_i,
             delta_p_deg=delta_p,
+            delta_contact_deg=delta_contact,
             delta_raw_deg=delta,
             u_raw_deg_s=rate,
             q_candidate_deg=candidate,
@@ -340,6 +354,7 @@ class ForceTeacher:
         q_accepted_deg: float | None = None,
         software_success: bool = False,
         safety_override: bool = False,
+        i_blocked: bool = False,
     ) -> None:
         """Advance history only after the owner reports a successful final wire submission."""
         if proposal.revision != self._revision or proposal.phase != self.phase:
@@ -357,6 +372,17 @@ class ForceTeacher:
             finite_number("q_sent_deg", q_sent_deg)
             if q_accepted_deg is not None:
                 finite_number("q_accepted_deg", q_accepted_deg)
+            if (
+                proposal.phase == ControlPhase.APPROACH and proposal.next_phase == ControlPhase.FORCE_TRACK
+            ) or self._contact_alignment_pending:
+                # Slew/driver clipping must not discard the remaining alignment. Allow only
+                # new force-control advance and the actual wire-encoding rounding difference.
+                force_advance = max(0.0, proposal.delta_p_deg + (0.0 if i_blocked else proposal.delta_i_deg))
+                wire_rounding = 0.0 if q_accepted_deg is None else abs(q_sent_deg - q_accepted_deg)
+                lead = self.close_sign * (q_sent_deg - proposal.inputs.q_measured_deg)
+                self._contact_alignment_pending = (
+                    proposal.delta_contact_deg < 0 and lead > force_advance + wire_rounding + 1e-8
+                )
             if proposal.phase == ControlPhase.RELEASE:
                 endpoint = self._phase_start_q - self.close_sign * self.config.release_travel_deg
                 # The accepted endpoint must survive both safety and driver

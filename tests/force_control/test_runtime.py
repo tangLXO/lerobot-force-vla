@@ -118,6 +118,41 @@ def test_owner_approach_switch_position_and_repeat_closure(bench):
     assert row["phase"] == "APPROACH" and row["hold_target_deg"] is None
 
 
+def test_owner_contact_alignment_preserves_real_submitted_reference_and_finishes_after_slew_limit(
+    bench, monkeypatch
+):
+    runtime, device, *_ = bench
+    runtime.safety.config = replace(runtime.safety.config, acceleration_limit_deg_s2=None)
+    start(bench)
+    runtime.controller.update_config(replace(runtime.controller.config, ki_deg_per_N_s=0))
+    monkeypatch.setattr(device.plant, "advance", lambda: None)  # Fresh feedback, simulated mechanical lag.
+    runtime.post(
+        "approach",
+        version=2,
+        epoch=runtime.epoch,
+        value={"approach_speed_deg_s": 5, "approach_force_threshold_N": 0.5},
+    )
+    for _ in range(7):
+        previous = step(bench, 0.1, 0.1)
+    row = step(bench, 0.6, 0.6)
+    assert row["phase"] == "FORCE_TRACK"
+    assert row["q_prev_sent_deg"] == previous["q_sent_deg"]
+    assert row["q_measured_deg"] == 0
+    assert row["delta_contact_deg"] == pytest.approx(-0.7)
+    assert row["delta_p_deg"] == pytest.approx(-0.05)
+    assert row["delta_final_deg"] == pytest.approx(-0.1)
+    assert row["contact_alignment_pending"] and not row["label_valid"]
+    for _ in range(6):
+        previous, row = row, step(bench, 0.6, 0.6)
+        assert row["q_prev_sent_deg"] == previous["q_sent_deg"]
+        assert row["delta_final_deg"] == pytest.approx(-0.1)
+        assert not row["label_valid"]
+    assert not row["contact_alignment_pending"]
+    assert row["q_sent_deg"] == pytest.approx(row["q_measured_deg"])
+    row = step(bench, 0.6, 0.6)
+    assert row["delta_contact_deg"] == 0 and row["label_valid"]
+
+
 @pytest.mark.parametrize(
     "mode,target,phase", [("position", -1, "POSITION_HOLD"), ("approach", None, "APPROACH")]
 )

@@ -74,6 +74,7 @@ class TeacherProposal:
     tracking_tag: str = "inactive"
     transition: str | None = None
     failure_reason: str | None = None
+    delta_contact_deg: float = 0.0
 
 
 @dataclass(frozen=True)

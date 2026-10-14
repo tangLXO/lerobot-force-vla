@@ -788,6 +788,7 @@ class ForceRuntime:
                         delta_raw_deg=self.controller.close_sign * (q_teleop - q_prev),
                         delta_i_deg=0.0,
                         delta_p_deg=0.0,
+                        delta_contact_deg=0.0,
                         tracking_tag="teleop",
                     )
                 row.update(
@@ -799,6 +800,7 @@ class ForceRuntime:
                     error_N=proposal.error_N,
                     delta_i_deg=proposal.delta_i_deg,
                     delta_p_deg=proposal.delta_p_deg,
+                    delta_contact_deg=proposal.delta_contact_deg,
                     delta_raw_deg=proposal.delta_raw_deg,
                     u_raw_deg_s=proposal.u_raw_deg_s,
                     tracking_tag=proposal.tracking_tag,
@@ -924,6 +926,7 @@ class ForceRuntime:
                                     and not changed
                                     and not decision.safety_override
                                     and proposal.phase == ControlPhase.FORCE_TRACK
+                                    and proposal.delta_contact_deg == 0
                                     and self.mode != "TELEOP"
                                 )
                                 if result.clipped_deg != decision.q_after_safety_deg:
@@ -937,6 +940,7 @@ class ForceRuntime:
                                     software_success=success,
                                     safety_override=decision.safety_override,
                                     q_accepted_deg=result.clipped_deg,
+                                    i_blocked=decision.i_blocked,
                                 )
                             self.safety.commit(q_prev, result.submitted_deg, dt, software_success=success)
                             if not success:
@@ -974,6 +978,7 @@ class ForceRuntime:
             parameter_update=self._parameter_update,
             hold_target_deg=self.controller.hold_target_deg,
             hold_speed_deg_s=self.controller.hold_speed_deg_s,
+            contact_alignment_pending=self.controller.contact_alignment_pending,
             approach_speed_deg_s=self.controller.config.approach_speed_deg_s,
             approach_force_threshold_N=self.controller.config.approach_force_threshold_N,
             control_reference_reset_ns=self.last_tick_start

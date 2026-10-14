@@ -1561,6 +1561,7 @@ class Tuner:
                 f"指定 / 保持目标 {self.fmt(row.get('hold_target_deg'))}° | "
                 f"定位速度 {self.fmt(row.get('hold_speed_deg_s'))}°/s\n"
                 f"ΔI {self.fmt(row.get('delta_i_deg'))}° | ΔP {self.fmt(row.get('delta_p_deg'))}° | "
+                f"接触回退 {self.fmt(row.get('delta_contact_deg'))}° | "
                 f"原始 / 最终增量 {self.fmt(row.get('delta_raw_deg'))} / {self.fmt(row.get('delta_final_deg'))}°\n"
                 f"目标领先 {self.fmt(row.get('command_lead_deg'))}° | 限制 {', '.join(row.get('clip_flags') or ()) or '无'}\n"
                 f"{timing_description(row)}"
@@ -1644,6 +1645,7 @@ class Tuner:
                 (
                     ("delta_i_deg", "I", "#ea580c"),
                     ("delta_p_deg", "P", "#2563eb"),
+                    ("delta_contact_deg", "回退", "#db2777"),
                     ("delta_raw_deg", "原始", "#7c3aed"),
                     ("delta_final_deg", "最终", "#16a34a"),
                 ),

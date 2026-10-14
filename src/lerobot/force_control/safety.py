@@ -160,7 +160,14 @@ class SafetySupervisor:
         if not proposal.command_enabled:
             return SafetyDecision(None, 0.0)
         try:
-            for name in ("q_candidate_deg", "u_raw_deg_s", "delta_raw_deg", "delta_i_deg", "delta_p_deg"):
+            for name in (
+                "q_candidate_deg",
+                "u_raw_deg_s",
+                "delta_raw_deg",
+                "delta_i_deg",
+                "delta_p_deg",
+                "delta_contact_deg",
+            ):
                 finite_number(name, getattr(proposal, name))
         except ValueError:
             return self.latch_fault("invalid_candidate")
@@ -172,8 +179,21 @@ class SafetySupervisor:
             return self.latch_fault("candidate_rate_reference_mismatch")
         if not math.isclose(raw_delta, proposal.delta_raw_deg, abs_tol=1e-8):
             return self.latch_fault("candidate_increment_reference_mismatch")
+        if proposal.delta_contact_deg != 0 and (
+            proposal.next_phase != ControlPhase.FORCE_TRACK
+            or proposal.phase not in (ControlPhase.APPROACH, ControlPhase.FORCE_TRACK)
+            or proposal.delta_contact_deg > 0
+            or not math.isclose(
+                proposal.delta_contact_deg,
+                -max(0.0, self.close_sign * (inputs.q_prev_sent_deg - inputs.q_measured_deg)),
+                abs_tol=1e-8,
+            )
+        ):
+            return self.latch_fault("invalid_contact_alignment")
         if proposal.next_phase == ControlPhase.FORCE_TRACK and not math.isclose(
-            proposal.delta_raw_deg, proposal.delta_i_deg + proposal.delta_p_deg, abs_tol=1e-8
+            proposal.delta_raw_deg,
+            proposal.delta_i_deg + proposal.delta_p_deg + proposal.delta_contact_deg,
+            abs_tol=1e-8,
         ):
             return self.latch_fault("candidate_ip_increment_mismatch")
         lower, upper = cfg.q_min_deg, cfg.q_max_deg
@@ -203,7 +223,7 @@ class SafetySupervisor:
             if self.close_sign * (closing_limit - inputs.q_prev_sent_deg) <= 1e-10:
                 return self.latch_fault("approach_position_limit")
         i_blocked = proposal.next_phase == ControlPhase.FORCE_TRACK and i_direction in blocked_directions
-        delta = proposal.delta_p_deg if i_blocked else raw_delta
+        delta = proposal.delta_p_deg + proposal.delta_contact_deg if i_blocked else raw_delta
         if i_blocked:
             flags.append("integral_blocked")
         q_candidate = inputs.q_prev_sent_deg + self.close_sign * delta
