@@ -260,6 +260,7 @@ class ForceRuntime:
         self.shutdown_evidence = None
         self._parameter_update = None
         self._startup_performed = False
+        self._hybrid_leader_required = False
 
     def open(self):
         """Claim and connect the bus only on the thread that will execute all ticks."""
@@ -341,6 +342,8 @@ class ForceRuntime:
         """Recheck live raw force and stop immediately before each startup write."""
         if self._stop.is_set():
             raise RuntimeError("user_stop_during_startup")
+        if self._hybrid_leader_required:
+            self._arm_intent(self.clock(), {})
         self.trace.check_health()
         self.sensor._check_recorder_fault()
         sample = self.sensor.read_latest_before(self.clock(), max_age_ms=self.safety.config.force_max_age_ms)
@@ -406,6 +409,12 @@ class ForceRuntime:
             ):
                 raise ValueError("start requires mode, position_deg and optional position_speed_deg_s")
             validate_motion_request(self.controller.config, self.safety.config, **request)
+            if request["mode"] == "hybrid":
+                if self._hybrid_leader_required:
+                    raise RuntimeError("hybrid_restart_requires_new_session")
+                # Validate the actual leader sample before any startup enable/write.
+                self._hybrid_leader_required = True
+                self._arm_intent(now, {})
             self._startup_performed = tuple(self.config.joint_names) == ("gripper",) and hasattr(
                 self.device, "start_gripper"
             )
@@ -542,13 +551,17 @@ class ForceRuntime:
     def _arm_intent(self, anchor, row):
         intent = self.arm_mailbox.latest()
         active = self.controller.phase not in (ControlPhase.DISABLED, ControlPhase.ARMED)
-        required = self.config.arm_intent_required and (active or self.mode == "TELEOP")
+        required = self._hybrid_leader_required or (
+            self.config.arm_intent_required and (active or self.mode == "TELEOP")
+        )
         if intent is None:
             if required:
                 raise RuntimeError("arm_intent_missing")
             return None
         if intent.epoch != self.epoch or not 0 <= anchor - intent.captured_ns <= intent.ttl_ns:
             raise RuntimeError("arm_intent_ttl_expired")
+        if self._hybrid_leader_required:
+            self._leader_inputs(intent)
         row.update(
             arm_command_version=intent.version,
             arm_command_timestamp_ns=intent.captured_ns,
@@ -558,6 +571,27 @@ class ForceRuntime:
             arm_filtered_keys=[] if self.mode == "TELEOP" else ["gripper.pos"],
         )
         return intent
+
+    def _leader_inputs(self, intent):
+        """Extract the sampled leader evidence; mailbox versions are not sample sequences."""
+        if intent is None or not self._hybrid_leader_required:
+            return {}
+        metadata = json.loads(intent.metadata_json)
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("raw_action_deg"), dict):
+            raise RuntimeError("hybrid_requires_leader_metadata")
+        values = {
+            "leader_gripper_deg": dict(intent.goals).get("gripper.pos"),
+            "leader_raw_gripper_deg": metadata.get("raw_action_deg", {}).get("gripper.pos"),
+            "leader_sequence": metadata.get("leader_sequence"),
+            "leader_captured_ns": intent.captured_ns,
+        }
+        finite_number("leader_gripper_deg", values["leader_gripper_deg"])
+        finite_number("leader_raw_gripper_deg", values["leader_raw_gripper_deg"])
+        if type(values["leader_sequence"]) is not int or values["leader_sequence"] < 0:
+            raise RuntimeError("hybrid_requires_leader_sample_sequence")
+        if metadata.get("leader_request_started_ns") != intent.captured_ns:
+            raise RuntimeError("hybrid_leader_capture_mismatch")
+        return values
 
     def tick(self):
         """Read fresh joints, select force once, propose, limit, submit, then publish evidence."""
@@ -588,6 +622,8 @@ class ForceRuntime:
             "feedback_valid": False,
             "teacher_active": False,
             "label_valid": False,
+            "hybrid_transition": None,
+            "contact_reference_candidate": None,
             "safety_override": False,
             "close_sign": self.controller.close_sign,
             "q_prev_sent_deg": self.last_sent,
@@ -781,6 +817,7 @@ class ForceRuntime:
                     feedback.receive_timestamp_ns,
                     feedback.receive_sequence,
                     snapshot.is_valid,
+                    **self._leader_inputs(intent),
                 )
                 proposal = self.controller.propose(inputs)
                 if self.mode == "TELEOP":
@@ -803,7 +840,9 @@ class ForceRuntime:
                     force_target_requested_N=proposal.target_N,
                     force_target_effective_N=proposal.target_N,
                     target_version=proposal.target_version,
-                    teacher_active=proposal.command_enabled and self.mode != "TELEOP",
+                    teacher_active=proposal.command_enabled
+                    and self.mode != "TELEOP"
+                    and proposal.next_phase not in (ControlPhase.FOLLOW, ControlPhase.FOLLOW_WAIT_CLEAR),
                     error_N=proposal.error_N,
                     delta_i_deg=proposal.delta_i_deg,
                     delta_p_deg=proposal.delta_p_deg,
@@ -813,7 +852,16 @@ class ForceRuntime:
                     tracking_tag=proposal.tracking_tag,
                     transition=proposal.transition,
                     phase_before=str(proposal.phase),
+                    contact_reference_candidate=None
+                    if proposal.contact_reference is None
+                    else asdict(proposal.contact_reference),
                 )
+                if self.controller.hybrid_active:
+                    row["arm_filtered_keys"] = (
+                        []
+                        if proposal.next_phase in (ControlPhase.FOLLOW, ControlPhase.FOLLOW_WAIT_CLEAR)
+                        else ["gripper.pos"]
+                    )
                 decision = self.safety.apply(inputs, proposal, now_ns=self.clock())
                 row.update(
                     q_after_safety_deg=decision.q_after_safety_deg,
@@ -933,6 +981,7 @@ class ForceRuntime:
                                     and not changed
                                     and not decision.safety_override
                                     and proposal.phase == ControlPhase.FORCE_TRACK
+                                    and proposal.next_phase == ControlPhase.FORCE_TRACK
                                     and proposal.delta_contact_deg == 0
                                     and self.mode != "TELEOP"
                                 )
@@ -949,6 +998,14 @@ class ForceRuntime:
                                     q_accepted_deg=result.clipped_deg,
                                     i_blocked=decision.i_blocked,
                                 )
+                                if (
+                                    success
+                                    and self.controller.hybrid_active
+                                    and proposal.transition is not None
+                                ):
+                                    row["mode_transition"] = True
+                                    row["label_valid"] = False
+                                    row["hybrid_transition"] = proposal.transition
                             self.safety.commit(q_prev, result.submitted_deg, dt, software_success=success)
                             if not success:
                                 self._fault("send_result_unknown")
@@ -986,6 +1043,10 @@ class ForceRuntime:
             hold_target_deg=self.controller.hold_target_deg,
             hold_speed_deg_s=self.controller.hold_speed_deg_s,
             contact_alignment_pending=self.controller.contact_alignment_pending,
+            hybrid_state=str(self.controller.phase) if self.controller.hybrid_active else None,
+            contact_reference=None
+            if self.controller.contact_reference is None
+            else asdict(self.controller.contact_reference),
             gripper_follow_speed_deg_s=self.controller.config.gripper_follow_speed_deg_s,
             contact_force_threshold_N=self.controller.config.contact_force_threshold_N,
             control_reference_reset_ns=self.last_tick_start

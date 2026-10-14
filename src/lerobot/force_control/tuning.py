@@ -1,6 +1,6 @@
 """Shared B601 I-P settings and disconnected profile construction.
 
-The panel, teleoperation and recording entry points use this module without
+The panel and Teacher entry points use this module without
 importing Tk or opening a transport. Saved drafts never authorize motion.
 """
 
@@ -37,7 +37,7 @@ FIELDS = (
     (
         "control",
         "gripper_follow_speed_deg_s",
-        "夹爪跟随 / 恒速闭合速度 (°/s) · 使用时必填",
+        "夹爪跟随 / 接近速度上限 (°/s) · 使用时必填",
         "",
         float,
         True,
@@ -81,6 +81,20 @@ FIELDS = (
     ("limits", "start_feedback_max_age_ms", "只读启动参考最大年龄 (ms)", "150", float, False, None),
     ("device", "port", "B601 串口", "COM22", str, False, None),
     ("device", "baudrate", "B601 波特率", "921600", int, False, None),
+    ("device", "leader_port", "102 主臂串口 · Teacher 模式必填", "", str, False, None),
+    (
+        "device",
+        "leader_readonly_transport",
+        "102 只读传输 (protocol_v1 / sdk)",
+        "protocol_v1",
+        str,
+        False,
+        None,
+    ),
+    ("device", "leader_baudrate", "102 波特率", "1000000", int, False, None),
+    ("device", "leader_frequency_hz", "102 采样频率 (Hz)", "50", float, False, None),
+    ("device", "leader_max_age_s", "102 指令最大年龄 (s)", "0.15", float, False, None),
+    ("device", "leader_read_budget_s", "102 读取预算 (s)", "0.1", float, False, None),
     ("device", "motor_velocity_code", "FORCE_POS 速度码 (整数 1–10000)", "1", int, False, None),
     ("device", "drive_percent", "FORCE_POS 电流 / 力矩比例 (%)", "2", float, False, None),
     ("device", "watchdog_ticks", "看门狗 TIMEOUT ticks (50 μs/tick)", "2000", int, False, None),
@@ -164,7 +178,8 @@ FIELD_PAGES = {
     for section, key, *_ in FIELDS
 }
 SETTINGS_FORMAT = "b601_ip_tuner_settings"
-SETTINGS_SCHEMA_VERSION = 5
+SETTINGS_SCHEMA_VERSION = 6
+LEADER_FIELDS = frozenset(key for _, key, *_ in FIELDS if key.startswith("leader_"))
 MOTION_FIELDS = {
     "gripper_follow_speed_deg_s",
     "contact_force_threshold_N",
@@ -234,7 +249,7 @@ def read_settings(path, *, on_unit_conversion=None):
         or set(document) != keys
         or document["format"] != SETTINGS_FORMAT
         or type(document["schema_version"]) is not int
-        or document["schema_version"] not in (1, 2, 3, 4, SETTINGS_SCHEMA_VERSION)
+        or document["schema_version"] not in (1, 2, 3, 4, 5, SETTINGS_SCHEMA_VERSION)
         or document["controller_type"] != "ip"
         or not isinstance(document["calibration_file"], str)
         or not document["calibration_file"].strip()
@@ -245,6 +260,11 @@ def read_settings(path, *, on_unit_conversion=None):
     values = dict(document["values"])
     if document["schema_version"] < 5:
         values = canonicalize_teacher_fields(values)
+    if document["schema_version"] < 6:
+        # Old profiles never select a leader port or authorize a running mode.
+        defaults = default_values()
+        for key in LEADER_FIELDS:
+            values.setdefault(key, defaults[key])
     if document["schema_version"] == 1:
         legacy_keys = (set(default_values()) - MOTION_FIELDS - set(LEGACY_TARGET_FIELDS.values())) | set(
             LEGACY_TARGET_FIELDS
@@ -337,7 +357,7 @@ def sensor_config(v):
     )
 
 
-def build_config(values, enabled, calibration, output):
+def build_config(values, enabled, calibration, output, *, initial_mode="force"):
     """Map every visible control into the common typed runtime profile."""
     calibration.require_unchanged()
     v = parse_values(values, enabled)
@@ -415,6 +435,14 @@ def build_config(values, enabled, calibration, output):
         observe_only=False,
         allow_motion=True,
         explicit_arm=True,
+        initial_mode=initial_mode,
+        leader_backend="rebot_102" if initial_mode == "hybrid" else None,
+        leader_port=(v["leader_port"] or None) if initial_mode == "hybrid" else None,
+        leader_readonly_transport=v["leader_readonly_transport"],
+        leader_baudrate=v["leader_baudrate"],
+        leader_frequency_hz=v["leader_frequency_hz"],
+        leader_max_age_s=v["leader_max_age_s"],
+        leader_read_budget_s=v["leader_read_budget_s"],
         close_sign=v["close_sign"],
         b601=B601HardwareConfig(
             port=v["port"],

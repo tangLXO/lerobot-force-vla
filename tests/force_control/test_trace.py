@@ -32,6 +32,22 @@ def write_run(tmp_path, rows=None, *, complete=True):
     return trace, sensor, manifest
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"phase": "FOLLOW"},
+        {"phase": "FOLLOW_WAIT_CLEAR"},
+        {"hybrid_transition": "contact"},
+        {"delta_contact_deg": -0.1},
+    ],
+)
+def test_follow_and_contact_transition_cannot_claim_force_labels(tmp_path, changes):
+    trace, _, _ = write_run(tmp_path, [control_row(0), control_row(1, **changes)])
+    report = validate_trace(trace.root)
+    assert not report["valid"]
+    assert any("must be masked" in error for error in report["errors"])
+
+
 def test_roundtrip_native_raw_causal_labels_stats_and_read_only(tmp_path):
     trace, sensor, manifest = write_run(tmp_path)
     assert manifest["complete"] is True

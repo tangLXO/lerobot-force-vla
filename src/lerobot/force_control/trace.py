@@ -721,7 +721,10 @@ def _validate_rows(
                 or row["deadline_miss"]
                 or row.get("action_override", False)
                 or row.get("mode_transition", False)
-                or row["phase"] in ("FAULT", "DISABLED", "RELEASE", "ARMED", "APPROACH")
+                or row.get("hybrid_transition") is not None
+                or row.get("delta_contact_deg", 0) != 0
+                or row["phase"]
+                in ("FAULT", "DISABLED", "RELEASE", "ARMED", "APPROACH", "FOLLOW", "FOLLOW_WAIT_CLEAR")
                 or (previous_row is not None and row["mode"] != previous_row["mode"])
             ):
                 errors.append(prefix + "unsafe/initial/failed/discontinuous tick must be masked")

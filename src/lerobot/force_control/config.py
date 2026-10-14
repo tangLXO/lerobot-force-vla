@@ -241,10 +241,12 @@ def validate_motion_request(
     teacher: TeacherConfig, safety: SafetyConfig, mode: str, position_deg=None, position_speed_deg_s=None
 ):
     """Validate operator motion intent before enabling hardware or changing phase."""
-    if mode not in ("force", "approach", "position"):
-        raise ValueError("motion mode must be force, approach or position")
-    if mode == "approach" and teacher.gripper_follow_speed_deg_s is None:
-        raise ValueError("请填写恒速闭合速度和切换平均力阈值")
+    if mode not in ("force", "approach", "position", "hybrid"):
+        raise ValueError("motion mode must be force, approach, position or hybrid")
+    if mode in ("approach", "hybrid") and (
+        teacher.gripper_follow_speed_deg_s is None or teacher.contact_force_threshold_N is None
+    ):
+        raise ValueError("请填写夹爪跟随速度和接触平均力阈值")
     if mode == "position":
         goal = finite_number("指定绝对位置 (°)", position_deg)
         if position_speed_deg_s is not None:

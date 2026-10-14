@@ -306,7 +306,7 @@ def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel
     assert restored == (values, enabled, Path(calibration.path).resolve())
     document = json.loads(saved.read_text(encoding="utf-8"))
     assert document["format"] == "b601_ip_tuner_settings"
-    assert document["controller_type"] == "ip" and document["schema_version"] == 5
+    assert document["controller_type"] == "ip" and document["schema_version"] == 6
     assert document["values"]["kp_deg_per_N"] == ""
     assert (
         not {"reference", "executable", "confirmed", "exit_confirmed", "shutdown_evidence"} & document.keys()
@@ -490,7 +490,7 @@ def test_legacy_kg_parameters_preserve_force_and_show_conversion(
     saved = tmp_path / "newtons.json"
     stopped_panel.save_parameters_file(saved)
     document = json.loads(saved.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 5
+    assert document["schema_version"] == 6
     assert not {"target_kg", "target_min_kg", "target_max_kg"} & document["values"].keys()
     assert panel.read_settings(saved)[0] == values
     assert path.read_bytes() == original

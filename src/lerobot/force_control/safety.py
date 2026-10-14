@@ -181,7 +181,7 @@ class SafetySupervisor:
             return self.latch_fault("candidate_increment_reference_mismatch")
         if proposal.delta_contact_deg != 0 and (
             proposal.next_phase != ControlPhase.FORCE_TRACK
-            or proposal.phase not in (ControlPhase.APPROACH, ControlPhase.FORCE_TRACK)
+            or proposal.phase not in (ControlPhase.APPROACH, ControlPhase.FOLLOW, ControlPhase.FORCE_TRACK)
             or proposal.delta_contact_deg > 0
             or not math.isclose(
                 proposal.delta_contact_deg,

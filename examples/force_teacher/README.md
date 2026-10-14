@@ -2,6 +2,8 @@
 
 调参入口：`uv run --no-sync python examples/force_teacher/b601_tuner.py`，或双击同目录的 `run_b601_tuner.bat`。具体流程见 [TUNING.md](TUNING.md)。
 
+同一界面支持独立调参和“Teacher 主从夹爪”：低力时跟随 102 主爪，接触后保持目标力，主爪张开越界后接回。物理执行范围为 B601 ID7，其他从臂关节不参与。提交整理与回退方式见 [DELIVERY_SCOPE.md](DELIVERY_SCOPE.md)。
+
 夹爪使用 B601 ID7 的 FORCE_POS 位置执行方式，外环使用 X518 双侧当前力均值进行增量 I-P 控制：
 
 `delta = Ki * dt * (target_N - mean_N) - Kp * (mean_N - previous_mean_N)`。
@@ -12,6 +14,7 @@ Teacher 仅产生候选；Safety 限制候选；唯一 owner 完成硬件下发�
 
 ```powershell
 uv run --no-sync python -m lerobot.scripts.lerobot_force_teacher --config_path examples/force_teacher/fake_teacher.yaml
+uv run --no-sync python -m lerobot.scripts.lerobot_force_teacher --config_path examples/force_teacher/fake_hybrid.yaml
 uv run --no-sync pytest tests/force_control -q
 ```
 

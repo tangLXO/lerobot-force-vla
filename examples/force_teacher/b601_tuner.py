@@ -233,6 +233,19 @@ def timing_settings_description(values, config=None, *, startup_complete=False, 
     )
 
 
+def hybrid_description(row):
+    """Show the committed boundary in the same calibrated coordinates as the follower."""
+    state = row.get("hybrid_state")
+    if state is None:
+        return ""
+    reference = row.get("contact_reference") or {}
+    leader = (row.get("arm_intent") or {}).get("gripper.pos")
+    boundary = reference.get("follower_gripper_deg")
+    leader_text = "—" if leader is None else f"{leader:.5g}"
+    boundary_text = "—" if boundary is None else f"{boundary:.5g}"
+    return f"\nTeacher {state} | 主爪映射 {leader_text}° | 接触从爪参考 {boundary_text}°"
+
+
 def timing_description(row):
     """Show measured tick/query time against its recorded absolute deadline."""
     start = row.get("tick_start_ns")
@@ -566,6 +579,10 @@ class Tuner:
         self.approach_button.grid(row=5, column=0, sticky="ew", pady=6, padx=(0, 4))
         self.position_button = ttk.Button(actions, text="运动到指定位置", command=self.move_to_position)
         self.position_button.grid(row=5, column=1, sticky="ew")
+        self.hybrid_button = ttk.Button(
+            actions, text="Teacher 主从夹爪（使能）", command=lambda: self.start("hybrid")
+        )
+        self.hybrid_button.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         stopped = ttk.LabelFrame(right, text="最近一次停止原因（重连后保留）", padding=8)
@@ -934,7 +951,13 @@ class Tuner:
             if row["phase"] != "DISABLED" or not self.confirmed.get():
                 raise ValueError("需要夹爪失能反馈以及机械 / 方向 / 力通道确认")
             folder = OUTPUTS / uuid.uuid4().hex
-            config = build_config(self.values(), self.enabled(), self.calibration, folder / "run/stream")
+            config = build_config(
+                self.values(),
+                self.enabled(),
+                self.calibration,
+                folder / "run/stream",
+                initial_mode="hybrid" if mode == "hybrid" else "force",
+            )
             config = replace(
                 config,
                 initial_mode=mode,
@@ -1161,7 +1184,7 @@ class Tuner:
                 f"{self.fmt(row.get('force_left_N'))} / {self.fmt(row.get('force_right_N'))} / {self.fmt(row.get('force_mean_N'))} N\n"
                 f"目标 {self.fmt(row.get('force_target_requested_N'))} N | 下发 / 实际位置 "
                 f"{self.fmt(row.get('q_sent_deg'))} / {self.fmt(row.get('q_measured_deg'))}°\n"
-                f"恒速 {self.fmt(row.get('gripper_follow_speed_deg_s'))}°/s → "
+                f"跟随 / 接近上限 {self.fmt(row.get('gripper_follow_speed_deg_s'))}°/s → "
                 f"阈值 {self.fmt(row.get('contact_force_threshold_N'))} N | "
                 f"指定 / 保持目标 {self.fmt(row.get('hold_target_deg'))}° | "
                 f"定位速度 {self.fmt(row.get('hold_speed_deg_s'))}°/s\n"
@@ -1169,7 +1192,7 @@ class Tuner:
                 f"接触回退 {self.fmt(row.get('delta_contact_deg'))}° | "
                 f"原始 / 最终增量 {self.fmt(row.get('delta_raw_deg'))} / {self.fmt(row.get('delta_final_deg'))}°\n"
                 f"目标领先 {self.fmt(row.get('command_lead_deg'))}° | 限制 {', '.join(row.get('clip_flags') or ()) or '无'}\n"
-                f"{timing_description(row)}"
+                f"{timing_description(row)}{hybrid_description(row)}"
             )
         self.update_editability()
         self.update_timing_settings()
@@ -1177,13 +1200,18 @@ class Tuner:
         self.update_optional()
         self.calibration_button.configure(state="disabled" if self.settings_busy() else "normal")
         self.start_button.configure(state="disabled" if self.running else "normal")
+        self.hybrid_button.configure(state="disabled" if self.running else "normal")
         self.read_button.configure(text="断开只读监测" if self.monitoring else "连接 / 只读监测")
         active = self.running and row and not row.get("cleanup_pending")
         self.freeze_button.configure(
-            state="normal" if active and row.get("phase") in ("FORCE_TRACK", "APPROACH") else "disabled"
+            state="normal"
+            if active and row.get("phase") in ("FORCE_TRACK", "APPROACH", "FOLLOW", "FOLLOW_WAIT_CLEAR")
+            else "disabled"
         )
         can_move = not self.running or (
-            active and row.get("phase") in ("FORCE_TRACK", "APPROACH", "POSITION_HOLD")
+            active
+            and row.get("phase")
+            in ("FORCE_TRACK", "APPROACH", "POSITION_HOLD", "FOLLOW", "FOLLOW_WAIT_CLEAR")
         )
         self.approach_button.configure(state="normal" if can_move else "disabled")
         self.position_button.configure(state="normal" if can_move else "disabled")

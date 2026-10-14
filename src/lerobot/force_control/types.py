@@ -8,12 +8,14 @@ from enum import StrEnum
 
 
 class ControlPhase(StrEnum):
-    """Operator-selected motion, with a one-way approach-to-force transition."""
+    """Operator motion and the explicitly started hybrid grasp lifecycle."""
 
     DISABLED = "DISABLED"
     ARMED = "ARMED"
     APPROACH = "APPROACH"
+    FOLLOW = "FOLLOW"
     FORCE_TRACK = "FORCE_TRACK"
+    FOLLOW_WAIT_CLEAR = "FOLLOW_WAIT_CLEAR"
     POSITION_HOLD = "POSITION_HOLD"
     RELEASE = "RELEASE"
     FAULT = "FAULT"
@@ -52,6 +54,23 @@ class ControlInputs:
     joint_received_ns: int | None
     joint_sequence: int | None
     joint_valid: bool = True
+    leader_gripper_deg: float | None = None
+    leader_raw_gripper_deg: float | None = None
+    leader_sequence: int | None = None
+    leader_captured_ns: int | None = None
+
+
+@dataclass(frozen=True)
+class ContactReference:
+    """Contact evidence in follower coordinates, committed only after submission."""
+
+    timestamp_ns: int
+    leader_gripper_deg: float
+    leader_raw_gripper_deg: float
+    leader_sequence: int
+    leader_captured_ns: int
+    follower_gripper_deg: float
+    q_prev_sent_deg: float
 
 
 @dataclass(frozen=True)
@@ -75,6 +94,7 @@ class TeacherProposal:
     transition: str | None = None
     failure_reason: str | None = None
     delta_contact_deg: float = 0.0
+    contact_reference: ContactReference | None = None
 
 
 @dataclass(frozen=True)

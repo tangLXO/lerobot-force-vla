@@ -32,6 +32,10 @@ class RebotArm102LeaderConfig:
 
     baudrate: int = 1_000_000
 
+    # Explicit opt-in for the query-only, checksum-validated transport. Applies
+    # only to connect_readonly(), never to the native teleoperation entry point.
+    readonly_transport: str = "sdk"
+
     # Servo id of each joint on the UART bus.
     joint_ids: dict[str, int] = field(
         default_factory=lambda: {

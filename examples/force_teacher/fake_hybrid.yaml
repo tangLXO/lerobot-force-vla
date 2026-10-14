@@ -1,0 +1,67 @@
+# SIMULATION ONLY: I-P values describe the fake plant; never use as hardware calibration.
+backend: fake
+dry_run: true
+observe_only: false
+allow_motion: false
+explicit_arm: true
+close_sign: 1
+initial_mode: hybrid
+leader_backend: fake
+teacher:
+  controller_type: ip
+  force_target_N: 1.0
+  target_min_N: 0.0
+  target_max_N: 3.0
+  kp_deg_per_N: 0.1
+  ki_deg_per_N_s: 4.0
+  integral_deadband_N: 0.0
+  gripper_follow_speed_deg_s: 2.0
+  contact_force_threshold_N: 0.5
+  release_speed_deg_s: 2.0
+  release_travel_deg: 2.0
+  max_release_time_s: 3.0
+  controller_id: force_teacher_ip
+  profile_id: fake_example_only
+safety:
+  q_min_deg: -10.0
+  q_max_deg: 10.0
+  max_relative_target_deg: 1.0
+  max_command_tracking_error_deg: 2.0
+  max_close_speed_deg_s: 5.0
+  max_open_speed_deg_s: 5.0
+  acceleration_limit_deg_s2: 50.0
+  hard_force_limit_left_N: 5.0
+  hard_force_limit_right_N: 5.0
+  force_max_age_ms: 100.0
+  joint_feedback_max_age_ms: 100.0
+  decision_max_age_ms: 50.0
+  max_dt_s: 0.1
+  fault_action: hold_measured
+  supported_object_bench: true
+  soft_q_min_deg: null
+  soft_q_max_deg: null
+  max_total_travel_deg: null
+  max_run_time_s: null
+  stall_position_tolerance_deg: 0.01
+  stall_timeout_s: 0.5
+runtime:
+  control_hz: 50.0
+  feedback_budget_ms: 5.0
+  tick_deadline_ms: 30.0
+  command_ttl_ms: 200.0
+  force_instance: gripper_force
+  left_feature: left.normal_force
+  right_feature: right.normal_force
+  force_metric: mean_normal
+  software_calibration_id: driver_semantic_N
+  object_id: unspecified
+  contact_condition_id: unspecified
+queue_capacity: 2048
+duration_s: 3.0
+fake_sample_rate_hz: 200.0
+fake_response_time_s: 0.03
+fake_relaxation_N_s: 0.0
+startup_timeout_s: 2.0
+shutdown_timeout_s: 2.0
+raw_queue_capacity: 4096
+trace_join_timeout_s: 2.0

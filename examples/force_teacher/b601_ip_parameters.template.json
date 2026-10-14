@@ -1,6 +1,6 @@
 {
   "format": "b601_ip_tuner_settings",
-  "schema_version": 5,
+  "schema_version": 6,
   "controller_type": "ip",
   "calibration_file": "operator-gripper-calibration.json",
   "values": {
@@ -75,7 +75,13 @@
     "plot_seconds": "20",
     "ipc_poll_ms": "50",
     "object_id": "unspecified",
-    "contact_condition_id": "unspecified"
+    "contact_condition_id": "unspecified",
+    "leader_port": "",
+    "leader_frequency_hz": "50",
+    "leader_baudrate": "1000000",
+    "leader_max_age_s": "0.15",
+    "leader_readonly_transport": "protocol_v1",
+    "leader_read_budget_s": "0.1"
   },
   "enabled": {
     "acceleration": true,
