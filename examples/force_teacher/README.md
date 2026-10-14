@@ -1,5 +1,7 @@
 # FORCE_POS 力控
 
+调参入口：`uv run --no-sync python examples/force_teacher/b601_tuner.py`，或双击同目录的 `run_b601_tuner.bat`。具体流程见 [TUNING.md](TUNING.md)。
+
 夹爪使用 B601 ID7 的 FORCE_POS 位置执行方式，外环使用 X518 双侧当前力均值进行增量 I-P 控制：
 
 `delta = Ki * dt * (target_N - mean_N) - Kp * (mean_N - previous_mean_N)`。

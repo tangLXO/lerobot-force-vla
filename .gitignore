@@ -166,6 +166,10 @@ wandb/
 data/
 outputs/
 
+# Personal FORCE_POS tuning profiles (portable templates live in examples/).
+/b601_ip_parameters.json
+/b601_ip_parameters_communication.json
+
 # Translations
 *.mo
 *.pot
