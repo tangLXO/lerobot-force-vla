@@ -13,6 +13,8 @@ uv run --no-sync python examples/force_teacher/b601_tuner.py --smoke-test
 
 `b601_ip_parameters.template.json` 是待填写的配置模板。根目录的 `b601_ip_parameters.json` 与 `b601_ip_parameters_communication.json` 是本机文件，不纳入版本控制。旧设置可读取迁移，原文件不会自动改写。
 
+参数解析、保存与运行配置构建统一由 `lerobot.force_control.tuning` 提供，界面只负责编辑和提交。新保存格式为 v5：夹爪跟随 / 恒速闭合速度使用 `gripper_follow_speed_deg_s`，接触平均力阈值使用 `contact_force_threshold_N`。v1–v4 JSON 和旧 Teacher YAML 仍可读取；旧 `approach_speed_deg_s` / `approach_force_threshold_N` 分别映射到这两个字段，旧新同名含义字段同时出现会被拒绝，不猜测优先级。旧 kg 目标继续按 9.80665 N/kg 转换；增益、速度、限位及底层协议值均不随迁移改动。
+
 ## 控制与单位
 
 - 目标力及死区为 N；Kp 为 °/N，Ki 为 °/(N·s)。Ki=0 时，恒定的力误差不会产生持续积分闭合。

@@ -78,14 +78,14 @@ def test_owner_approach_switch_position_and_repeat_closure(bench):
         version=2,
         epoch=runtime.epoch,
         value={
-            "approach_speed_deg_s": 2,
-            "approach_force_threshold_N": 0.5,
+            "gripper_follow_speed_deg_s": 2,
+            "contact_force_threshold_N": 0.5,
         },
     )
     row = step(bench, 0.1, 0.1)
     assert row["phase"] == "APPROACH" and not row["label_valid"]
     assert row["delta_final_deg"] == pytest.approx(0.04)
-    assert row["approach_force_threshold_N"] == 0.5
+    assert row["contact_force_threshold_N"] == 0.5
     row = step(bench, 0.3, 0.3)
     assert row["phase"] == "APPROACH"
     assert row["delta_p_deg"] == pytest.approx(-0.02)
@@ -110,12 +110,47 @@ def test_owner_approach_switch_position_and_repeat_closure(bench):
         version=4,
         epoch=runtime.epoch,
         value={
-            "approach_speed_deg_s": 1,
-            "approach_force_threshold_N": 0.4,
+            "gripper_follow_speed_deg_s": 1,
+            "contact_force_threshold_N": 0.4,
         },
     )
     row = step(bench, 0.1, 0.1)
     assert row["phase"] == "APPROACH" and row["hold_target_deg"] is None
+
+
+def test_owner_reads_legacy_approach_request_and_reports_canonical_profile(bench):
+    runtime = bench[0]
+    start(bench)
+    runtime.post(
+        "approach",
+        version=2,
+        epoch=runtime.epoch,
+        value={"approach_speed_deg_s": 2, "approach_force_threshold_N": 0.5},
+    )
+    row = step(bench, 0.1, 0.1)
+    assert row["phase"] == "APPROACH"
+    assert row["gripper_follow_speed_deg_s"] == 2
+    assert row["contact_force_threshold_N"] == 0.5
+    assert "approach_speed_deg_s" not in row["parameter_update"]["teacher"]
+
+
+def test_owner_rejects_conflicting_approach_alias_without_changing_profile(bench):
+    runtime = bench[0]
+    start(bench)
+    previous = runtime.controller.config
+    runtime.post(
+        "approach",
+        version=2,
+        epoch=runtime.epoch,
+        value={
+            "approach_speed_deg_s": 2,
+            "gripper_follow_speed_deg_s": 2,
+            "contact_force_threshold_N": 0.5,
+        },
+    )
+    row = step(bench, 0.1, 0.1)
+    assert row["phase"] == "FAULT"
+    assert runtime.controller.config == previous
 
 
 def test_owner_contact_alignment_preserves_real_submitted_reference_and_finishes_after_slew_limit(
@@ -130,7 +165,7 @@ def test_owner_contact_alignment_preserves_real_submitted_reference_and_finishes
         "approach",
         version=2,
         epoch=runtime.epoch,
-        value={"approach_speed_deg_s": 5, "approach_force_threshold_N": 0.5},
+        value={"gripper_follow_speed_deg_s": 5, "contact_force_threshold_N": 0.5},
     )
     for _ in range(7):
         previous = step(bench, 0.1, 0.1)
@@ -161,8 +196,8 @@ def test_owner_starts_requested_motion_without_intermediate_force_track(bench, m
     runtime.controller.update_config(
         replace(
             runtime.controller.config,
-            approach_speed_deg_s=2,
-            approach_force_threshold_N=0.5,
+            gripper_follow_speed_deg_s=2,
+            contact_force_threshold_N=0.5,
         )
     )
     runtime.post("arm", version=0, epoch=runtime.epoch)
@@ -242,7 +277,7 @@ def test_invalid_position_speed_bundle_is_rejected_without_motion(bench, speed):
 
 @pytest.mark.parametrize(
     "kind,value",
-    [("position", 11), ("approach", {"approach_speed_deg_s": 2, "approach_force_threshold_N": 5})],
+    [("position", 11), ("approach", {"gripper_follow_speed_deg_s": 2, "contact_force_threshold_N": 5})],
 )
 def test_invalid_motion_event_never_submits_new_target(bench, kind, value):
     start(bench)
@@ -260,8 +295,8 @@ def test_approach_checks_raw_overforce_before_mode_switch(bench):
         version=2,
         epoch=runtime.epoch,
         value={
-            "approach_speed_deg_s": 2,
-            "approach_force_threshold_N": 0.5,
+            "gripper_follow_speed_deg_s": 2,
+            "contact_force_threshold_N": 0.5,
         },
     )
     row = step(bench, 5, 0)

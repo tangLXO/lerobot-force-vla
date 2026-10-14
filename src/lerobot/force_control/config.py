@@ -4,7 +4,30 @@
 # ruff: noqa: N803, N815
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
+
+import draccus
+from draccus.parsers.decoding import decode_dataclass
+from draccus.utils import DecodingError
+
+LEGACY_TEACHER_FIELDS = {
+    "approach_speed_deg_s": "gripper_follow_speed_deg_s",
+    "approach_force_threshold_N": "contact_force_threshold_N",
+}
+
+
+def canonicalize_teacher_fields(values: Mapping[str, object]) -> dict[str, object]:
+    """Migrate field names without guessing units, values, or alias precedence."""
+    if not isinstance(values, Mapping):
+        raise ValueError("Teacher parameters must be a mapping")
+    canonical = dict(values)
+    for legacy, current in LEGACY_TEACHER_FIELDS.items():
+        if legacy in canonical:
+            if current in canonical:
+                raise ValueError(f"Conflicting Teacher fields: {legacy} and {current}")
+            canonical[current] = canonical.pop(legacy)
+    return canonical
 
 
 def finite_number(name: str, value: object, *, minimum: float | None = None) -> float:
@@ -41,8 +64,8 @@ class TeacherConfig:
     kp_deg_per_N: float | None = None
     ki_deg_per_N_s: float | None = None
     integral_deadband_N: float = 0.0
-    approach_speed_deg_s: float | None = None
-    approach_force_threshold_N: float | None = None
+    gripper_follow_speed_deg_s: float | None = None
+    contact_force_threshold_N: float | None = None
     release_speed_deg_s: float | None = None
     release_travel_deg: float | None = None
     max_release_time_s: float | None = None
@@ -60,9 +83,9 @@ class TeacherConfig:
         if self.target_min_N > self.target_max_N:
             raise ValueError("target range must be ordered and nonnegative")
         self.validate_target(self.force_target_N)
-        if self.approach_speed_deg_s is not None or self.approach_force_threshold_N is not None:
-            positive("approach_speed_deg_s", self.approach_speed_deg_s)
-            positive("approach_force_threshold_N", self.approach_force_threshold_N)
+        if self.gripper_follow_speed_deg_s is not None or self.contact_force_threshold_N is not None:
+            positive("gripper_follow_speed_deg_s", self.gripper_follow_speed_deg_s)
+            positive("contact_force_threshold_N", self.contact_force_threshold_N)
         for name in ("release_speed_deg_s", "release_travel_deg", "max_release_time_s"):
             positive(name, getattr(self, name))
         for name in ("controller_id", "profile_id"):
@@ -91,6 +114,16 @@ class TeacherConfig:
         }
         values.update(overrides)
         return cls(**values)
+
+
+@draccus.decode.register(TeacherConfig)
+def _decode_teacher_config(raw_value, path):
+    """Read legacy YAML/JSON while the dataclass and all new output stay canonical."""
+    try:
+        canonical = canonicalize_teacher_fields(raw_value)
+    except ValueError as exc:
+        raise DecodingError(path, str(exc)) from exc
+    return decode_dataclass(TeacherConfig, canonical, path)
 
 
 @dataclass(frozen=True)
@@ -195,10 +228,10 @@ def validate_profile(teacher: TeacherConfig, safety: SafetyConfig, close_sign: i
         raise ValueError("target domain must be strictly below both hard per-side force limits")
     if teacher.release_speed_deg_s > safety.max_open_speed_deg_s:
         raise ValueError("release speed must not exceed the configured opening speed limit")
-    if teacher.approach_speed_deg_s is not None:
-        if teacher.approach_speed_deg_s > safety.max_close_speed_deg_s:
+    if teacher.gripper_follow_speed_deg_s is not None:
+        if teacher.gripper_follow_speed_deg_s > safety.max_close_speed_deg_s:
             raise ValueError("approach speed must not exceed the configured closing speed limit")
-        if teacher.approach_force_threshold_N >= min(
+        if teacher.contact_force_threshold_N >= min(
             safety.hard_force_limit_left_N, safety.hard_force_limit_right_N
         ):
             raise ValueError("approach force threshold must be strictly below both hard per-side limits")
@@ -210,7 +243,7 @@ def validate_motion_request(
     """Validate operator motion intent before enabling hardware or changing phase."""
     if mode not in ("force", "approach", "position"):
         raise ValueError("motion mode must be force, approach or position")
-    if mode == "approach" and teacher.approach_speed_deg_s is None:
+    if mode == "approach" and teacher.gripper_follow_speed_deg_s is None:
         raise ValueError("请填写恒速闭合速度和切换平均力阈值")
     if mode == "position":
         goal = finite_number("指定绝对位置 (°)", position_deg)

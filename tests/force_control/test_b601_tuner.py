@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import draccus
 import pytest
 
+from lerobot.force_control import tuning
+
 
 class _Variable:
     def __init__(self, value):
@@ -304,7 +306,7 @@ def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel
     assert restored == (values, enabled, Path(calibration.path).resolve())
     document = json.loads(saved.read_text(encoding="utf-8"))
     assert document["format"] == "b601_ip_tuner_settings"
-    assert document["controller_type"] == "ip" and document["schema_version"] == 4
+    assert document["controller_type"] == "ip" and document["schema_version"] == 5
     assert document["values"]["kp_deg_per_N"] == ""
     assert (
         not {"reference", "executable", "confirmed", "exit_confirmed", "shutdown_evidence"} & document.keys()
@@ -323,16 +325,18 @@ def test_schema_v2_loads_without_guessing_motion_parameters(panel, calibration, 
     assert all(values[key] == "" for key in panel.MOTION_FIELDS)
     config = panel.build_config(values, enabled, calibration, tmp_path / "trace")
     assert config.initial_mode == "force"
-    assert config.teacher.approach_speed_deg_s is None
+    assert config.teacher.gripper_follow_speed_deg_s is None
     assert path.read_bytes() == original
 
 
 def test_motion_parameters_map_to_profile_and_do_not_activate_on_load(panel, calibration, settings, tmp_path):
     values, enabled = settings
-    values.update(approach_speed_deg_s="0.1", approach_force_threshold_N="0.5", position_target_deg="-10")
+    values.update(
+        gripper_follow_speed_deg_s="0.1", contact_force_threshold_N="0.5", position_target_deg="-10"
+    )
     config = panel.build_config(values, enabled, calibration, tmp_path / "trace")
-    assert config.teacher.approach_speed_deg_s == 0.1
-    assert config.teacher.approach_force_threshold_N == 0.5
+    assert config.teacher.gripper_follow_speed_deg_s == 0.1
+    assert config.teacher.contact_force_threshold_N == 0.5
     assert config.initial_mode == "force" and config.initial_position_deg is None
 
 
@@ -348,7 +352,7 @@ def test_schema_v3_preserves_settings_without_guessing_position_speed(panel, cal
     assert values == {**document["values"], "position_speed_deg_s": ""}
     assert path.read_bytes() == original
     values["position_speed_deg_s"] = "0.7"
-    saved = panel.save_settings(tmp_path / "v4.json", values, enabled, calibration.path)
+    saved = panel.save_settings(tmp_path / "v5.json", values, enabled, calibration.path)
     assert panel.read_settings(saved)[0]["position_speed_deg_s"] == "0.7"
 
 
@@ -360,10 +364,10 @@ def test_buttons_send_atomic_approach_and_absolute_position(
     app.config = panel.build_config(*settings, calibration, tmp_path / "trace")
     sent = []
     app.live = SimpleNamespace(submit=lambda *args: sent.append(args))
-    app.fields["approach_speed_deg_s"].set("0.1")
-    app.fields["approach_force_threshold_N"].set("0.5")
+    app.fields["gripper_follow_speed_deg_s"].set("0.1")
+    app.fields["contact_force_threshold_N"].set("0.5")
     app.approach()
-    assert sent[-1] == ("approach", {"approach_speed_deg_s": 0.1, "approach_force_threshold_N": 0.5})
+    assert sent[-1] == ("approach", {"gripper_follow_speed_deg_s": 0.1, "contact_force_threshold_N": 0.5})
     app.fields["position_target_deg"].set("-10")
     app.fields["position_speed_deg_s"].set("0.7")
     app.move_to_position()
@@ -486,7 +490,7 @@ def test_legacy_kg_parameters_preserve_force_and_show_conversion(
     saved = tmp_path / "newtons.json"
     stopped_panel.save_parameters_file(saved)
     document = json.loads(saved.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 4
+    assert document["schema_version"] == 5
     assert not {"target_kg", "target_min_kg", "target_max_kg"} & document["values"].keys()
     assert panel.read_settings(saved)[0] == values
     assert path.read_bytes() == original
@@ -532,7 +536,7 @@ def test_failed_atomic_parameter_replace_preserves_previous_file(
         assert Path(destination) == path
         raise OSError("replace denied")
 
-    monkeypatch.setattr(panel.os, "replace", reject_replace)
+    monkeypatch.setattr(tuning.os, "replace", reject_replace)
     with pytest.raises(OSError, match="replace denied"):
         panel.save_settings(path, values, enabled, calibration.path)
     assert path.read_bytes() == previous and set(tmp_path.iterdir()) == files

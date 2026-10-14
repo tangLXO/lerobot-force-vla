@@ -1,6 +1,6 @@
 {
   "format": "b601_ip_tuner_settings",
-  "schema_version": 4,
+  "schema_version": 5,
   "controller_type": "ip",
   "calibration_file": "operator-gripper-calibration.json",
   "values": {
@@ -8,8 +8,8 @@
     "kp_deg_per_N": "",
     "ki_deg_per_N_s": "",
     "integral_deadband_N": "0",
-    "approach_speed_deg_s": "",
-    "approach_force_threshold_N": "",
+    "gripper_follow_speed_deg_s": "",
+    "contact_force_threshold_N": "",
     "position_target_deg": "",
     "position_speed_deg_s": "",
     "close_sign": "",

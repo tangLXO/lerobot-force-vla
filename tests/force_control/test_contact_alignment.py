@@ -14,7 +14,7 @@ from tests.force_control.helpers import inputs, submit
 def approaching(sign=1, **config):
     teacher = ForceTeacher(
         TeacherConfig.fake(
-            ki_deg_per_N_s=0, approach_speed_deg_s=2, approach_force_threshold_N=0.5, **config
+            ki_deg_per_N_s=0, gripper_follow_speed_deg_s=2, contact_force_threshold_N=0.5, **config
         ),
         sign,
     )

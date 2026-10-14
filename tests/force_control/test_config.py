@@ -1,10 +1,18 @@
 """Configuration dimensions and optional limits use synthetic values only."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
+import draccus
 import pytest
 
-from lerobot.force_control.config import SafetyConfig, TeacherConfig, validate_close_sign, validate_profile
+from lerobot.force_control.config import (
+    LEGACY_TEACHER_FIELDS,
+    SafetyConfig,
+    TeacherConfig,
+    canonicalize_teacher_fields,
+    validate_close_sign,
+    validate_profile,
+)
 
 
 def test_defaults_never_supply_hardware_gains_or_limits():
@@ -96,3 +104,45 @@ def test_target_and_release_share_safety_envelope():
     for changed in (replace(safety, hard_force_limit_right_N=3), replace(safety, max_open_speed_deg_s=1)):
         with pytest.raises(ValueError):
             validate_profile(teacher, changed, 1)
+
+
+def test_legacy_teacher_yaml_decodes_nested_and_encodes_only_canonical_names(tmp_path):
+    from lerobot.scripts.lerobot_force_teacher import ForceTeacherRunConfig
+
+    path = tmp_path / "legacy.yaml"
+    path.write_text(
+        "teacher:\n  approach_speed_deg_s: 0.2\n  approach_force_threshold_N: 0.5\n",
+        encoding="utf-8",
+    )
+    original = path.read_bytes()
+    config = draccus.parse(ForceTeacherRunConfig, config_path=path, args=[])
+    assert config.teacher.gripper_follow_speed_deg_s == 0.2
+    assert config.teacher.contact_force_threshold_N == 0.5
+    encoded = draccus.encode(config)["teacher"]
+    assert not LEGACY_TEACHER_FIELDS.keys() & encoded.keys()
+    assert encoded == asdict(config.teacher)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("legacy,current", LEGACY_TEACHER_FIELDS.items())
+@pytest.mark.parametrize("value", [0.2, None])
+def test_legacy_and_canonical_teacher_names_conflict_even_when_values_match(legacy, current, value):
+    payload = {legacy: value, current: value}
+    with pytest.raises(ValueError, match="Conflicting Teacher fields"):
+        canonicalize_teacher_fields(payload)
+    with pytest.raises(draccus.utils.DecodingError, match="Conflicting Teacher fields"):
+        draccus.decode(TeacherConfig, payload)
+    assert payload == {legacy: value, current: value}
+
+
+def test_canonical_teacher_config_round_trip_and_replace_have_one_source_of_truth():
+    original = TeacherConfig.fake(gripper_follow_speed_deg_s=0.2, contact_force_threshold_N=0.5)
+    changed = replace(original, gripper_follow_speed_deg_s=0.3)
+    assert changed.gripper_follow_speed_deg_s == 0.3
+    assert draccus.decode(TeacherConfig, draccus.encode(changed)) == changed
+    assert not LEGACY_TEACHER_FIELDS.keys() & asdict(changed).keys()
+
+
+def test_legacy_teacher_decode_remains_strict_about_unknown_fields():
+    with pytest.raises(draccus.utils.DecodingError, match="unknown_gain"):
+        draccus.decode(TeacherConfig, {"approach_speed_deg_s": 0.2, "unknown_gain": 1})

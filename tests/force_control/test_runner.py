@@ -68,7 +68,7 @@ def test_new_start_modes_flow_through_runner_trace_and_cleanup(tmp_path, mode):
     config.initial_mode = mode
     config.initial_position_deg = -0.1 if mode == "position" else None
     config.initial_position_speed_deg_s = 0.5 if mode == "position" else None
-    config.teacher = replace(config.teacher, approach_speed_deg_s=5, approach_force_threshold_N=0.05)
+    config.teacher = replace(config.teacher, gripper_follow_speed_deg_s=5, contact_force_threshold_N=0.05)
     config.duration_s = 0.6
     report = runner.run(config)
     assert report["valid"], report["errors"]

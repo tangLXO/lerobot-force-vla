@@ -17,7 +17,9 @@ from tests.force_control.helpers import inputs, submit
 
 
 def approach_teacher(sign=1):
-    teacher = ForceTeacher(TeacherConfig.fake(approach_speed_deg_s=2, approach_force_threshold_N=0.5), sign)
+    teacher = ForceTeacher(
+        TeacherConfig.fake(gripper_follow_speed_deg_s=2, contact_force_threshold_N=0.5), sign
+    )
     teacher.arm()
     teacher.start(0, 0, mode="approach")
     return teacher
@@ -139,11 +141,11 @@ def test_failed_transition_submission_faults_and_never_enters_force_tracking():
 def test_live_threshold_change_uses_current_sample_and_preserves_one_way_transition():
     teacher = approach_teacher()
     submit(teacher, teacher.propose(inputs(0.2)))
-    teacher.update_config(replace(teacher.config, approach_force_threshold_N=0.2))
+    teacher.update_config(replace(teacher.config, contact_force_threshold_N=0.2))
     proposal = teacher.propose(inputs(0.2))
     assert proposal.next_phase == ControlPhase.FORCE_TRACK and proposal.delta_p_deg == 0
     submit(teacher, proposal)
-    teacher.update_config(replace(teacher.config, approach_force_threshold_N=0.8))
+    teacher.update_config(replace(teacher.config, contact_force_threshold_N=0.8))
     assert teacher.propose(inputs(0.2)).next_phase == ControlPhase.FORCE_TRACK
 
 
@@ -172,12 +174,12 @@ def test_position_preempts_approach_and_holds_one_absolute_goal():
 @pytest.mark.parametrize(
     "override",
     [
-        {"approach_speed_deg_s": 0},
-        {"approach_speed_deg_s": float("nan")},
-        {"approach_speed_deg_s": 6},
-        {"approach_force_threshold_N": None},
-        {"approach_force_threshold_N": 0},
-        {"approach_force_threshold_N": 5},
+        {"gripper_follow_speed_deg_s": 0},
+        {"gripper_follow_speed_deg_s": float("nan")},
+        {"gripper_follow_speed_deg_s": 6},
+        {"contact_force_threshold_N": None},
+        {"contact_force_threshold_N": 0},
+        {"contact_force_threshold_N": 5},
     ],
 )
 def test_approach_configuration_rejects_invalid_or_unsafe_values(override):

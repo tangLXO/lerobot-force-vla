@@ -91,7 +91,7 @@ class ForceTeacher:
             raise RuntimeError("start requires explicit arm")
         if mode not in ("force", "approach", "position"):
             raise ValueError("unknown start mode")
-        if mode == "approach" and self.config.approach_speed_deg_s is None:
+        if mode == "approach" and self.config.gripper_follow_speed_deg_s is None:
             raise ValueError("approach requires explicit speed and force threshold")
         if mode == "position":
             finite_number("position_deg", position_deg)
@@ -114,7 +114,7 @@ class ForceTeacher:
         """Explicitly re-enter constant-speed closure; force loss never re-enters it."""
         if self.phase not in (ControlPhase.FORCE_TRACK, ControlPhase.POSITION_HOLD, ControlPhase.APPROACH):
             raise RuntimeError("approach requires an active non-faulted controller")
-        if self.config.approach_speed_deg_s is None:
+        if self.config.gripper_follow_speed_deg_s is None:
             raise ValueError("approach requires explicit speed and force threshold")
         self._validate_reference(now_ns, q_measured_deg)
         self._reset()
@@ -211,7 +211,7 @@ class ForceTeacher:
         config.validate()
         if self.phase == ControlPhase.FAULT:
             raise RuntimeError("a parameter update cannot clear a fault")
-        if self.phase == ControlPhase.APPROACH and config.approach_speed_deg_s is None:
+        if self.phase == ControlPhase.APPROACH and config.gripper_follow_speed_deg_s is None:
             raise ValueError("cannot remove approach parameters during closure")
         gains_changed = (config.kp_deg_per_N, config.ki_deg_per_N_s) != (
             self.config.kp_deg_per_N,
@@ -271,7 +271,7 @@ class ForceTeacher:
         delta_i = delta_p = delta_contact = delta = 0.0
         next_phase = self.phase
         tag = "inactive"
-        if self.phase == ControlPhase.APPROACH and inputs.force.mean_N >= cfg.approach_force_threshold_N:
+        if self.phase == ControlPhase.APPROACH and inputs.force.mean_N >= cfg.contact_force_threshold_N:
             next_phase = ControlPhase.FORCE_TRACK
         # Keep measurement feedback continuous through contact; only the forward drive changes.
         if (
@@ -294,7 +294,7 @@ class ForceTeacher:
                 else ("low_force_recovery" if error > 0 else "high_force_recovery")
             )
         elif self.phase == ControlPhase.APPROACH:
-            advance = cfg.approach_speed_deg_s * inputs.dt_control_s
+            advance = cfg.gripper_follow_speed_deg_s * inputs.dt_control_s
             # Falling force must not accelerate recontact beyond the requested approach speed.
             # Negative increments remain available, with opening limits enforced by Safety.
             delta = min(advance, advance + delta_p)

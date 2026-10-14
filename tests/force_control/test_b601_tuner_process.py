@@ -74,9 +74,9 @@ def test_spawn_isolates_owner_and_carries_new_parameters_and_priority_stop(bridg
         wait_for(lambda: live.applied[0] == "freeze", live)
         live.submit("step", -0.01)
         wait_for(lambda: live.applied == ("step", -0.01), live)
-        live.submit("approach", {"approach_speed_deg_s": 1, "approach_force_threshold_N": 0.5})
+        live.submit("approach", {"gripper_follow_speed_deg_s": 1, "contact_force_threshold_N": 0.5})
         wait_for(lambda: live.applied[0] == "approach", live)
-        assert live.applied[1]["approach_force_threshold_N"] == 0.5
+        assert live.applied[1]["contact_force_threshold_N"] == 0.5
         position = {"position_deg": -2, "position_speed_deg_s": 0.7}
         live.submit("position", position)
         wait_for(lambda: live.applied == ("position", position), live)

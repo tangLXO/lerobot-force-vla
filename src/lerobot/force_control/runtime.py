@@ -11,7 +11,13 @@ import threading
 import time
 from dataclasses import asdict, dataclass, replace
 
-from .config import finite_number, positive, validate_motion_request, validate_profile
+from .config import (
+    canonicalize_teacher_fields,
+    finite_number,
+    positive,
+    validate_motion_request,
+    validate_profile,
+)
 from .types import ControlInputs, ControlPhase, ForceObservation
 
 DEFAULT_FEEDBACK_BUDGET_MS = 15.0
@@ -449,12 +455,13 @@ class ForceRuntime:
             self.last_success_tick = None
         elif command.kind in ("approach", "position"):
             if command.kind == "approach":
-                if not isinstance(command.value, dict) or set(command.value) != {
-                    "approach_speed_deg_s",
-                    "approach_force_threshold_N",
+                request = canonicalize_teacher_fields(command.value)
+                if set(request) != {
+                    "gripper_follow_speed_deg_s",
+                    "contact_force_threshold_N",
                 }:
                     raise ValueError("approach requires explicit speed and force threshold")
-                teacher = replace(self.controller.config, **command.value)
+                teacher = replace(self.controller.config, **request)
                 validate_profile(teacher, self.safety.config, self.controller.close_sign)
                 validate_motion_request(teacher, self.safety.config, "approach")
                 self.controller.update_config(teacher)
@@ -488,8 +495,8 @@ class ForceRuntime:
                 "kp_deg_per_N",
                 "ki_deg_per_N_s",
                 "integral_deadband_N",
-                "approach_speed_deg_s",
-                "approach_force_threshold_N",
+                "gripper_follow_speed_deg_s",
+                "contact_force_threshold_N",
             }
             live_safety = {"max_close_speed_deg_s", "max_open_speed_deg_s", "acceleration_limit_deg_s2"}
             if any(
@@ -979,8 +986,8 @@ class ForceRuntime:
             hold_target_deg=self.controller.hold_target_deg,
             hold_speed_deg_s=self.controller.hold_speed_deg_s,
             contact_alignment_pending=self.controller.contact_alignment_pending,
-            approach_speed_deg_s=self.controller.config.approach_speed_deg_s,
-            approach_force_threshold_N=self.controller.config.approach_force_threshold_N,
+            gripper_follow_speed_deg_s=self.controller.config.gripper_follow_speed_deg_s,
+            contact_force_threshold_N=self.controller.config.contact_force_threshold_N,
             control_reference_reset_ns=self.last_tick_start
             if self.event in ("start", "freeze", "resume", "approach", "position")
             else None,
