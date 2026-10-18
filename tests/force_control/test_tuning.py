@@ -21,6 +21,29 @@ def test_shared_settings_import_without_tk_or_example_modules():
     subprocess.run([sys.executable, "-c", script], check=True, timeout=30)
 
 
+def test_v6_settings_load_without_overwriting_file_or_selecting_arm_limits(settings, calibration, tmp_path):
+    document = tuning.settings_document(*settings, calibration.path)
+    document["schema_version"] = 6
+    document.pop("arm_settings")
+    path = tmp_path / "legacy-v6.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    original = path.read_bytes()
+    arms = []
+    values, enabled, _ = tuning.read_settings(path, on_arm_settings=arms.append)
+    assert (values, enabled) == settings
+    assert arms == [{}] and path.read_bytes() == original
+
+
+@pytest.mark.parametrize("bad", [{"supported_arm": True}, {"operator": {}, "joints": {}}, "invalid"])
+def test_saved_arm_settings_reject_unknown_fields_and_activation_state(settings, calibration, tmp_path, bad):
+    document = tuning.settings_document(*settings, calibration.path)
+    document["arm_settings"] = bad
+    path = tmp_path / "invalid-arm-settings.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="全臂参数"):
+        tuning.read_settings(path)
+
+
 def test_panel_uses_the_shared_functions_and_schema(panel):
     for name in ("FIELDS", "build_config", "parse_values", "read_settings", "save_settings", "sensor_config"):
         assert getattr(panel, name) is getattr(tuning, name)
@@ -47,7 +70,7 @@ def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
     assert (path.read_bytes(), path.stat().st_mtime_ns) == (original, mtime)
     saved = tuning.save_settings(tmp_path / "canonical.json", restored, switches, source)
     encoded = json.loads(saved.read_text(encoding="utf-8"))
-    assert encoded["schema_version"] == 6
+    assert encoded["schema_version"] == 8
     assert encoded["values"] == values
     assert not LEGACY_TEACHER_FIELDS.keys() & encoded["values"].keys()
     config = tuning.build_config(restored, switches, calibration, tmp_path / "trace")
@@ -119,3 +142,19 @@ def test_hybrid_panel_explains_mapped_leader_and_committed_contact_reference(pan
         }
     )
     assert "主爪映射 -60°" in text and "接触从爪参考 -90°" in text
+
+
+def test_working_command_profile_is_inside_independent_calibration_hard_limits(
+    panel, calibration, settings, tmp_path
+):
+    values, enabled = settings
+    values.update(soft_q_min_deg="-30", soft_q_max_deg="30")
+    enabled["soft_limits"] = True
+    config = tuning.build_config(values, enabled, calibration, tmp_path / "unused")
+    assert (config.safety.q_min_deg, config.safety.q_max_deg) == (-40, 40)
+    assert (config.safety.soft_q_min_deg, config.safety.soft_q_max_deg) == (-30, 30)
+    profile = config.b601.control.profiles[0]
+    assert (profile.minimum_deg, profile.maximum_deg) == (-30, 30)
+    text = panel.position_range_description(config)
+    assert "工作目标范围 [-30, 30]°" in text and "校准硬保护范围 [-40, 40]°" in text
+    assert not (tmp_path / "unused").exists()

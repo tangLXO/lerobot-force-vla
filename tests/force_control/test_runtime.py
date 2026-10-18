@@ -11,8 +11,9 @@ from lerobot.force_control.runtime import ForceRuntime, LatestMailbox, OwnerComm
 from lerobot.force_control.safety import SafetySupervisor
 from lerobot.force_control.teacher import ForceTeacher
 from lerobot.force_control.types import ControlPhase
+from lerobot.robots.rebot_b601_follower.control_protocol import encode_position
 from lerobot.scripts.lerobot_force_teacher import ForceTeacherRunConfig
-from tests.force_control.hardware_helpers import ManualSensor, MemoryTrace
+from tests.force_control.hardware_helpers import ManualSensor, MemoryTrace, profile
 
 
 class Clock:
@@ -116,6 +117,52 @@ def test_owner_approach_switch_position_and_repeat_closure(bench):
     )
     row = step(bench, 0.1, 0.1)
     assert row["phase"] == "APPROACH" and row["hold_target_deg"] is None
+
+
+def test_endpoint_wire_rounding_is_the_next_tick_reference_without_rewriting_accepted_target(
+    bench, monkeypatch
+):
+    runtime, device, _, _, _ = bench
+    device.plant.position_deg = device.plant.target_deg = -269.0
+    runtime.safety.config = replace(
+        runtime.safety.config,
+        q_min_deg=-270,
+        q_max_deg=0,
+        max_relative_target_deg=100,
+        max_command_tracking_error_deg=100,
+        max_open_speed_deg_s=1000,
+        acceleration_limit_deg_s2=None,
+    )
+    configured = replace(profile(), minimum_deg=-270, maximum_deg=0, max_relative_deg=100)
+    original_send, original_commit = device.send_gripper_position, runtime.controller.commit
+    commits = []
+
+    def wire_send(position, *, feedback_snapshot):
+        encoded = encode_position(
+            7, position, feedback_snapshot.get("gripper").position_deg, configured, (12.5, 30, 10)
+        )
+        receipt = original_send(encoded.wire_position_deg, feedback_snapshot=feedback_snapshot)
+        result = replace(receipt.get("gripper"), candidate_deg=position, clipped_deg=encoded.clipped_deg)
+        return replace(receipt, results=(result,))
+
+    def remember_commit(proposal, **kwargs):
+        commits.append(kwargs)
+        return original_commit(proposal, **kwargs)
+
+    monkeypatch.setattr(device, "send_gripper_position", wire_send)
+    monkeypatch.setattr(runtime.controller, "commit", remember_commit)
+    start(bench)
+    runtime.post("position", version=2, epoch=runtime.epoch, value=-270.0)
+    row = step(bench)
+    assert row["phase"] == "POSITION_HOLD" and row["q_after_safety_deg"] == -270
+    wire = row["q_sent_deg"]
+    assert -270 < wire < -269.9999
+    assert runtime.last_sent == runtime.last_submitted["gripper"] == wire
+    assert commits[-1]["q_accepted_deg"] == -270 and commits[-1]["q_sent_deg"] == wire
+    assert "driver_clip" not in row["clip_flags"]
+    next_row = step(bench)
+    assert next_row["phase"] == "POSITION_HOLD"
+    assert next_row["q_prev_sent_deg"] == next_row["q_sent_deg"] == wire
 
 
 def test_owner_reads_legacy_approach_request_and_reports_canonical_profile(bench):

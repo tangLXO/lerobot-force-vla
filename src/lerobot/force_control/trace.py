@@ -20,9 +20,13 @@ import queue
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from .capture_annotations import ANNOTATION_SCHEMA, annotate_capture
+from .types import ControlPhase
 
 if TYPE_CHECKING:
     from lerobot.sensors import Sensor
@@ -69,6 +73,29 @@ REQUIRED_FIELDS = frozenset(
         "force_mean_N",
         "force_target_effective_N",
         "force_target_requested_N",
+    }
+)
+
+CAPTURE_INPUT_FIELDS = frozenset(
+    {
+        "phase_at_tick_start",
+        "phase_before",
+        "force_valid",
+        "force_max_age_ms",
+        "joint_feedback_max_age_ms",
+        "contact_force_threshold_N",
+    }
+)
+CAPTURE_ANNOTATION_FIELDS = frozenset(
+    {
+        "annotation_schema",
+        "phase_after",
+        "phase_changed",
+        "capture_stage",
+        "contact_estimate",
+        "contact_estimate_valid",
+        "contact_estimate_rule",
+        "action_label_valid",
     }
 )
 
@@ -480,7 +507,9 @@ def validate_trace(
         ):
             errors.append("Terminal manifest disagrees with last control phase")
         _validate_rows(manifest, control, raw, errors)
+        _validate_capture_annotations(manifest, control, raw, errors)
         report["statistics"] = _statistics(control, raw, band_n=band_n, recovery_dwell_s=recovery_dwell_s)
+        report["capture_summary"] = _capture_summary(manifest, control)
         report["run_uid"] = manifest.get("run_uid")
         report["complete"] = manifest.get("complete")
         report["terminal_state"] = manifest.get("terminal_state")
@@ -488,6 +517,116 @@ def validate_trace(
         errors.append(f"Malformed trace: {type(exc).__name__}: {exc}")
     report["valid"] = not errors
     return report
+
+
+def _validate_capture_annotations(
+    manifest: dict[str, Any], control: list[dict[str, Any]], raw: list[dict[str, Any]], errors: list[str]
+) -> None:
+    """Verify declared annotations without adding them to historical evidence."""
+    metadata = manifest.get("metadata", {})
+    declared = metadata.get("capture_annotation_schema")
+    row_declared = any(CAPTURE_ANNOTATION_FIELDS.intersection(row) for row in control)
+    if "capture_annotation_schema" not in metadata and not row_declared:
+        return
+    if declared != ANNOTATION_SCHEMA:
+        errors.append("Unsupported/missing capture annotation schema in metadata")
+    phases = {str(phase) for phase in ControlPhase}
+    raw_by_sequence = {sample.get("sequence"): sample for sample in raw}
+    required = CAPTURE_INPUT_FIELDS | CAPTURE_ANNOTATION_FIELDS
+    for row in control:
+        prefix = f"Tick {row.get('tick_id')}: "
+        missing = required - row.keys()
+        if missing:
+            errors.append(prefix + f"missing capture annotation fields: {sorted(missing)}")
+            continue
+        for field in ("phase_at_tick_start", "phase_before", "phase_after"):
+            if not isinstance(row[field], str) or row[field] not in phases:
+                errors.append(prefix + f"unrecognized capture phase: {field}")
+        for field in ("force_valid", "phase_changed", "contact_estimate_valid", "action_label_valid"):
+            if type(row[field]) is not bool:
+                errors.append(prefix + f"{field} must be a boolean")
+        for field in ("force_max_age_ms", "joint_feedback_max_age_ms"):
+            if not _finite(row[field]) or row[field] <= 0:
+                errors.append(prefix + f"capture annotations require positive finite {field}")
+        threshold = row["contact_force_threshold_N"]
+        if threshold is not None and (not _finite(threshold) or threshold <= 0):
+            errors.append(prefix + "contact_force_threshold_N must be null or positive finite")
+        sample = raw_by_sequence.get(row.get("force_sequence"))
+        if row["force_valid"] is not (sample is not None and sample.get("is_valid") is True):
+            errors.append(prefix + "force_valid disagrees with selected raw evidence")
+        expected = annotate_capture(row)
+        for field, value in expected.items():
+            if type(row[field]) is not type(value) or row[field] != value:
+                errors.append(prefix + f"capture annotation mismatch: {field}")
+
+
+def _capture_summary(manifest: dict[str, Any], control: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe recorded coverage, never physical completion or training acceptance."""
+    declared = manifest.get("metadata", {}).get("capture_annotation_schema")
+    annotated = [row for row in control if row.get("annotation_schema") == ANNOTATION_SCHEMA]
+    stage_counts = Counter(row.get("capture_stage", "unknown") for row in annotated)
+    transitions: Counter[str] = Counter()
+    release_epochs: set[int] = set()
+    completed_releases = 0
+    for row in annotated:
+        before, after = row.get("phase_before"), row.get("phase_after")
+        phases = (row.get("phase_at_tick_start"), before, after)
+        for left, right in zip(phases, phases[1:], strict=False):
+            if isinstance(left, str) and isinstance(right, str) and left != right:
+                transitions[f"{left}->{right}"] += 1
+        epoch = row.get("epoch")
+        normal = (
+            type(epoch) is int
+            and row.get("failure_reason") is None
+            and row.get("safety_override") is False
+            and row.get("deadline_miss") is False
+        )
+        if normal and before == after == "RELEASE" and row.get("send_status") == "submitted":
+            release_epochs.add(epoch)
+        if (
+            normal
+            and epoch in release_epochs
+            and before == "RELEASE"
+            and after == "DISABLED"
+            and row.get("transition") == "RELEASE->DISABLED"
+            and row.get("send_status") == "none"
+        ):
+            completed_releases += 1
+            release_epochs.discard(epoch)
+        elif not normal or after != "RELEASE":
+            release_epochs.discard(epoch)
+    observed = {
+        stage: stage_counts[stage] > 0
+        for stage in ("approach", "contact_transition", "force_control", "release")
+    }
+
+    def labels(field: str) -> dict[str, int]:
+        return {
+            "valid": sum(row.get(field) is True for row in control),
+            "invalid": sum(row.get(field) is False for row in control),
+            "unavailable": sum(type(row.get(field)) is not bool for row in control),
+        }
+
+    return {
+        "available": declared == ANNOTATION_SCHEMA,
+        "annotation_schema": declared,
+        "file_complete": manifest.get("complete") is True,
+        "control_tick_count": len(control),
+        "annotated_tick_count": len(annotated),
+        "phase_counts": dict(Counter(row.get("phase", "unknown") for row in control)),
+        "phase_changed_tick_count": sum(row.get("phase_changed") is True for row in annotated),
+        "phase_transition_count": sum(transitions.values()),
+        "phase_transition_counts": dict(transitions),
+        "capture_stage_counts": dict(stage_counts),
+        "contact_estimate_counts": dict(Counter(row.get("contact_estimate", "unknown") for row in annotated)),
+        "force_label_counts": labels("label_valid"),
+        "action_label_counts": labels("action_label_valid"),
+        "observed_stages": observed,
+        "all_stages_observed": all(observed.values()),
+        "normal_release_completed": completed_releases > 0,
+        "normal_release_completed_count": completed_releases,
+        "software_evidence_only": True,
+    }
 
 
 def _validate_b601_io(metadata: dict, control: list[dict], errors: list[str]) -> None:
@@ -506,9 +645,30 @@ def _validate_b601_io(metadata: dict, control: list[dict], errors: list[str]) ->
         or disposition.get("hardware_stop_confirmed") is not False
     ):
         errors.append("B601 shutdown lacks truthful software disposition evidence")
-    streams = [row.get("device_io_evidence") for row in control]
+    streams = []
+    for row in control:
+        startup = row.get("startup_evidence")
+        if isinstance(startup, dict):
+            stages = startup.get("io_stages", [])
+            if not isinstance(stages, list):
+                errors.append("B601 startup I/O stages are malformed")
+            else:
+                # Startup drains its bounded audit between disabled preloads
+                # and enables. These are canonical events between this row's
+                # preceding tick and its ordinary end-of-tick audit.
+                streams.extend(stages)
+        streams.append(row.get("device_io_evidence"))
     streams.append(shutdown.get("device_io_evidence"))
     sequence, previous_time = 1, -1
+    io_errors = set()
+
+    def io_error(message):
+        # A single omitted range must not create one repeated error per later
+        # event. Keep strict rejection while bounding the diagnostic output.
+        if message not in io_errors:
+            io_errors.add(message)
+            errors.append(message)
+
     for stream in streams:
         if (
             not isinstance(stream, dict)
@@ -517,17 +677,23 @@ def _validate_b601_io(metadata: dict, control: list[dict], errors: list[str]) ->
             or stream.get("hardware_ack") != "unknown"
             or not isinstance(stream.get("events"), list)
         ):
-            errors.append("B601 I/O audit is missing, incomplete or misrepresents correlation")
+            io_error("B601 I/O audit is missing, incomplete or misrepresents correlation")
             continue
         for event in stream["events"]:
+            if not isinstance(event, dict):
+                io_error("B601 I/O event is malformed")
+                continue
             timestamp = event.get("timestamp_ns")
             kind = event.get("kind")
             if event.get("sequence") != sequence or type(timestamp) is not int or timestamp < previous_time:
-                errors.append("B601 I/O event sequence/time is not contiguous and monotonic")
+                io_error("B601 I/O event sequence/time is not contiguous and monotonic")
             sequence += 1
             if type(timestamp) is int:
                 previous_time = timestamp
-            data = bytes.fromhex(event.get("data_hex", ""))
+            try:
+                data = bytes.fromhex(event.get("data_hex", ""))
+            except (ValueError, TypeError):
+                data = b""
             if not data or kind not in {
                 "query_attempt",
                 "query_rx",
@@ -535,12 +701,14 @@ def _validate_b601_io(metadata: dict, control: list[dict], errors: list[str]) ->
                 "command_rx",
                 "pre_query_unattributed_rx",
                 "parameter_write_unattributed_rx",
+                "full_validation_stop_rx",
+                "post_disable_unexpected_rx",
             }:
-                errors.append("B601 I/O event has malformed kind or bytes")
+                io_error("B601 I/O event has malformed kind or bytes")
             if kind in {"query_attempt", "command_attempt"} and (
                 len(data) != 30 or data[:4] != b"\x55\xaa\x1e\x03"
             ):
-                errors.append("B601 I/O TX event is not a reviewed bridge packet")
+                io_error("B601 I/O TX event is not a reviewed bridge packet")
     if sequence == 1:
         errors.append("B601 I/O audit contains no transport evidence")
 

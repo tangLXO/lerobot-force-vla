@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from .config import positive
 from .hardware_types import JointSnapshot
 from .runtime import ArmIntent, ForceRuntime
+from .telemetry import control_row_summary
 from .types import ControlPhase
 
 
@@ -24,6 +26,28 @@ class OwnerSnapshot:
     epoch: int
     mode: str
     tick_id: int
+
+
+class OwnerSubscription:
+    """Bounded completed-tick handoff; overflow invalidates capture, never blocks I/O."""
+
+    def __init__(self, capacity: int):
+        """Allocate a fixed queue and a latched capture-only error."""
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("Owner subscription capacity must be a positive integer")
+        self.queue: queue.Queue[OwnerSnapshot] = queue.Queue(maxsize=capacity)
+        self.error: str | None = None
+        self.closed = False
+
+    def check_health(self) -> None:
+        """Reject a capture after any completed tick was lost."""
+        if self.error is not None:
+            raise RuntimeError(self.error)
+
+    def get(self, timeout: float = 0.05) -> OwnerSnapshot:
+        """Read the next detached completed tick with a bounded wait."""
+        self.check_health()
+        return self.queue.get(timeout=timeout)
 
 
 class OwnerService:
@@ -42,6 +66,21 @@ class OwnerService:
         self._arm_version = -1
         self._reset_version = None
         self._submission_lock = threading.Lock()
+        self._subscriptions: list[OwnerSubscription] = []
+
+    def subscribe(self, capacity: int = 128) -> OwnerSubscription:
+        """Subscribe to future complete ticks without reading any hardware."""
+        subscription = OwnerSubscription(capacity)
+        with self._condition:
+            self._subscriptions.append(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription: OwnerSubscription) -> None:
+        """Freeze a subscription boundary so a recorder can drain before saving."""
+        with self._condition:
+            if subscription in self._subscriptions:
+                self._subscriptions.remove(subscription)
+            subscription.closed = True
 
     @property
     def is_running(self):
@@ -76,7 +115,7 @@ class OwnerService:
 
     def _publish(self, row):
         snapshot = OwnerSnapshot(
-            copy.deepcopy(row),
+            copy.deepcopy(control_row_summary(row)),
             self.runtime.latest_joint_snapshot,
             tuple(self.runtime.last_submitted.items()),
             self.runtime.epoch,
@@ -90,6 +129,14 @@ class OwnerService:
             else:
                 self._fault_origin = None
             self._latest = snapshot
+            for subscription in self._subscriptions:
+                if subscription.error is None:
+                    try:
+                        subscription.queue.put_nowait(copy.deepcopy(snapshot))
+                    except queue.Full:
+                        subscription.error = (
+                            "Completed control-tick queue overflow; demonstration is incomplete"
+                        )
             self._condition.notify_all()
 
     def _run(self):
@@ -111,7 +158,7 @@ class OwnerService:
                     remaining = (deadline - time.perf_counter_ns()) / 1e9
                     if remaining <= 0:
                         break
-                    time.sleep(min(0.005, remaining))
+                    time.sleep(min(self.runtime.config.scheduler_sleep_slice_ms / 1000, remaining))
             if (
                 self.runtime.controller.phase not in (ControlPhase.DISABLED, ControlPhase.FAULT)
                 or self.runtime.mode == "TELEOP"
@@ -141,6 +188,24 @@ class OwnerService:
         positive("timeout_s", timeout_s)
         self.runtime.request_stop()
         self._shutdown.set()
+        self._join(timeout_s)
+
+    def quiesce_after_release(self, timeout_s=2.0):
+        """Close a normally released owner without setting the shared user-stop event."""
+        positive("timeout_s", timeout_s)
+        with self._condition:
+            if (
+                self._latest is None
+                or self._latest.row.get("phase") != str(ControlPhase.DISABLED)
+                or self.runtime.controller.phase != ControlPhase.DISABLED
+                or self.runtime.mode == "TELEOP"
+            ):
+                raise RuntimeError("Normal owner quiescence requires completed release to DISABLED")
+            self._shutdown.set()
+        self._join(timeout_s)
+
+    def _join(self, timeout_s):
+        """Retain ownership until close completes; both stop paths share the same diagnostics."""
         if self._thread is not None:
             self._thread.join(timeout_s)
             if self._thread.is_alive():

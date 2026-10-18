@@ -1,16 +1,20 @@
 """One bus owner with bounded mailboxes, causal input selection and command evidence.
 
-The first bench owns only a supported gripper. Cameras, leader reads, Dataset
+The owner submits configured arm joints and the supported gripper. Cameras, leader reads, Dataset
 transactions and trace serialization are deliberately outside this execution context.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
 from dataclasses import asdict, dataclass, replace
 
+from lerobot.robots.rebot_b601_follower.full_arm_control_types import FullArmLeaderSample
+
+from .capture_annotations import ANNOTATION_SCHEMA, annotate_capture
 from .config import (
     canonicalize_teacher_fields,
     finite_number,
@@ -42,10 +46,17 @@ class RuntimeConfig:
     joint_names: tuple[str, ...] = ("gripper",)
     arm_intent_required: bool = False
     handover_tolerance_deg: float | None = None
+    scheduler_sleep_slice_ms: float = 5.0
 
     def validate(self):
         """Reject malformed budgets and unsupported force semantics before connection."""
-        for name in ("control_hz", "feedback_budget_ms", "tick_deadline_ms", "command_ttl_ms"):
+        for name in (
+            "control_hz",
+            "scheduler_sleep_slice_ms",
+            "feedback_budget_ms",
+            "tick_deadline_ms",
+            "command_ttl_ms",
+        ):
             positive(name, getattr(self, name))
         if self.feedback_budget_ms >= self.tick_deadline_ms:
             raise ValueError("feedback budget must be less than the tick deadline")
@@ -228,6 +239,8 @@ class ForceRuntime:
         )
         self.config = config or RuntimeConfig()
         self.config.validate()
+        if hasattr(trace, "metadata"):
+            trace.metadata["capture_annotation_schema"] = ANNOTATION_SCHEMA
         validate_profile(controller.config, safety.config, controller.close_sign)
         for key in (self.config.left_feature, self.config.right_feature):
             feature = sensor.features.get(key)
@@ -237,6 +250,11 @@ class ForceRuntime:
         self.owner = None
         self.mailbox = LatestMailbox()
         self.arm_mailbox = ArmMailbox()
+        self._metadata_intent = None
+        self._metadata_json = None
+        self._metadata_value = None
+        self._leader_input_cache = None
+        self._leader_sample_cache = None
         self._stop = threading.Event() if stop_event is None else stop_event
         self.epoch = 0
         self.segment_id = 0
@@ -261,6 +279,44 @@ class ForceRuntime:
         self._parameter_update = None
         self._startup_performed = False
         self._hybrid_leader_required = False
+        self._validation_parameter_pin = (
+            (asdict(controller.config), asdict(safety.config))
+            if getattr(device, "full_arm_validation_config", None) is not None
+            else None
+        )
+        self._check_validation_target()
+
+    def _check_validation_target(self, *, teacher=None, safety=None, target=None):
+        """Keep short validation bound to its reviewed force, gains and protections."""
+        validation = getattr(self.device, "full_arm_validation_config", None)
+        if validation is not None:
+            requested = (teacher or self.controller.config).force_target_N if target is None else target
+            if requested != validation.target_force_N:
+                raise RuntimeError("full_arm_validation_force_target_changed")
+            if asdict(teacher or self.controller.config) != self._validation_parameter_pin[0]:
+                raise RuntimeError("full_arm_validation_teacher_config_changed")
+            if asdict(safety or self.safety.config) != self._validation_parameter_pin[1]:
+                raise RuntimeError("full_arm_validation_safety_config_changed")
+
+    def _validation_leader_sample(self):
+        """Expose fresh complete leader evidence without reading its serial port here."""
+        intent = self._arm_intent(self.clock(), None)
+        if intent is None:
+            raise RuntimeError("full_arm_validation_requires_leader")
+        cached = self._leader_sample_cache
+        if cached is not None and cached[0] is intent and cached[1] == intent.metadata_json:
+            return cached[2]
+        metadata = self._intent_metadata(intent)
+        sample = FullArmLeaderSample(
+            positions_deg=tuple((key.removesuffix(".pos"), value) for key, value in intent.goals),
+            captured_ns=intent.captured_ns,
+            response_completed_ns=metadata.get("leader_response_completed_ns"),
+            sequence=metadata.get("leader_sequence"),
+            source_config_sha256=metadata.get("leader_config_sha256"),
+            epoch=intent.epoch,
+        )
+        self._leader_sample_cache = (intent, intent.metadata_json, sample)
+        return sample
 
     def open(self):
         """Claim and connect the bus only on the thread that will execute all ticks."""
@@ -339,14 +395,21 @@ class ForceRuntime:
                 }
 
     def _startup_guard(self):
-        """Recheck live raw force and stop immediately before each startup write."""
+        """Recheck force/stop throughout startup and active guarded transport I/O."""
         if self._stop.is_set():
-            raise RuntimeError("user_stop_during_startup")
+            raise RuntimeError(
+                "user_stop_during_startup" if self.controller.phase == ControlPhase.ARMED else "user_stop"
+            )
+        self._check_validation_target()
         if self._hybrid_leader_required:
-            self._arm_intent(self.clock(), {})
+            self._arm_intent(self.clock(), None)
         self.trace.check_health()
         self.sensor._check_recorder_fault()
-        sample = self.sensor.read_latest_before(self.clock(), max_age_ms=self.safety.config.force_max_age_ms)
+        sample = self.sensor.read_latest_before(
+            self.clock(),
+            max_age_ms=self.safety.config.force_max_age_ms,
+            minimum_sequence=getattr(self.trace, "start_sequence", 0),
+        )
         if not sample.is_valid or sample.sequence < getattr(self.trace, "start_sequence", 0):
             raise RuntimeError("invalid_startup_force")
         left = finite_number("left_N", sample.values[self.config.left_feature])
@@ -420,6 +483,24 @@ class ForceRuntime:
             )
             if self._startup_performed:
                 measured = self.device.start_gripper(self.latest_joint_snapshot, self._startup_guard)
+            elif getattr(self.device, "full_arm_validation_config", None) is not None:
+                if request["mode"] != "hybrid":
+                    raise RuntimeError("full_arm_validation_requires_hybrid")
+                self._check_validation_target()
+                self.latest_joint_snapshot = self.device.start_full_arm_validation(
+                    guard=self._startup_guard, leader_sample=self._validation_leader_sample
+                )
+                measured = self.latest_joint_snapshot.get("gripper").position_deg
+                self._startup_performed = True
+            elif getattr(self.device, "operator_teleoperation_config", None) is not None:
+                if request["mode"] != "hybrid":
+                    raise RuntimeError("operator_teleoperation_requires_hybrid")
+                self.latest_joint_snapshot = self.device.start_operator_teleoperation(
+                    guard=self._startup_guard, leader_sample=self._validation_leader_sample
+                )
+                measured = self.latest_joint_snapshot.get("gripper").position_deg
+                self._startup_performed = True
+            if self._startup_performed:
                 sample = self._startup_guard()
                 force = ForceObservation(
                     sample.values[self.config.left_feature],
@@ -471,6 +552,7 @@ class ForceRuntime:
                 }:
                     raise ValueError("approach requires explicit speed and force threshold")
                 teacher = replace(self.controller.config, **request)
+                self._check_validation_target(teacher=teacher)
                 validate_profile(teacher, self.safety.config, self.controller.close_sign)
                 validate_motion_request(teacher, self.safety.config, "approach")
                 self.controller.update_config(teacher)
@@ -498,6 +580,7 @@ class ForceRuntime:
             if not isinstance(command.value, dict) or set(command.value) != {"teacher", "safety"}:
                 raise ValueError("parameters requires a complete teacher/safety bundle")
             teacher, safety = command.value["teacher"], command.value["safety"]
+            self._check_validation_target(teacher=teacher, safety=safety)
             validate_profile(teacher, safety, self.controller.close_sign)
             live_teacher = {
                 "force_target_N",
@@ -531,6 +614,7 @@ class ForceRuntime:
         elif command.kind in ("disable", "end_episode", "discard"):
             self._fault(command.kind)
         elif command.kind == "target":
+            self._check_validation_target(target=command.value)
             self.controller.set_target(command.value)
             self.last_success_tick = None
         elif command.kind == "segment":
@@ -548,6 +632,17 @@ class ForceRuntime:
             raise ValueError("Unsupported owner event")
         return True
 
+    def _intent_metadata(self, intent):
+        """Decode immutable mailbox metadata once; all live safety checks still run."""
+        if self._metadata_intent is not intent or self._metadata_json != intent.metadata_json:
+            value = json.loads(intent.metadata_json)
+            self._metadata_intent, self._metadata_json, self._metadata_value = (
+                intent,
+                intent.metadata_json,
+                value,
+            )
+        return self._metadata_value
+
     def _arm_intent(self, anchor, row):
         intent = self.arm_mailbox.latest()
         active = self.controller.phase not in (ControlPhase.DISABLED, ControlPhase.ARMED)
@@ -562,23 +657,37 @@ class ForceRuntime:
             raise RuntimeError("arm_intent_ttl_expired")
         if self._hybrid_leader_required:
             self._leader_inputs(intent)
-        row.update(
-            arm_command_version=intent.version,
-            arm_command_timestamp_ns=intent.captured_ns,
-            arm_command_ttl_ns=intent.ttl_ns,
-            arm_intent=dict(intent.goals),
-            arm_intent_metadata=json.loads(intent.metadata_json),
-            arm_filtered_keys=[] if self.mode == "TELEOP" else ["gripper.pos"],
-        )
+        if row is not None:
+            row.update(
+                arm_command_version=intent.version,
+                arm_command_timestamp_ns=intent.captured_ns,
+                arm_command_ttl_ns=intent.ttl_ns,
+                arm_intent=dict(intent.goals),
+                arm_intent_metadata=copy.deepcopy(self._intent_metadata(intent)),
+                arm_filtered_keys=[] if self.mode == "TELEOP" else ["gripper.pos"],
+            )
         return intent
 
     def _leader_inputs(self, intent):
         """Extract the sampled leader evidence; mailbox versions are not sample sequences."""
         if intent is None or not self._hybrid_leader_required:
             return {}
-        metadata = json.loads(intent.metadata_json)
+        cached = self._leader_input_cache
+        if (
+            cached is not None
+            and cached[0] is intent
+            and cached[1] == intent.metadata_json
+            and cached[2] == self.config.joint_names
+        ):
+            return dict(cached[3])
+        metadata = self._intent_metadata(intent)
         if not isinstance(metadata, dict) or not isinstance(metadata.get("raw_action_deg"), dict):
             raise RuntimeError("hybrid_requires_leader_metadata")
+        expected = {f"{name}.pos" for name in self.config.joint_names}
+        if set(dict(intent.goals)) != expected or set(metadata["raw_action_deg"]) != expected:
+            raise RuntimeError("hybrid_requires_complete_joint_intent")
+        for name in expected:
+            finite_number(f"leader_raw_{name}", metadata["raw_action_deg"][name])
         values = {
             "leader_gripper_deg": dict(intent.goals).get("gripper.pos"),
             "leader_raw_gripper_deg": metadata.get("raw_action_deg", {}).get("gripper.pos"),
@@ -591,6 +700,7 @@ class ForceRuntime:
             raise RuntimeError("hybrid_requires_leader_sample_sequence")
         if metadata.get("leader_request_started_ns") != intent.captured_ns:
             raise RuntimeError("hybrid_leader_capture_mismatch")
+        self._leader_input_cache = (intent, intent.metadata_json, self.config.joint_names, dict(values))
         return values
 
     def tick(self):
@@ -611,6 +721,8 @@ class ForceRuntime:
             "segment_id": self.segment_id,
             "epoch": self.epoch,
             "mode": self.mode,
+            "phase_at_tick_start": str(self.controller.phase),
+            "phase_before": str(self.controller.phase),
             "controller_id": self.controller.config.controller_id,
             "profile_id": self.controller.config.profile_id,
             "object_id": self.config.object_id,
@@ -639,6 +751,11 @@ class ForceRuntime:
             "prev_successful_tick_id": self.last_success_tick,
             "u_label_deg_s": None,
             "force_sequence": None,
+            "force_hardware_sequence": None,
+            "force_status": "unavailable",
+            "force_valid": False,
+            "force_max_age_ms": self.safety.config.force_max_age_ms,
+            "joint_feedback_max_age_ms": self.safety.config.joint_feedback_max_age_ms,
             "force_timestamp_ns": None,
             "force_arrival_timestamp_ns": None,
             "force_left_N": None,
@@ -681,6 +798,7 @@ class ForceRuntime:
                         q_prev_sent_deg=None,
                     )
             self.trace.check_health()
+            self._check_validation_target()
             self.sensor._check_recorder_fault()
             if not self.sensor.is_connected:
                 raise RuntimeError("force_sensor_disconnected")
@@ -756,7 +874,9 @@ class ForceRuntime:
                         raise RuntimeError(f"joint_feedback_not_updated:{joint.name}")
                     self._joint_evidence[joint.name] = (joint.receive_sequence, joint.receive_timestamp_ns)
                 sample = self.sensor.read_latest_before(
-                    anchor, max_age_ms=self.safety.config.force_max_age_ms
+                    anchor,
+                    max_age_ms=self.safety.config.force_max_age_ms,
+                    minimum_sequence=getattr(self.trace, "start_sequence", 0),
                 )
                 if sample.sequence < getattr(self.trace, "start_sequence", 0):
                     raise RuntimeError("force_sample_precedes_recording_subscription")
@@ -772,6 +892,7 @@ class ForceRuntime:
                 )
                 row.update(
                     force_sequence=sample.sequence,
+                    force_hardware_sequence=sample.hardware_sequence,
                     force_timestamp_ns=sample.timestamp_ns,
                     force_arrival_timestamp_ns=sample.arrival_timestamp_ns,
                     force_age_ns=anchor - sample.timestamp_ns,
@@ -782,6 +903,19 @@ class ForceRuntime:
                     force_status=sample.status,
                 )
                 changed = self._apply_event(anchor, feedback.position_deg, force)
+                row["phase_before"] = str(self.controller.phase)
+                if changed and self.event == "start" and self._startup_performed:
+                    # Startup may outlast a leader publication. Its later cache entry
+                    # must be tested against completion time, never the old anchor.
+                    anchor = self.clock()
+                    # Keep the original receive evidence; its derived ages must
+                    # use this same final anchor rather than the pre-start time.
+                    row.update(
+                        decision_anchor_ns=anchor,
+                        feedback_age_ns=anchor - row["feedback_received_ns"],
+                        joint_age_ns=anchor - row["joint_receive_timestamp_ns"],
+                        force_age_ns=anchor - row["force_timestamp_ns"],
+                    )
                 intent = self._arm_intent(anchor, row)
                 if self.mode == "HANDOVER_PENDING" and intent is not None:
                     leader_gripper = dict(intent.goals).get("gripper.pos")
@@ -880,6 +1014,7 @@ class ForceRuntime:
                         self._fault("tick_deadline_before_send")
                     else:
                         self.trace.check_health()
+                        self._check_validation_target()
                         # Check visibility again immediately before submitting the command.
                         age_check = self.safety.check_inputs(inputs, now_ns=self.clock())
                         if age_check is not None:
@@ -947,10 +1082,16 @@ class ForceRuntime:
                             ) != len(goals):
                                 raise RuntimeError("partial_receipt_names_mismatch")
                             for item in receipt.results:
+                                finite_number("candidate_deg", item.candidate_deg)
+                                finite_number("clipped_deg", item.clipped_deg)
+                                if item.candidate_deg != goals[item.name]:
+                                    raise RuntimeError("partial_receipt_candidate_mismatch")
                                 if item.status == "success":
                                     finite_number("submitted_deg", item.submitted_deg)
                                     row["submitted_action"][f"{item.name}.pos"] = item.submitted_deg
                                     self.last_submitted[item.name] = item.submitted_deg
+                                    if item.name != "gripper" and item.clipped_deg != item.candidate_deg:
+                                        row["clip_flags"].append(f"driver_clip:{item.name}")
                             result = receipt.get("gripper")
                             success = receipt.all_submitted and result.submitted_deg is not None
                             if success:
@@ -989,7 +1130,7 @@ class ForceRuntime:
                                     row["clip_flags"].append("driver_clip")
                                 self.last_sent, self.last_success_tick = result.submitted_deg, self.tick_id
                                 self.last_send_start = receipt.send_start_ns
-                            if self.mode != "TELEOP":
+                            if self.mode != "TELEOP" and success:
                                 self.controller.commit(
                                     proposal,
                                     q_sent_deg=result.submitted_deg,
@@ -1008,7 +1149,9 @@ class ForceRuntime:
                                     row["hybrid_transition"] = proposal.transition
                             self.safety.commit(q_prev, result.submitted_deg, dt, software_success=success)
                             if not success:
-                                self._fault("send_result_unknown")
+                                reason = getattr(self.device, "failure", None) or "send_failed_or_unknown"
+                                row["failure_reason"] = reason
+                                self._fault(reason)
                 else:
                     self.controller.commit(proposal, software_success=False)
         except Exception as exc:
@@ -1073,6 +1216,7 @@ class ForceRuntime:
                     failure_reason="device_io_evidence_incomplete",
                     fault_disposition=self._fault_disposition,
                 )
+        row.update(annotate_capture(row))
         if not self.trace.submit(row):
             self._fault("control_trace_incomplete")
             # Consumers must never bind a frame to an unpersistable successful-looking tick.
@@ -1083,6 +1227,7 @@ class ForceRuntime:
                 failure_reason="control_trace_incomplete",
                 fault_disposition=self._fault_disposition,
             )
+            row.update(annotate_capture(row))
         self.latest_row = row
         self.tick_id += 1
         return row

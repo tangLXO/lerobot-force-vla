@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from lerobot.utils.import_utils import _serial_available, require_package
 
 from .control_io import B601BusLease
+from .serial_timeouts import set_serial_timeout
 
 if TYPE_CHECKING or _serial_available:
     import serial
@@ -300,9 +301,9 @@ class ReadonlyB601Transport:
         if current is not None and 0 < current <= timeout:
             timeout = current
         if current != timeout:
-            # Every setter reconfigures the full Windows serial handle. Do not
-            # restore a longer wait just because a later query has more budget.
-            setattr(self._serial, name, timeout)
+            # Keep a bounded OS-millisecond wait. Native Windows updates only
+            # COMMTIMEOUTS, preserving the port's DCB and modem-line state.
+            set_serial_timeout(self._serial, name, timeout)
         # Serial configuration itself consumes time; an expired attempt must
         # never progress to a query write or read after a slow setter returns.
         if self._remaining(deadline_ns) < 0.001:
@@ -418,6 +419,7 @@ class ReadonlyB601Transport:
         self._query_attempt(payload)
         if self._serial.write(payload) != len(payload):
             raise OSError("B601 read-only query write was partial")
+        self._query_submitted(payload, deadline_ns)
         self._remaining(deadline_ns)
         # No flush(): its wait is not deadline bounded on all platforms.
         context = self._new_rx_context("query_rx", deadline_ns, payload.hex())
@@ -457,6 +459,7 @@ class ReadonlyB601Transport:
                         [exc, rollback_error],
                     ) from None
             raise
+        self._query_completed(payload)
 
     def _prepare_query(self, deadline_ns: int) -> None:
         """Discard pre-query bytes only in the original query-only diagnostic path."""
@@ -466,6 +469,12 @@ class ReadonlyB601Transport:
 
     def _query_attempt(self, payload: bytes) -> None:
         """Allow the unified execution adapter to retain transport audit evidence."""
+
+    def _query_submitted(self, payload: bytes, deadline_ns: int) -> None:
+        """Allow the unified owner to track a complete query before any RX/deadline check."""
+
+    def _query_completed(self, payload: bytes) -> None:
+        """Allow the unified owner to retire only a validated, timely query response."""
 
     def _receive_chunk(self, data: bytes, received_ns: int) -> int | None:
         """Allow the unified adapter to audit received bytes before decoding them."""

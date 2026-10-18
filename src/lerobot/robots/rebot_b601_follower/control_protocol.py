@@ -36,6 +36,16 @@ def _velocity_code(value: int) -> int:
     return value
 
 
+def _next_f32(value: float, direction: int) -> float:
+    """Move one float32 value toward increasing (+1) or decreasing (-1) radians."""
+    if value == 0:
+        bits = 1 | (0x80000000 if direction < 0 else 0)
+    else:
+        bits = struct.unpack("<I", struct.pack("<f", value))[0]
+        bits += -direction if bits & 0x80000000 else direction
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
 def position_wire_bounds(lower_deg: float, upper_deg: float) -> tuple[float, float]:
     """Round mechanical endpoints inward to representable float32 radians."""
     lower = _number(lower_deg, "lower_deg")
@@ -46,9 +56,7 @@ def position_wire_bounds(lower_deg: float, upper_deg: float) -> tuple[float, flo
     for bound, direction in ((lower, 1), (upper, -1)):
         position = _f32(math.radians(bound))
         if direction * (math.degrees(position) - bound) < 0:
-            bits = struct.unpack("<I", struct.pack("<f", position))[0]
-            bits += -direction if bits & 0x80000000 else direction
-            position = struct.unpack("<f", struct.pack("<I", bits))[0]
+            position = _next_f32(position, direction)
         bounds.append(math.degrees(position))
     if bounds[0] >= bounds[1]:
         raise ValueError("Position range has no distinct float32 endpoints")
@@ -63,12 +71,14 @@ class B601JointCommandProfile:
     mode: Literal["mit", "pos_vel", "force_pos"]
     minimum_deg: float
     maximum_deg: float
-    max_relative_deg: float
+    max_relative_deg: float | None = None
     velocity_deg_s: float | None = None
     torque_ratio: float | None = None
     kp: float | None = None
     kd: float | None = None
     velocity_wire_code: int | None = None
+    mit_velocity_deg_s: float = 0.0
+    mit_torque_Nm: float = 0.0  # noqa: N815 - preserve the explicit SI torque unit.
 
     @property
     def velocity_limit_deg_s(self) -> float | None:
@@ -80,18 +90,22 @@ class B601JointCommandProfile:
         return math.degrees(_velocity_code(self.velocity_wire_code) / 100)
 
     def validate(self) -> None:
-        """Reject unsupported modes and values the vendor encoder would clamp."""
+        """Validate explicit settings, retaining the vendor's MIT gain saturation."""
         if not isinstance(self.name, str) or not self.name or "." in self.name:
             raise ValueError("A bare joint name is required")
         if self.mode not in ("mit", "pos_vel", "force_pos"):
             raise ValueError("Unsupported B601 command mode")
         if _number(self.minimum_deg, "minimum_deg") >= _number(self.maximum_deg, "maximum_deg"):
             raise ValueError("Joint minimum must be below maximum")
-        if _number(self.max_relative_deg, "max_relative_deg") <= 0:
+        if self.max_relative_deg is None and self.mode != "mit":
+            raise ValueError("Position modes require an explicit positive max_relative_deg")
+        if self.max_relative_deg is not None and _number(self.max_relative_deg, "max_relative_deg") <= 0:
             raise ValueError("max_relative_deg must be positive")
+        _number(self.mit_velocity_deg_s, "mit_velocity_deg_s")
+        _number(self.mit_torque_Nm, "mit_torque_Nm")
         if self.mode == "mit":
-            if not 0 <= _number(self.kp, "kp") <= 500 or not 0 <= _number(self.kd, "kd") <= 5:
-                raise ValueError("MIT gains must fit wire ranges kp=[0,500], kd=[0,5]")
+            if _number(self.kp, "kp") < 0 or _number(self.kd, "kd") < 0:
+                raise ValueError("MIT gains must be nonnegative")
             if (
                 self.velocity_deg_s is not None
                 or self.velocity_wire_code is not None
@@ -99,6 +113,8 @@ class B601JointCommandProfile:
             ):
                 raise ValueError("MIT profile does not accept position-mode parameters")
         else:
+            if self.mit_velocity_deg_s != 0 or self.mit_torque_Nm != 0:
+                raise ValueError("Position-mode profile does not accept MIT velocity/torque references")
             if self.kp is not None or self.kd is not None:
                 raise ValueError("Position-mode profile does not accept MIT gains")
             if self.mode == "force_pos":
@@ -199,8 +215,21 @@ def encode_disable(motor_id: int) -> bytes:
 
 
 def _uint(value: float, low: float, high: float, bits: int) -> int:
-    """Match the SDK's float32 arithmetic and truncation for MIT fields."""
+    """Match the SDK's clamp, float32 arithmetic and truncation for MIT fields."""
+    value = max(low, min(high, value))
     return int(_f32(_f32(_f32(value - low) * ((1 << bits) - 1)) / _f32(high - low)))
+
+
+def mit_gain_wire_codes(kp: float, kd: float) -> tuple[int, int]:
+    """Encode requested gains exactly as motorbridge 0.3.9, including its clamp.
+
+    The native B601 profile requests kd=12 for its first three joints. The
+    vendor protocol saturates those requests to its kd=5 wire maximum.
+    """
+    kp, kd = _number(kp, "kp"), _number(kd, "kd")
+    if kp < 0 or kd < 0:
+        raise ValueError("MIT gains must be nonnegative")
+    return _uint(_f32(min(kp, 500)), 0, 500, 12), _uint(_f32(min(kd, 5)), 0, 5, 12)
 
 
 def force_pos_wire_codes(
@@ -243,18 +272,33 @@ def encode_position(
     if len(mapping) != 3 or any(_number(value, "mapping") <= 0 for value in mapping):
         raise ValueError("Three positive session mapping registers are required")
     pmax, vmax, tmax = mapping
-    low = max(profile.minimum_deg, measured - profile.max_relative_deg, -math.degrees(pmax))
-    high = min(profile.maximum_deg, measured + profile.max_relative_deg, math.degrees(pmax))
+    low = max(profile.minimum_deg, -math.degrees(pmax))
+    high = min(profile.maximum_deg, math.degrees(pmax))
+    if profile.max_relative_deg is not None:
+        low = max(low, measured - profile.max_relative_deg)
+        high = min(high, measured + profile.max_relative_deg)
     if low > high:
         raise ValueError("Joint, measured-relative and device ranges have no intersection")
     clipped = max(low, min(high, candidate))
     pos = _f32(math.radians(clipped))
     if profile.mode == "mit":
         p = _uint(pos, -pmax, pmax, 16)
-        v = _uint(0, -vmax, vmax, 12)
-        t = _uint(0, -tmax, tmax, 12)
-        kp = _uint(_f32(profile.kp), 0, 500, 12)
-        kd = _uint(_f32(profile.kd), 0, 5, 12)
+        wire_position = math.degrees(p * (2 * pmax) / 65535 - pmax)
+        # The SDK truncates MIT position to a 16-bit code. At an interval
+        # endpoint that code can fall just outside the existing bounds. Move
+        # inward on the same grid, retaining the semantic clipped target.
+        while wire_position < low and p < 65535:
+            p += 1
+            wire_position = math.degrees(p * (2 * pmax) / 65535 - pmax)
+        while wire_position > high and p > 0:
+            p -= 1
+            wire_position = math.degrees(p * (2 * pmax) / 65535 - pmax)
+        velocity = math.radians(profile.mit_velocity_deg_s)
+        if abs(velocity) > vmax or abs(profile.mit_torque_Nm) > tmax:
+            raise ValueError("MIT velocity/torque reference exceeds verified device mapping")
+        v = _uint(velocity, -vmax, vmax, 12)
+        t = _uint(profile.mit_torque_Nm, -tmax, tmax, 12)
+        kp, kd = mit_gain_wire_codes(profile.kp, profile.kd)
         payload = bytes(
             (
                 p >> 8,
@@ -268,10 +312,17 @@ def encode_position(
             )
         )
         arbitration_id = motor_id
-        wire_position = math.degrees(p * (2 * pmax) / 65535 - pmax)
         if payload[:7] == b"\xff" * 7:
             raise ValueError("MIT command collides with a reserved motor command")
     else:
+        # Nearest float32 rounding can put a valid endpoint just outside the
+        # calibrated/relative/device intersection (e.g. -270 degrees). Move
+        # one representable step inward; never widen the allowed interval.
+        wire_position = math.degrees(pos)
+        if wire_position < low:
+            pos = _next_f32(pos, 1)
+        elif wire_position > high:
+            pos = _next_f32(pos, -1)
         if profile.mode == "force_pos":
             v, torque = force_pos_wire_codes(
                 profile.velocity_deg_s, profile.torque_ratio, velocity_wire_code=profile.velocity_wire_code

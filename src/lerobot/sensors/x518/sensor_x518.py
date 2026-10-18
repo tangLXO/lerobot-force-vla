@@ -167,9 +167,17 @@ class X518Sensor(Sensor):
             )
             self._diagnostics.observe(sample, self.sample_rate_hz)
 
-    def read_latest_before(self, target_timestamp_ns: int, max_age_ms: float | None = None) -> SensorSample:
+    def read_latest_before(
+        self,
+        target_timestamp_ns: int,
+        max_age_ms: float | None = None,
+        *,
+        minimum_sequence: int | None = None,
+    ) -> SensorSample:
         """Select once using parent availability, retaining bounded age diagnostics."""
-        sample = super().read_latest_before(target_timestamp_ns, max_age_ms)
+        sample = super().read_latest_before(
+            target_timestamp_ns, max_age_ms, minimum_sequence=minimum_sequence
+        )
         with self._publication_condition:
             self._diagnostics.ages.append((target_timestamp_ns - sample.timestamp_ns) / 1e6)
         return sample

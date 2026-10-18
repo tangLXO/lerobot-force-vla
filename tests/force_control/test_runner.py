@@ -152,6 +152,114 @@ def test_armed_fake_uses_real_trace_subscription_and_explicit_release(tmp_path, 
     assert not devices[0].connected
 
 
+class FinishRequestLive:
+    """Exercise the live runner protocol using only detached fake-owner snapshots."""
+
+    def __init__(self, *, stop_at=None, wait_for_valid_label=False):
+        self.stop = threading.Event()
+        self.stop_at = stop_at
+        self.wait_for_valid_label = wait_for_valid_label
+        self._latest = self.applied = self.startup = None
+        self.requests = 0
+
+    @property
+    def latest(self):
+        return self._latest
+
+    @latest.setter
+    def latest(self, value):
+        self._latest = value
+        if value.get("phase") == self.stop_at:
+            self.stop.set()
+
+    def take(self):
+        if self.requests or self.latest["phase"] not in ("FORCE_TRACK", "FOLLOW", "APPROACH"):
+            return None
+        if self.wait_for_valid_label and not self.latest.get("label_valid"):
+            return None
+        self.requests += 1
+        return "release_and_finish", None
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_live_release_finishes_after_disabled_and_keeps_hybrid_leader_fresh(tmp_path, monkeypatch, hybrid):
+    devices = instrument_device(monkeypatch)
+    config = run_config(tmp_path, armed=True)
+    config.duration_s = 0.05
+    config.teacher = replace(config.teacher, release_travel_deg=0.1, release_speed_deg_s=0.2)
+    if hybrid:
+        config.initial_mode = "hybrid"
+        config.leader_backend = "fake"
+        config.leader_frequency_hz = 100
+        config.leader_max_age_s = 0.25
+        config.runtime = replace(config.runtime, command_ttl_ms=250)
+        config.teacher = replace(config.teacher, gripper_follow_speed_deg_s=5, contact_force_threshold_N=0.1)
+    live = FinishRequestLive()
+    report = runner.run(config, live=live)
+    assert report["valid"], report["errors"]
+    history = rows(config.trace_root)
+    releasing = [row for row in history if row["phase"] == "RELEASE"]
+    assert len(releasing) >= 3
+    assert history[-1]["phase"] == "DISABLED"
+    assert live.requests == 1
+    assert sum(row["event"] == "release" for row in history) == 1
+    assert all(not row["label_valid"] for row in releasing)
+    assert all(
+        abs(row["u_label_deg_s"]) <= config.teacher.release_speed_deg_s + 1e-8
+        for row in releasing
+        if row["q_sent_deg"] is not None
+    )
+    assert (
+        releasing[-1]["decision_anchor_ns"] - releasing[0]["decision_anchor_ns"]
+    ) / 1e9 > config.duration_s
+    metadata = manifest(config.trace_root)["metadata"]
+    assert metadata["release_and_finish_completed"] is True
+    assert metadata["finish_request"]["kind"] == "release_and_finish"
+    assert metadata["config"]["teacher"]["release_speed_deg_s"] == 0.2
+    if hybrid:
+        assert len({row["arm_intent_metadata"]["leader_sequence"] for row in releasing}) >= 3
+    assert {thread_id for _, thread_id in devices[0].calls} == {devices[0].owner}
+    assert not devices[0].connected
+
+
+def test_live_capture_keeps_approach_transition_force_and_release_rows(tmp_path):
+    config = run_config(tmp_path, armed=True)
+    config.initial_mode = "approach"
+    config.duration_s = 1.5
+    config.teacher = replace(config.teacher, gripper_follow_speed_deg_s=5, contact_force_threshold_N=0.05)
+    report = runner.run(config, live=FinishRequestLive(wait_for_valid_label=True))
+    assert report["valid"], report["errors"]
+    history = rows(config.trace_root)
+    phases = {row["phase"] for row in history}
+    assert {"DISABLED", "ARMED", "APPROACH", "FORCE_TRACK", "RELEASE"} <= phases
+    assert any(row.get("transition") == "APPROACH->FORCE_TRACK" for row in history)
+    assert any(row["label_valid"] for row in history)
+    assert [row["tick_id"] for row in history] == list(range(len(history)))
+    raw = [json.loads(line) for line in (config.trace_root / "raw_force.jsonl").read_text().splitlines()]
+    sequences = {row["sequence"] for row in raw}
+    assert all(row["force_sequence"] in sequences for row in history if row["force_sequence"] is not None)
+    assert all(not row["label_valid"] for row in history if row["phase"] in ("APPROACH", "RELEASE"))
+
+
+@pytest.mark.parametrize("stop_at", ["FORCE_TRACK", "RELEASE"])
+def test_live_stop_preempts_release_finish_without_an_extra_opening_trajectory(
+    tmp_path, monkeypatch, stop_at
+):
+    devices = instrument_device(monkeypatch)
+    config = run_config(tmp_path, armed=True)
+    config.teacher = replace(config.teacher, release_travel_deg=0.2, release_speed_deg_s=0.1)
+    live = FinishRequestLive(stop_at=stop_at)
+    report = runner.run(config, live=live)
+    assert report["terminal_state"] == "FAULT"
+    history = rows(config.trace_root)
+    releases = [row for row in history if row["event"] == "release"]
+    assert len(releases) == (1 if stop_at == "RELEASE" else 0)
+    assert history[-1]["failure_reason"] in ("user_stop", "user_stop_before_send")
+    assert not manifest(config.trace_root)["metadata"].get("release_and_finish_completed", False)
+    assert sum(op == "emergency_stop" for op, _ in devices[0].calls) == 1
+    assert not devices[0].connected
+
+
 @pytest.mark.parametrize("armed", [False, True])
 def test_required_sensor_normal_shutdown_releases_recording_before_disconnect(tmp_path, monkeypatch, armed):
     sensors = instrument_required_sensor(monkeypatch)

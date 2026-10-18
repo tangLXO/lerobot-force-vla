@@ -41,6 +41,7 @@ def stopped_panel(panel, calibration, settings, monkeypatch):
     app.monitor_stop = panel.threading.Event()
     app.messages = panel.queue.SimpleQueue()
     app.running = app.monitoring = False
+    app.finishing = False
     app.exit_confirmed = False
     app.unconfirmed_port = "COM22"
     app.monitor_port = "COM22"
@@ -85,6 +86,122 @@ def _readonly_row():
         "joint_received_ns": 1_990_000_000,
         "force_timestamp_ns": 1_990_000_000,
     }
+
+
+def test_release_finish_uses_saved_limits_once_and_stop_stays_immediate(panel, stopped_panel):
+    app = stopped_panel
+    submitted = []
+    app.running = True
+    app.live = SimpleNamespace(
+        latest={"phase": "FORCE_TRACK"},
+        submit=lambda *args: submitted.append(args),
+        stop=panel.threading.Event(),
+    )
+    app.config = SimpleNamespace(
+        teacher=SimpleNamespace(release_travel_deg=0.5, release_speed_deg_s=0.2, max_release_time_s=3)
+    )
+    app.release_button = _Widget()
+    app.release_and_finish()
+    assert submitted == [("release_and_finish",)]
+    assert app.finishing and not app.live.stop.is_set()
+    assert "0.5°" in app.status.get() and "0.2°/s" in app.status.get() and "3s" in app.status.get()
+    app.release_and_finish()
+    app.command("freeze")
+    panel.Tuner.apply(app)
+    assert submitted == [("release_and_finish",)]
+    app.stop()
+    assert app.live.stop.is_set() and app.monitor_stop.is_set()
+    assert submitted == [("release_and_finish",)]
+
+
+@pytest.mark.parametrize("phase", ["DISABLED", "ARMED", "RELEASE", "FAULT"])
+def test_release_finish_rejects_inactive_or_already_releasing_gui_state(panel, stopped_panel, phase):
+    app = stopped_panel
+    app.running = True
+    app.live = SimpleNamespace(
+        latest={"phase": phase}, submit=lambda *args: pytest.fail("inactive release was submitted")
+    )
+    app.release_and_finish()
+    assert not app.finishing
+
+
+def test_full_mode_mailbox_does_not_latch_gui_release_request(panel, stopped_panel):
+    app = stopped_panel
+
+    def full(*args):
+        raise panel.queue.Full
+
+    app.running = True
+    app.live = SimpleNamespace(latest={"phase": "FOLLOW"}, submit=full)
+    app.release_and_finish()
+    assert not app.finishing and "尚未接收" in app.status.get()
+
+
+def test_full_arm_acceptance_gate_is_visible_before_creating_a_session(
+    panel, stopped_panel, monkeypatch, tmp_path
+):
+    app = stopped_panel
+    app.exit_confirmed = app.monitoring = True
+    app.preview_latest = {"joint_received_ns": panel.time.perf_counter_ns(), "phase": "DISABLED"}
+
+    def gate():
+        raise RuntimeError("hardware acceptance is incomplete")
+
+    app.recording_page = SimpleNamespace(session_options=gate)
+    monkeypatch.setattr(panel, "OUTPUTS", tmp_path / "new-sessions")
+    panel.Tuner.start(app)
+    assert not app.running and "hardware acceptance is incomplete" in app.status.get()
+    assert not (tmp_path / "new-sessions").exists()
+
+
+def test_full_arm_profile_teacher_is_not_replaced_by_unrelated_gripper_form(panel, stopped_panel):
+    app = stopped_panel
+    app.running = True
+    app.config = SimpleNamespace(runtime=SimpleNamespace(joint_names=("arm", "gripper")))
+    app.live = SimpleNamespace(submit=lambda *args: pytest.fail("unreviewed gains replaced full-arm profile"))
+    panel.Tuner.apply(app)
+    assert "已预检完整配置" in app.status.get()
+
+
+def test_full_arm_exit_requires_all_seven_disabled_and_closed(panel):
+    result = {
+        "config": {"runtime": {"joint_names": [joint.name for joint in panel.DEFAULT_B601_JOINTS]}},
+        "shutdown_evidence": {
+            "transport_closed": True,
+            "fault_disposition": {
+                "status": "submitted",
+                "error": None,
+                "disabled_feedback_observed": True,
+            },
+        },
+    }
+    assert not panel.exit_confirmation(result)
+    result["shutdown_evidence"]["fault_disposition"]["all_joints_disabled_observed"] = True
+    assert panel.exit_confirmation(result)
+    assert "全臂七关节" in panel.stop_report(result, "synthetic-result.json")["summary"]
+    result["shutdown_evidence"]["transport_closed"] = False
+    assert not panel.exit_confirmation(result)
+
+
+def test_bounded_full_arm_startup_receipt_does_not_require_gripper_only_settings(panel):
+    receipt = {
+        "kind": "bounded_full_arm_validation",
+        "complete": True,
+        "target_force_N": 1,
+        "enabled_joint_names": [joint.name for joint in panel.DEFAULT_B601_JOINTS],
+    }
+    text = panel.startup_description(receipt)
+    assert "非正式全臂验收" in text and "1 N" in text and "7 / 7" in text
+    assert "hardware_ack=unknown" in text
+
+
+def test_gripper_only_readonly_reference_cannot_recover_full_arm_exit(panel, stopped_panel):
+    app = stopped_panel
+    app.unconfirmed_full_arm = True
+    app.exit_confirmed = False
+    app.status.set("保留本次按钮反馈")
+    assert not app.recover_readonly_exit(_readonly_row())
+    assert not app.exit_confirmed and app.status.get() == "保留本次按钮反馈"
 
 
 @pytest.fixture
@@ -306,7 +423,7 @@ def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel
     assert restored == (values, enabled, Path(calibration.path).resolve())
     document = json.loads(saved.read_text(encoding="utf-8"))
     assert document["format"] == "b601_ip_tuner_settings"
-    assert document["controller_type"] == "ip" and document["schema_version"] == 6
+    assert document["controller_type"] == "ip" and document["schema_version"] == 8
     assert document["values"]["kp_deg_per_N"] == ""
     assert (
         not {"reference", "executable", "confirmed", "exit_confirmed", "shutdown_evidence"} & document.keys()
@@ -490,7 +607,7 @@ def test_legacy_kg_parameters_preserve_force_and_show_conversion(
     saved = tmp_path / "newtons.json"
     stopped_panel.save_parameters_file(saved)
     document = json.loads(saved.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 6
+    assert document["schema_version"] == 8
     assert not {"target_kg", "target_min_kg", "target_max_kg"} & document["values"].keys()
     assert panel.read_settings(saved)[0] == values
     assert path.read_bytes() == original
@@ -752,7 +869,7 @@ def test_exit_report_preserves_uncertain_disable_and_raw_errors(panel, tmp_path)
     assert not panel.exit_confirmation(result)
 
 
-def test_panel_build_has_two_tabs_and_other_settings_lock_without_io(
+def test_panel_build_has_recording_tab_and_other_settings_lock_without_io(
     panel, calibration, monkeypatch, tmp_path
 ):
     monkeypatch.setattr(panel, "OUTPUTS", tmp_path)
@@ -765,7 +882,16 @@ def test_panel_build_has_two_tabs_and_other_settings_lock_without_io(
     root.withdraw()
     app = panel.Tuner(root, calibration_path=calibration.path)
     try:
-        assert [app.notebook.tab(tab, "text") for tab in app.notebook.tabs()] == ["夹爪控制", "其他设置"]
+        assert [app.notebook.tab(tab, "text") for tab in app.notebook.tabs()] == [
+            "夹爪控制",
+            "全臂遥操",
+            "示范录制",
+            "其他设置",
+        ]
+        assert not app.recording_page.enabled.get()
+        assert not app.recording_page.full_arm_enabled.get()
+        assert app.recording_page.session_options() == {}
+        assert all(str(button.cget("state")) == "disabled" for button in app.recording_page.buttons.values())
         assert set(app.fields) == set(panel.default_values())
         assert set(panel.FIELD_PAGES) == set(app.fields)
         assert panel.FIELD_PAGES["motor_velocity_code"] == "gripper"
@@ -836,6 +962,7 @@ def test_query_only_monitor_closes_resources_and_preserves_raw_values(
 
         def close(self):
             calls.append("device_close")
+            self.has_resources = False
 
     class Sensor:
         has_resources = True
@@ -861,6 +988,7 @@ def test_query_only_monitor_closes_resources_and_preserves_raw_values(
 
         def disconnect(self):
             calls.append("sensor_close")
+            self.has_resources = False
 
     monkeypatch.setattr(panel, "ReadonlyB601Transport", Device)
     monkeypatch.setattr(panel, "X518Sensor", Sensor)
@@ -1039,6 +1167,87 @@ def test_stop_report_never_substitutes_defaults_for_malformed_recorded_config(pa
     report = panel.stop_report(result, tmp_path)
     assert "本次查询 / 周期工作预算 未填写 / 未记录 / 未填写 / 未记录 ms" in report["summary"]
     assert json.loads(report["details"])["runtime_config"] == {}
+
+
+@pytest.mark.parametrize("shutdown", [None, "invalid", {"fault_disposition": "invalid"}])
+def test_stop_report_tolerates_missing_or_malformed_shutdown_evidence(panel, tmp_path, shutdown):
+    report = panel.stop_report(
+        {"errors": ["RuntimeError: send_failed_or_unknown"], "shutdown_evidence": shutdown}, tmp_path
+    )
+    assert "send_failed_or_unknown" in report["summary"]
+
+
+def test_stop_report_shows_device_cause_behind_generic_send_failure(panel, tmp_path):
+    cause = "Full-arm validation command feedback exceeded reference envelope: gripper"
+    result = {
+        "errors": ["RuntimeError: send_failed_or_unknown"],
+        "shutdown_evidence": {"fault_disposition": {"reason": cause}},
+    }
+    report = panel.stop_report(result, tmp_path)
+    assert cause in report["summary"]
+    assert "send_failed_or_unknown" in report["summary"]
+    assert json.loads(report["details"])["shutdown"]["fault_disposition"]["reason"] == cause
+
+
+def test_repeated_old_audit_errors_do_not_flood_gui_and_raw_result_is_not_mutated(panel, tmp_path):
+    message = "B601 I/O event sequence/time is not contiguous and monotonic"
+    result = {
+        "errors": [message] * 10000,
+        "startup_evidence": {"complete": True},
+        "capture_summary": {"phase_counts": {"FORCE_TRACK": 500}},
+        "shutdown_evidence": {"fault_disposition": {"reason": "user_stop_during_startup"}},
+    }
+    report = panel.stop_report(result, tmp_path)
+    assert len(report["summary"]) < 500
+    assert "运行期间停止" in report["summary"]
+    details = json.loads(report["details"])
+    assert details["errors"] == [message]
+    assert details["error_counts"][message] == 10000 and details["total_error_count"] == 10000
+    assert len(result["errors"]) == 10000
+    assert result["shutdown_evidence"]["fault_disposition"]["reason"] == "user_stop_during_startup"
+
+
+def test_observed_frequency_uses_owner_tick_span_instead_of_gui_sample_count(panel):
+    rows = [
+        {"tick_id": 100, "tick_start_ns": 1_000_000_000},
+        {"tick_id": 105, "tick_start_ns": 1_050_000_000},
+        {"tick_id": 110, "tick_start_ns": 1_100_000_000},
+    ]
+    assert panel.observed_control_hz(rows) == 100
+    assert panel.observed_control_hz(rows[:1]) is None
+    assert panel.observed_control_hz([rows[0], rows[0]]) is None
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_old_io_only_results_are_rechecked_without_rewriting_original(panel, tmp_path, monkeypatch, valid):
+    import copy
+
+    stream = tmp_path / "stream"
+    stream.mkdir()
+    manifest = stream / "manifest.json"
+    manifest.write_text("canonical-original", encoding="utf-8")
+    message = "B601 I/O event sequence/time is not contiguous and monotonic"
+    result = {
+        "valid": False,
+        "run_uid": "old-run",
+        "errors": [message] * 100,
+        "config": {"backend": "b601"},
+        "terminal_state": "FAULT",
+    }
+    original = copy.deepcopy(result)
+    calls = []
+
+    def verify(path):
+        calls.append(path)
+        return {"valid": valid, "errors": [] if valid else [message], "run_uid": "old-run"}
+
+    monkeypatch.setattr(panel, "validate_trace", verify)
+    report = panel.stop_report(result, tmp_path / "result.json")
+    assert calls == [stream]
+    assert ("只读重验通过" in report["summary"]) is valid
+    assert ("核验失败" in report["summary"]) is not valid
+    assert json.loads(report["details"])["historical_error_counts"] == {message: 100}
+    assert result == original and manifest.read_text(encoding="utf-8") == "canonical-original"
 
 
 def test_protocol_failure_is_not_misreported_as_query_timeout_from_cleanup(panel, tmp_path):

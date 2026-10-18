@@ -8,6 +8,7 @@ call. The reader thread owns open/read/close, while ``latest`` never performs I/
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -68,6 +69,8 @@ class LeaderSamplerWorker:
         frequency_hz: float = 50.0,
         max_read_duration_s: float = 0.15,
         action_processor=None,
+        configuration_guard: Callable[[], None] | None = None,
+        source_config_sha256: str | None = None,
     ):
         """Validate sampling budgets without opening hardware or starting threads."""
         if not math.isfinite(frequency_hz) or frequency_hz <= 0:
@@ -79,12 +82,19 @@ class LeaderSamplerWorker:
         self.leader = leader
         self.frequency_hz = frequency_hz
         self.max_read_duration_s = max_read_duration_s
+        self._configuration_guard = configuration_guard
+        self._source_config_sha256 = source_config_sha256
         self._stop = threading.Event()
         self._condition = threading.Condition()
         self._latest = LeaderIntent(sequence=0, is_valid=False, error="not_started")
         self._thread: threading.Thread | None = None
         self._close_error: str | None = None
         self._resources_owned = False
+
+    @property
+    def source_config_sha256(self) -> str | None:
+        """Identity of the pinned producer mapping, when a bounded session requires it."""
+        return self._source_config_sha256
 
     @property
     def has_resources(self) -> bool:
@@ -175,7 +185,10 @@ class LeaderSamplerWorker:
 
     def _run(self) -> None:
         connected = False
+        terminal_error = None
         try:
+            if self._configuration_guard is not None:
+                self._configuration_guard()
             self.leader.connect_readonly()
             connected = True
             self._resources_owned = True
@@ -183,7 +196,11 @@ class LeaderSamplerWorker:
                 started = time.perf_counter()
                 request_started_ns = time.perf_counter_ns()
                 try:
+                    if self._configuration_guard is not None:
+                        self._configuration_guard()
                     snapshot = self.leader.read_action_snapshot(max_read_duration_s=self.max_read_duration_s)
+                    if self._configuration_guard is not None:
+                        self._configuration_guard()
                     if self._stop.is_set():
                         break
                     with self._condition:
@@ -222,7 +239,8 @@ class LeaderSamplerWorker:
                     time.sleep(min(remaining, 0.005))
         except Exception as exc:
             self._resources_owned = bool(getattr(self.leader, "has_resources", connected))
-            self._publish_error(f"connect_failed: {type(exc).__name__}: {exc}")
+            terminal_error = f"connect_failed: {type(exc).__name__}: {exc}"
+            self._publish_error(terminal_error)
         finally:
             if connected or self._resources_owned:
                 try:
@@ -230,17 +248,29 @@ class LeaderSamplerWorker:
                     self._resources_owned = False
                 except Exception as exc:
                     self._close_error = f"102 close failed: {type(exc).__name__}: {exc}"
-            self._publish_error(self._close_error or "stopped")
+            self._publish_error(self._close_error or terminal_error or "stopped")
 
 
 class FakeReadonlyLeader:
-    """Stationary synthetic gripper input for offline hybrid runs only."""
+    """Stationary synthetic joint input for offline hybrid runs only."""
 
-    def __init__(self, position_deg: float = 0.0):
+    def __init__(self, position_deg: float = 0.0, *, goals_deg: dict[str, float] | None = None):
         """Construct deterministic input without allocating a transport."""
         if not math.isfinite(position_deg):
             raise ValueError("Fake leader position must be finite")
         self.position_deg = position_deg
+        self.goals_deg = dict(goals_deg) if goals_deg is not None else None
+        if self.goals_deg is not None and (
+            "gripper.pos" not in self.goals_deg
+            or any(
+                not isinstance(name, str)
+                or not name.endswith(".pos")
+                or type(value) not in (int, float)
+                or not math.isfinite(value)
+                for name, value in self.goals_deg.items()
+            )
+        ):
+            raise ValueError("Fake leader goals require finite joint.pos values including gripper")
         self.connected = False
         self.sequence = 0
 
@@ -259,9 +289,12 @@ class FakeReadonlyLeader:
             raise RuntimeError("Fake leader is disconnected")
         now = time.perf_counter_ns()
         self.sequence += 1
+        goals = self.goals_deg or {"gripper.pos": self.position_deg}
         return LeaderActionSnapshot(
-            raw_action_deg=(("gripper.pos", -self.position_deg / 6.0),),
-            action_deg=(("gripper.pos", self.position_deg),),
+            raw_action_deg=tuple(
+                (name, -value / 6.0 if name == "gripper.pos" else value) for name, value in goals.items()
+            ),
+            action_deg=tuple(goals.items()),
             request_started_ns=now,
             response_completed_ns=now,
             sequence=self.sequence,

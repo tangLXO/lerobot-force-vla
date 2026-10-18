@@ -31,6 +31,7 @@ class HistoryBuffer:
         self._samples: deque[SensorSample] = deque()
         self._lock = RLock()
         self._last_arrival_timestamp_ns: int | None = None
+        self._max_valid_sample: SensorSample | None = None
 
     def append(self, sample: SensorSample) -> None:
         """Append one sample and evict entries outside the arrival horizon."""
@@ -42,9 +43,28 @@ class HistoryBuffer:
                 raise ValueError("Sensor arrival_timestamp_ns must be monotonically non-decreasing.")
             self._last_arrival_timestamp_ns = sample.arrival_timestamp_ns
             self._samples.append(sample)
+            if sample.is_valid and (
+                self._max_valid_sample is None
+                or (sample.timestamp_ns, sample.sequence)
+                > (self._max_valid_sample.timestamp_ns, self._max_valid_sample.sequence)
+            ):
+                self._max_valid_sample = sample
             cutoff_ns = sample.arrival_timestamp_ns - self.duration_ns
+            rebuild_latest = False
             while self._samples and self._samples[0].arrival_timestamp_ns < cutoff_ns:
-                self._samples.popleft()
+                if self._samples.popleft() is self._max_valid_sample:
+                    rebuild_latest = True
+            if rebuild_latest:
+                self._max_valid_sample = max(
+                    (item for item in self._samples if item.is_valid),
+                    key=lambda item: (item.timestamp_ns, item.sequence),
+                    default=None,
+                )
+
+    def _latest_valid(self) -> SensorSample | None:
+        """Return the retained maximum by measurement time and sequence."""
+        with self._lock:
+            return self._max_valid_sample
 
     def snapshot(self) -> tuple[SensorSample, ...]:
         """Return an immutable point-in-time copy."""
@@ -56,6 +76,7 @@ class HistoryBuffer:
         with self._lock:
             self._samples.clear()
             self._last_arrival_timestamp_ns = None
+            self._max_valid_sample = None
 
     def __len__(self) -> int:
         """Return the retained sample count."""

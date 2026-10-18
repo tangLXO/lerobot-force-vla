@@ -6,7 +6,15 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 import draccus
+from b601_profile_review import (
+    bounded_validation_summary,
+    config_document,
+    operator_teleoperation_summary,
+    require_profile_pin,
+    require_validation_evidence_pin,
+)
 
+from lerobot.force_control.demonstration import TeacherRecordConfig
 from lerobot.robots.rebot_b601_follower.calibration import B601GripperCalibration
 from lerobot.robots.rebot_b601_follower.control_protocol import force_pos_wire_codes
 from lerobot.scripts.lerobot_force_teacher import ForceTeacherRunConfig, run as run_runtime
@@ -19,7 +27,27 @@ def load_reviewed(path):
     if asdict(calibration) != draft["calibration"]:
         raise ValueError("校准文件已变化；请重新加载并读取新参考")
     config = draccus.decode(ForceTeacherRunConfig, draft["config"])
+    if draft.get("full_arm_profile_file"):
+        if (
+            getattr(config.b601, "validation", None) is not None
+            or getattr(config.b601, "operator_teleoperation", None) is not None
+            or draft.get("full_arm_profile_pin") is not None
+        ):
+            require_profile_pin(draft["full_arm_profile_file"], draft.get("full_arm_profile_pin"))
+        # The UI pins the decoded profile in draft.config. Reject a disk change,
+        # and never silently reload changed modes/gains immediately before motion.
+        selected = draccus.decode(
+            ForceTeacherRunConfig,
+            config_document(json.loads(Path(draft["full_arm_profile_file"]).read_text(encoding="utf-8"))),
+        )
+        if draccus.encode(replace(selected, trace_root=config.trace_root)) != draccus.encode(config):
+            raise ValueError("全臂配置文件已变化；请重新预检并读取参考")
+    if draft.get("recording") is not None:
+        config = replace(config, recording=TeacherRecordConfig(**draft["recording"]))
+    bounded_validation_summary(config)
+    operator_teleoperation_summary(config)
     config.validate()
+    require_validation_evidence_pin(config, draft.get("full_arm_validation_evidence_pin"))
     if (config.safety.q_min_deg, config.safety.q_max_deg) != (
         calibration.minimum_deg,
         calibration.maximum_deg,
@@ -43,7 +71,7 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
     if reviewed_config is None:
         raise ValueError("An explicit reviewed configuration is required")
     draft, config = load_reviewed(reviewed_config)
-    profile = config.b601.control.profiles[0]
+    profile = next(profile for profile in config.b601.control.profiles if profile.name == "gripper")
     velocity, drive = force_pos_wire_codes(
         profile.velocity_deg_s, profile.torque_ratio, velocity_wire_code=profile.velocity_wire_code
     )
@@ -54,6 +82,9 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
             "velocity_wire_code": velocity,
             "drive_wire_code": drive,
             "hardware_ack": "unknown",
+            "bounded_validation": bounded_validation_summary(config),
+            "operator_teleoperation": operator_teleoperation_summary(config),
+            "production_arm_authorized": False,
         }
     if draft.get("executable") is not True or draft.get("consumed") is not False:
         raise ValueError("需要本次只读反馈、人工确认及未使用的配置")
@@ -85,7 +116,12 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
         shutdown_evidence=result.get("shutdown_evidence", shutdown),
         trace_root=str(config.trace_root.resolve()),
         hardware_ack="unknown",
+        bounded_validation=bounded_validation_summary(config),
+        operator_teleoperation=operator_teleoperation_summary(config),
+        production_arm_authorized=False,
     )
+    if live is not None and getattr(live, "recording", None) is not None:
+        result["recording"] = live.recording
     (output / "result.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )

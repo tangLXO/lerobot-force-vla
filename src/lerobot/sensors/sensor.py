@@ -388,27 +388,62 @@ class Sensor(abc.ABC):
         except SensorDataUnavailableError as exc:
             raise TimeoutError(f"Latest {label} sample is unavailable or stale.") from exc
 
-    def read_latest_before(self, target_timestamp_ns: int, max_age_ms: float | None = None) -> SensorSample:
-        """Select the newest causal valid sample at a fixed target time."""
+    def read_latest_before(
+        self,
+        target_timestamp_ns: int,
+        max_age_ms: float | None = None,
+        *,
+        minimum_sequence: int | None = None,
+    ) -> SensorSample:
+        """Select one causal valid sample within a consumer's recording boundary.
+
+        By default the latest active recorder lease supplies the boundary. A
+        long-lived control owner may explicitly retain its own trace's boundary
+        while an independent episode recorder starts. This changes only sequence
+        eligibility; availability, validity, freshness and recorder faults remain
+        mandatory.
+        """
         from .synchronization import SensorDataUnavailableError, latest_causal_sample
 
+        if minimum_sequence is not None and (type(minimum_sequence) is not int or minimum_sequence < 0):
+            raise ValueError("minimum_sequence must be a non-negative integer or None.")
         self._require_active()
         with self._publication_condition:
-            boundary = max((lease.start_sequence for lease in self._recorder_leases.values()), default=0)
+            boundary = (
+                max((lease.start_sequence for lease in self._recorder_leases.values()), default=0)
+                if minimum_sequence is None
+                else minimum_sequence
+            )
+            candidate = self._history._latest_valid()
+            if (
+                candidate is not None
+                and candidate.sequence >= boundary
+                and candidate.timestamp_ns <= target_timestamp_ns
+                and candidate.arrival_timestamp_ns <= target_timestamp_ns
+            ):
+                resolved_age_ms = self._latest_max_age_ms(max_age_ms)
+                if resolved_age_ms is None or target_timestamp_ns - candidate.timestamp_ns <= int(
+                    resolved_age_ms * 1_000_000
+                ):
+                    return candidate
             samples = tuple(sample for sample in self._history.snapshot() if sample.sequence >= boundary)
         if not samples:
             raise RuntimeError(f"{type(self).__name__} has not produced a sample yet.")
-        if max_age_ms is None:
-            selected = self.features if self.config.frame_features is None else self.config.frame_features
-            max_age_ms = self.config.resolve_max_age_ms(frame_features_present=bool(selected))
-        else:
-            self._validate_finite_number("max_age_ms", max_age_ms, allow_zero=True)
+        max_age_ms = self._latest_max_age_ms(max_age_ms)
         sample = latest_causal_sample(samples, target_timestamp_ns, max_age_ms)
         if sample is None:
             raise SensorDataUnavailableError(
                 f"{type(self).__name__} has no valid causal sample at {target_timestamp_ns}."
             )
         return sample
+
+    def _latest_max_age_ms(self, max_age_ms: float | None) -> float | None:
+        """Resolve the same age policy for direct and historical selection."""
+        if max_age_ms is None:
+            selected = self.features if self.config.frame_features is None else self.config.frame_features
+            return self.config.resolve_max_age_ms(frame_features_present=bool(selected))
+        self._validate_finite_number("max_age_ms", max_age_ms, allow_zero=True)
+        return max_age_ms
 
     def read_window(self, start_timestamp_ns: int, end_timestamp_ns: int) -> tuple[SensorSample, ...]:
         """Return raw causal records in ``(start, end]`` from short history."""

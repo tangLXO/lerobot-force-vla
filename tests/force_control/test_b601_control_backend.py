@@ -233,7 +233,6 @@ def test_every_receiver_preserves_partial_frame_for_fault_history(setup_backend,
         bridge_packet(7, payload=b"\x07\x00\x33\x0a" + struct.pack("<I", 4)),
         bridge_packet(7, payload=b"\x07\x00\x55\x0a" + struct.pack("<I", 4)),
         bridge_packet(7, status=8),
-        bridge_packet(7, status=1, position_uint=65535),
         b"\x00" * 16,
     ],
 )
@@ -470,6 +469,47 @@ def test_integer_speed_is_reported_and_submitted_without_degree_round_trip(setup
     assert not device.has_resources
 
 
+def test_fully_open_endpoint_can_be_submitted_repeatedly_and_then_closed(setup_backend, tmp_path):
+    """Replay the -270 degree limit with a fake bus and preserve the actual wire receipt."""
+    original, fake, clock, _ = setup_backend
+    calibration_path = Path(original.config.calibration_file)
+    calibration_path.write_text(
+        json.dumps(
+            {"gripper": {"id": 7, "drive_mode": 0, "homing_offset": 0, "range_min": -270, "range_max": 0}}
+        ),
+        encoding="utf-8",
+    )
+    configured = replace(profile(), minimum_deg=-270, maximum_deg=0, max_relative_deg=100)
+    fake.mapping = {21: 12.5, 22: 30.0, 23: 10.0}
+    position_uint = round((math.radians(-250.84) + 12.5) * 65535 / 25)
+    fake.feedback_transform = lambda _packet, motor_id: bridge_packet(
+        motor_id, status=fake.status, position_uint=position_uint
+    )
+    device = backend.B601ControlBackend(
+        "FAKE_CONTROL",
+        readonly.DEFAULT_B601_JOINTS[-1:],
+        replace(original.config, profiles=(configured,)),
+        lock_root=tmp_path,
+    )
+    try:
+        device.connect()
+        device.start_gripper(snapshot(device, clock), lambda: None)
+        for requested in (-269.0331191043383, -270.0, -270.0, -269.0):
+            receipt = device.send_gripper_position(requested, feedback_snapshot=snapshot(device, clock))
+            assert receipt.all_submitted
+            result = receipt.get("gripper")
+            assert result.candidate_deg == result.clipped_deg == requested
+            assert -270 <= result.submitted_deg <= 0
+            packet = commands(fake)[-1]
+            assert int.from_bytes(packet[13:17], "little") == 0x307
+            assert result.submitted_deg == math.degrees(struct.unpack("<f", packet[21:25])[0])
+            assert result.hardware_ack == "unknown"
+        assert device.failure is None
+    finally:
+        device.disconnect()
+    assert not device.has_resources
+
+
 def test_degrees_speed_receipt_preserves_requested_and_quantized_values(setup_backend):
     device, _, _, factory = setup_backend
     settings = device.command_settings
@@ -626,7 +666,6 @@ def test_fault_limits_intermediate_frames_even_if_disabled_follows(setup_backend
         (bridge_packet(7, payload=b"\x07\x00\x33\x0a" + struct.pack("<I", 4)), "not feedback"),
         (bridge_packet(7, payload=b"\x07\x00\x55\x0a" + struct.pack("<I", 4)), "not feedback"),
         (bridge_packet(7, status=8), "Unexpected gripper drive status"),
-        (bridge_packet(7, status=1, position_uint=65535), "校准限位"),
         (b"\x00" * 16, "framing/ID"),
     ],
 )
@@ -771,16 +810,18 @@ def test_startup_encoder_refuses_unreviewed_or_ambiguous_mode(mode):
         encode_mode_write(7, mode)
 
 
-@pytest.mark.parametrize("kwargs", [{"kd": 12}, {"kp": None}, {"kp": True}])
-def test_mit_rejects_legacy_out_of_range_or_missing_gains(kwargs):
+@pytest.mark.parametrize("kwargs", [{"kd": -1}, {"kp": None}, {"kp": True}])
+def test_mit_rejects_negative_or_missing_gains(kwargs):
     with pytest.raises(ValueError):
         replace(profile("shoulder_pan", "mit"), **kwargs).validate()
 
 
-def test_quantized_target_outside_soft_limits_is_rejected():
+def test_position_endpoint_quantization_stays_inside_configured_limits():
     p = replace(profile(), minimum_deg=0.1, maximum_deg=1)
-    with pytest.raises(ValueError, match="quantization"):
-        encode_position(7, 0.1, 0.1, p, (8, 14, 9))
+    encoded = encode_position(7, 0.1, 0.1, p, (8, 14, 9))
+    assert encoded.clipped_deg == 0.1
+    assert p.minimum_deg <= encoded.wire_position_deg <= p.maximum_deg
+    assert encoded.wire_position_deg == math.degrees(struct.unpack("<f", encoded.packet[21:25])[0])
 
 
 @pytest.mark.parametrize(
@@ -931,6 +972,161 @@ def test_disabled_status_evidence_survives_a_cleanup_position_error(setup_backen
     assert stop["status"] == "unknown" and stop["disabled_feedback_observed"]
     assert stop["error"] and not stop["hardware_stop_confirmed"]
     assert stop["hardware_ack"] == "unknown" and commands(fake) == [encode_disable(7)]
+
+
+@pytest.fixture
+def working_range_backend(setup_backend):
+    """Distinct working and hard bounds with synthetic, adjustable feedback."""
+    original, fake, clock, _ = setup_backend
+    calibration_path = Path(original.config.calibration_file)
+    calibration_path.write_text(
+        json.dumps(
+            {"gripper": {"id": 7, "drive_mode": 0, "homing_offset": 0, "range_min": -300, "range_max": 0}}
+        ),
+        encoding="utf-8",
+    )
+    configured = replace(profile(), minimum_deg=-270, maximum_deg=0)
+    device = backend.B601ControlBackend(
+        "FAKE_WORKING_RANGE",
+        readonly.DEFAULT_B601_JOINTS[-1:],
+        replace(original.config, profiles=(configured,)),
+        lock_root=calibration_path.parent,
+    )
+    position = {"degrees": -270.053}
+
+    def feedback(_packet, motor_id):
+        code = round((math.radians(position["degrees"]) + 8.0) / 16.0 * 65535)
+        return bridge_packet(motor_id, status=fake.status, position_uint=code)
+
+    fake.feedback_transform = feedback
+    yield device, fake, clock, position
+    if device.has_resources:
+        with suppress(RuntimeError):
+            device.disconnect()
+
+
+def test_startup_holds_hard_safe_feedback_outside_working_command_range(working_range_backend):
+    device, fake, clock, _ = working_range_backend
+    device.connect()
+    reference = snapshot(device, clock)
+    measured = reference.get("gripper").position_deg
+    assert -300 < measured < -270
+    wire = device.start_gripper(reference, lambda: None)
+    assert abs(wire - measured) < 0.00003  # Only float32 encoding, no endpoint motion.
+    assert wire < -270 and device.startup_receipt["complete"]
+    startup_positions = [p for p in commands(fake) if int.from_bytes(p[13:17], "little") == 0x307]
+    assert len(startup_positions) == 2
+    assert all(math.degrees(struct.unpack("<f", p[21:25])[0]) == wire for p in startup_positions)
+    assert device._profiles["gripper"].minimum_deg == -270
+    fake.writes.clear()
+    receipt = device.send_gripper_position(-270, feedback_snapshot=snapshot(device, clock))
+    result = receipt.get("gripper")
+    assert receipt.all_submitted and result.clipped_deg == -270
+    assert -270 <= result.submitted_deg < -269.9999
+    assert result.submitted_deg == math.degrees(struct.unpack("<f", commands(fake)[0][21:25])[0])
+    assert result.hardware_ack == "unknown"
+    assert device._last_command_feedback["position_deg"] == measured
+    device.disconnect()
+    assert not device.has_resources
+
+
+def test_startup_still_rejects_feedback_outside_calibrated_hard_limits(working_range_backend):
+    device, fake, _, position = working_range_backend
+    position["degrees"] = -300.053
+    with pytest.raises(ValueError, match="校准限位"):
+        device.connect()
+    assert not commands(fake)
+    assert not device._gripper_start_attempted
+
+
+def test_hard_overtravel_blocks_motion_but_preserves_fresh_disabled_observation(working_range_backend):
+    device, fake, clock, position = working_range_backend
+    device.connect()
+    device.start_gripper(snapshot(device, clock), lambda: None)
+    reference = snapshot(device, clock)
+    fake.writes.clear()
+    position["degrees"] = -300.053
+    motion = device.send_gripper_position(-270, feedback_snapshot=reference)
+    assert not motion.all_submitted
+    assert motion.get("gripper").submitted_deg is None
+    assert "校准限位" in motion.get("gripper").error
+    original_failure = device._failure
+    stop = device.emergency_stop("position_hard_limit")
+    item = stop["per_joint_results"][0]
+    assert stop["status"] == "submitted" and stop["error"] is None
+    assert stop["disabled_feedback_observed"]
+    assert stop["hardware_ack"] == "unknown" and not stop["hardware_stop_confirmed"]
+    assert stop["reason"] == "position_hard_limit" and device._failure == original_failure
+    disabled = item["feedback"]
+    assert disabled["status_code"] == 0 and disabled["position_deg"] < -300
+    assert not disabled["position_within_limits"] and "hard limits" in disabled["position_limit_error"]
+    assert disabled["position_limits_deg"]["calibration"] == [-300, 0]
+    assert not disabled["rx_context"]["inherited"]
+    historical = item["intermediate_feedback"]
+    assert len(historical) == 1 and historical[0]["historical_only"]
+    assert historical[0]["status_code"] == 1 and not historical[0]["position_within_limits"]
+    device.disconnect()
+    assert not device.has_resources and commands(fake).count(encode_disable(7)) == 1
+
+
+@pytest.mark.parametrize("historical_status", [0, 1])
+def test_historical_overtravel_does_not_block_current_disabled_feedback(
+    setup_backend, monkeypatch, historical_status
+):
+    device, fake, clock, _ = connected(setup_backend, monkeypatch)
+    old = bridge_packet(7, status=historical_status, position_uint=0)
+    timed_out_query_prefix(device, fake, clock, monkeypatch, old)
+    fake.feedback_transform = lambda _packet, motor_id: bridge_packet(
+        motor_id, status=fake.status, position_uint=0
+    )
+    stop = device.emergency_stop("out_of_bounds_before_disable")
+    item = stop["per_joint_results"][0]
+    assert stop["status"] == "submitted" and stop["disabled_feedback_observed"]
+    assert item["intermediate_feedback"][0]["historical_only"]
+    assert item["intermediate_feedback"][0]["status_code"] == historical_status
+    assert not item["intermediate_feedback"][0]["position_within_limits"]
+    assert not item["feedback"]["rx_context"]["inherited"]
+    assert not item["feedback"]["position_within_limits"]
+    assert item["feedback"]["status_code"] == 0
+
+
+def test_historical_out_of_bounds_disabled_alone_never_confirms_new_disable(setup_backend, monkeypatch):
+    device, fake, clock, _ = connected(setup_backend, monkeypatch)
+    old = bridge_packet(7, status=0, position_uint=0)
+    timed_out_query_prefix(device, fake, clock, monkeypatch, old)
+    fake.auto_command_feedback = False
+    stop = device.emergency_stop("historical_disabled_only")
+    assert stop["status"] == "unknown" and "TimeoutError" in stop["error"]
+    assert not stop.get("disabled_feedback_observed", False)
+    history = stop["per_joint_results"][0]["intermediate_feedback"]
+    assert len(history) == 1 and history[0]["historical_only"]
+    assert not history[0]["position_within_limits"]
+    assert commands(fake) == [encode_disable(7)]
+
+
+def test_fault_records_out_of_bounds_intermediate_enabled_before_current_disabled(setup_backend, monkeypatch):
+    device, fake, _, _ = connected(setup_backend, monkeypatch)
+    fake.pending.extend(bridge_packet(7, status=1, position_uint=65535))
+    stop = device.emergency_stop("overtravel_with_pending_enabled")
+    assert stop["status"] == "submitted" and stop["disabled_feedback_observed"]
+    item = stop["per_joint_results"][0]
+    intermediate = item["intermediate_feedback"]
+    assert len(intermediate) == 1 and intermediate[0]["status_code"] == 1
+    assert not intermediate[0]["rx_context"]["inherited"]
+    assert not intermediate[0]["position_within_limits"]
+    assert intermediate[0]["position_deg"] > 30
+    assert item["feedback"]["status_code"] == 0 and item["feedback"]["position_within_limits"]
+    assert commands(fake) == [encode_disable(7)]
+
+
+@pytest.mark.parametrize("fault_attempt,expected_status", [(False, 0), (False, 1), (True, 1)])
+def test_only_fault_disable_can_record_out_of_bounds_feedback_without_rejecting(
+    setup_backend, monkeypatch, fault_attempt, expected_status
+):
+    device, fake, clock, _ = connected(setup_backend, monkeypatch)
+    fake.pending.extend(bridge_packet(7, status=expected_status, position_uint=0))
+    with pytest.raises(ValueError, match="校准限位"):
+        device._receive_gripper_feedback(clock.now + 20_000_000, expected_status, fault_attempt=fault_attempt)
 
 
 def test_changed_calibration_after_connect_blocks_startup(setup_backend):

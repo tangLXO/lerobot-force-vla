@@ -25,6 +25,7 @@ from .config import (
     positive,
     validate_profile,
 )
+from .operator_settings import checked_arm_settings, migrate_arm_settings
 from .runtime import DEFAULT_FEEDBACK_BUDGET_MS, DEFAULT_TICK_DEADLINE_MS, RuntimeConfig
 
 GRAVITY_N_PER_KG = 9.80665
@@ -70,8 +71,8 @@ FIELDS = (
     ("limits", "max_command_tracking_error_deg", "跟随误差停止阈值 (°) · 必填", "", float, False, None),
     ("limits", "stall_position_tolerance_deg", "停滞 / 小步到位容差 (°) · 必填", "", float, False, None),
     ("limits", "stall_timeout_s", "持续停滞冻结积分时间 (s) · 必填", "", float, False, None),
-    ("limits", "soft_q_min_deg", "软件角度下限 (°)", "", float, False, "soft_limits"),
-    ("limits", "soft_q_max_deg", "软件角度上限 (°)", "", float, False, "soft_limits"),
+    ("limits", "soft_q_min_deg", "工作目标下限 (°)，到达后保持", "", float, False, "soft_limits"),
+    ("limits", "soft_q_max_deg", "工作目标上限 (°)，到达后保持", "", float, False, "soft_limits"),
     ("limits", "max_total_travel_deg", "累计绝对行程上限 (°)", "", float, False, "travel"),
     ("limits", "max_run_time_s", "运行时长上限 (s)", "", float, False, "duration"),
     ("limits", "force_max_age_ms", "力反馈最大年龄 (ms)", "50", float, False, None),
@@ -100,6 +101,7 @@ FIELDS = (
     ("device", "watchdog_ticks", "看门狗 TIMEOUT ticks (50 μs/tick)", "2000", int, False, None),
     ("device", "parameter_write_settle_s", "参数写入后等待读回 (s)", "0.01", float, False, None),
     ("device", "control_hz", "控制目标频率 (Hz)", "100", float, False, None),
+    ("device", "scheduler_sleep_slice_ms", "调度最长分段休眠 (ms)", "5", float, False, None),
     (
         "device",
         "feedback_budget_ms",
@@ -151,7 +153,7 @@ FIELDS = (
 )
 OPTIONAL_GROUPS = {
     "acceleration": ("启用位置变化率加速度限制", True),
-    "soft_limits": ("启用额外软件角度限位", False),
+    "soft_limits": ("启用工作目标范围（校准硬范围内）", False),
     "travel": ("启用累计行程限制", False),
     "duration": ("启用运行时长限制", False),
 }
@@ -162,6 +164,7 @@ GRIPPER_DEVICE_FIELDS = frozenset(
         "drive_percent",
         "watchdog_ticks",
         "control_hz",
+        "scheduler_sleep_slice_ms",
         "feedback_budget_ms",
         "tick_deadline_ms",
         "command_ttl_ms",
@@ -178,7 +181,7 @@ FIELD_PAGES = {
     for section, key, *_ in FIELDS
 }
 SETTINGS_FORMAT = "b601_ip_tuner_settings"
-SETTINGS_SCHEMA_VERSION = 6
+SETTINGS_SCHEMA_VERSION = 8
 LEADER_FIELDS = frozenset(key for _, key, *_ in FIELDS if key.startswith("leader_"))
 MOTION_FIELDS = {
     "gripper_follow_speed_deg_s",
@@ -193,7 +196,7 @@ LEGACY_TARGET_FIELDS = {
 }
 
 
-def settings_document(values, enabled, calibration_path):
+def settings_document(values, enabled, calibration_path, *, arm_settings=None):
     """Save editable drafts, never motor references, activation or cleanup state."""
     if (
         not isinstance(values, dict)
@@ -214,12 +217,13 @@ def settings_document(values, enabled, calibration_path):
         "calibration_file": str(Path(calibration_path).resolve()),
         "values": dict(values),
         "enabled": dict(enabled),
+        "arm_settings": checked_arm_settings(arm_settings),
     }
 
 
-def save_settings(path, values, enabled, calibration_path):
+def save_settings(path, values, enabled, calibration_path, *, arm_settings=None):
     """Replace one requested JSON atomically; preserve the previous file on failure."""
-    document = settings_document(values, enabled, calibration_path)
+    document = settings_document(values, enabled, calibration_path, arm_settings=arm_settings)
     path = Path(path).resolve()
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
@@ -239,17 +243,17 @@ def save_settings(path, values, enabled, calibration_path):
     return path
 
 
-def read_settings(path, *, on_unit_conversion=None):
+def read_settings(path, *, on_unit_conversion=None, on_arm_settings=None):
     """Strictly read a parameter file; calibration and runtime state are not trusted from JSON."""
     path = Path(path).resolve()
     document = json.loads(path.read_text(encoding="utf-8"))
     keys = {"format", "schema_version", "controller_type", "calibration_file", "values", "enabled"}
     if (
         not isinstance(document, dict)
-        or set(document) != keys
+        or set(document) not in (keys, keys | {"arm_settings"})
         or document["format"] != SETTINGS_FORMAT
         or type(document["schema_version"]) is not int
-        or document["schema_version"] not in (1, 2, 3, 4, 5, SETTINGS_SCHEMA_VERSION)
+        or document["schema_version"] not in (1, 2, 3, 4, 5, 6, 7, SETTINGS_SCHEMA_VERSION)
         or document["controller_type"] != "ip"
         or not isinstance(document["calibration_file"], str)
         or not document["calibration_file"].strip()
@@ -258,6 +262,8 @@ def read_settings(path, *, on_unit_conversion=None):
     ):
         raise ValueError("不是当前 I-P 参数文件，不能导入运行日志或旧控制配置")
     values = dict(document["values"])
+    if document["schema_version"] < 8:
+        values.setdefault("scheduler_sleep_slice_ms", default_values()["scheduler_sleep_slice_ms"])
     if document["schema_version"] < 5:
         values = canonicalize_teacher_fields(values)
     if document["schema_version"] < 6:
@@ -287,9 +293,14 @@ def read_settings(path, *, on_unit_conversion=None):
     calibration_path = Path(document["calibration_file"])
     if not calibration_path.is_absolute():
         calibration_path = path.parent / calibration_path
-    checked = settings_document(values, document["enabled"], calibration_path)
+    arm_settings = document.get("arm_settings")
+    if document["schema_version"] < 8:
+        arm_settings = migrate_arm_settings(arm_settings)
+    checked = settings_document(values, document["enabled"], calibration_path, arm_settings=arm_settings)
     if document["schema_version"] == 1 and on_unit_conversion is not None:
         on_unit_conversion("旧文件目标及范围已按 9.80665 N/kg 换算为 N，原文件未改写")
+    if on_arm_settings is not None:
+        on_arm_settings(checked["arm_settings"])
     return checked["values"], checked["enabled"], Path(checked["calibration_file"])
 
 
@@ -410,8 +421,8 @@ def build_config(values, enabled, calibration, output, *, initial_mode="force"):
     profile = B601JointCommandProfile(
         "gripper",
         "force_pos",
-        calibration.minimum_deg,
-        calibration.maximum_deg,
+        safety.soft_q_min_deg if safety.soft_q_min_deg is not None else calibration.minimum_deg,
+        safety.soft_q_max_deg if safety.soft_q_max_deg is not None else calibration.maximum_deg,
         v["max_relative_target_deg"],
         velocity_wire_code=v["motor_velocity_code"],
         torque_ratio=drive,
@@ -456,6 +467,7 @@ def build_config(values, enabled, calibration, output, *, initial_mode="force"):
         safety=safety,
         runtime=RuntimeConfig(
             control_hz=v["control_hz"],
+            scheduler_sleep_slice_ms=v["scheduler_sleep_slice_ms"],
             feedback_budget_ms=v["feedback_budget_ms"],
             tick_deadline_ms=v["tick_deadline_ms"],
             command_ttl_ms=v["command_ttl_ms"],

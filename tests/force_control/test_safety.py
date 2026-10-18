@@ -7,6 +7,7 @@ import pytest
 from lerobot.force_control.config import SafetyConfig, TeacherConfig
 from lerobot.force_control.safety import SafetySupervisor
 from lerobot.force_control.teacher import ForceTeacher
+from lerobot.force_control.types import ControlPhase
 from tests.force_control.helpers import inputs
 
 
@@ -222,3 +223,118 @@ def test_runtime_budget_survives_freeze_and_resume_reference_resets():
     safety.reset_motion_reference(0.01, 1_150_000_000, preserve_budget=True)
     later = inputs(0, now=1_200_000_000)
     assert safety.apply(later, replace(prop, inputs=later)).fault_reason == "run_time_exhausted"
+
+
+def working_endpoint_case(
+    *, q=-270, measured=-270.01, target=-280, phase=ControlPhase.FOLLOW, sign=1, acceleration=None, **config
+):
+    safety, inp, proposal = make_case(
+        sign=sign,
+        q_min_deg=-300,
+        q_max_deg=0,
+        soft_q_min_deg=-270,
+        soft_q_max_deg=0,
+        max_relative_target_deg=100,
+        max_command_tracking_error_deg=100,
+        max_close_speed_deg_s=100,
+        max_open_speed_deg_s=100,
+        acceleration_limit_deg_s2=acceleration,
+        **config,
+    )
+    inp = replace(inp, q_prev_sent_deg=q, q_measured_deg=measured)
+    proposal = replace(proposal, phase=phase, next_phase=phase)
+    delta = sign * (target - q)
+    # A P-only outward request also exercises the force phase without I anti-windup hiding it.
+    proposal = with_delta(proposal, inp, delta, sign, delta_i=0, delta_p=delta)
+    return safety, inp, proposal
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        ControlPhase.FOLLOW,
+        ControlPhase.FOLLOW_WAIT_CLEAR,
+        ControlPhase.POSITION_HOLD,
+        ControlPhase.FORCE_TRACK,
+    ],
+)
+@pytest.mark.parametrize("acceleration", [None, 10])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_working_endpoint_holds_with_measured_inertia_inside_hard_margin(phase, acceleration, sign):
+    safety, inp, proposal = working_endpoint_case(phase=phase, acceleration=acceleration, sign=sign)
+    safety.commit(-269, -270, 0.02, True)  # Last submitted trajectory was moving toward the endpoint.
+    original_rate = proposal.u_raw_deg_s
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason is None and not decision.safety_override
+    assert decision.q_after_safety_deg == -270 and decision.u_limited_deg_s == 0
+    assert "soft_position" in decision.clip_flags and "speed" in decision.clip_flags
+    if acceleration is not None:
+        assert "deceleration_override" in decision.clip_flags
+    assert proposal.u_raw_deg_s == original_rate
+    assert inp.q_prev_sent_deg == -270 and inp.q_measured_deg == -270.01
+
+
+def test_crossing_calibrated_hard_limit_still_faults_with_working_margin():
+    safety, inp, proposal = working_endpoint_case(measured=-300.001)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason == "measured_position_outside_limits"
+    assert decision.q_after_safety_deg is None
+
+
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_inertia_outside_working_range_can_follow_back_inward_without_new_reference(sign):
+    safety, inp, proposal = working_endpoint_case(target=-269, sign=sign)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason is None and decision.q_after_safety_deg == -269
+    assert inp.q_prev_sent_deg == -270
+
+
+@pytest.mark.parametrize(
+    "phase", [ControlPhase.FOLLOW, ControlPhase.FOLLOW_WAIT_CLEAR, ControlPhase.POSITION_HOLD]
+)
+@pytest.mark.parametrize("endpoint,q,target", [(-270, -269, -289), (0, -1, 19)])
+@pytest.mark.parametrize("sign", [-1, 1])
+def test_endpoint_braking_reserves_this_tick_and_stopping_distance(phase, endpoint, q, target, sign):
+    safety, inp, proposal = working_endpoint_case(
+        q=q, measured=q, target=target, phase=phase, sign=sign, acceleration=10
+    )
+    direction = 1 if target > q else -1
+    safety.commit(q - direction * 2, q, inp.dt_control_s, True)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason is None
+    assert "endpoint_braking" in decision.clip_flags and "speed" in decision.clip_flags
+    assert -270 <= decision.q_after_safety_deg <= 0
+    speed = abs(decision.u_limited_deg_s)
+    remaining = abs(endpoint - q)
+    assert speed * inp.dt_control_s + speed**2 / (2 * 10) <= remaining + 1e-12
+    assert 0 < speed < abs(proposal.u_raw_deg_s)
+    assert direction * (decision.q_after_safety_deg - q) > 0
+
+
+def test_no_acceleration_keeps_requested_speed_until_working_endpoint():
+    safety, inp, proposal = working_endpoint_case(q=-265, measured=-265, target=-266)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason is None and decision.q_after_safety_deg == -266
+    assert decision.u_limited_deg_s == -50 and "endpoint_braking" not in decision.clip_flags
+
+
+def test_endpoint_braking_does_not_add_a_new_force_control_law():
+    safety, inp, proposal = working_endpoint_case(
+        q=-269, measured=-269, target=-280, phase=ControlPhase.FORCE_TRACK, acceleration=10
+    )
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason is None and "endpoint_braking" not in decision.clip_flags
+
+
+def test_working_margin_does_not_expand_measured_relative_limit():
+    safety, inp, proposal = working_endpoint_case(measured=-272, target=-270)
+    safety.config = replace(safety.config, max_relative_target_deg=0.5)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason == "incompatible_command_limits" and decision.q_after_safety_deg is None
+
+
+def test_soft_outside_start_cannot_jump_to_working_range_or_forge_reference():
+    safety, inp, proposal = working_endpoint_case(q=-280, measured=-280, target=-270)
+    decision = safety.apply(inp, proposal)
+    assert decision.fault_reason == "incompatible_command_limits" and decision.q_after_safety_deg is None
+    assert inp.q_prev_sent_deg == -280

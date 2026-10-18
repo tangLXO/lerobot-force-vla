@@ -301,11 +301,15 @@ SensorSample(
 - 样本年龄大于 `max_age_ms` 时抛出 `TimeoutError`；
 - 适合 Sensor 与 Robot 主循环异频的场景。
 
-### `read_latest_before(target_timestamp_ns, max_age_ms)`
+### `read_latest_before(target_timestamp_ns, max_age_ms, *, minimum_sequence=None)`
 
 - 从短期 History 中选择不晚于 target 的最近 valid 样本；
 - 必须同时满足 measurement timestamp 和 arrival timestamp 不晚于 target；
 - 最近候选 invalid、迟到或 stale 时继续回退更早候选，而不是返回未来值或填零。
+- 默认以最新 recorder lease 的起始 sequence 为读取边界。持续运行的控制 owner 可显式传入自身
+  trace 的 `minimum_sequence`，使另一个 episode recorder 的启动不会短暂隐藏已有控制输入；
+  新 episode 仍须只录制其订阅起始 sequence 之后的样本。该参数只接受非负整数，且不改变
+  有效性、因果时间、最大年龄和 recorder fault 检查。
 
 ### `read_window(start_timestamp_ns, end_timestamp_ns)`
 

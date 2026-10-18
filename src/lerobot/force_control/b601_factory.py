@@ -6,8 +6,11 @@ scopes retain the independent hardware acceptance gate even with complete profil
 
 from dataclasses import dataclass
 
+from lerobot.robots.rebot_b601_follower.arm_calibration import B601ArmCalibration
 from lerobot.robots.rebot_b601_follower.control_backend import B601ControlBackend, B601ControlConfig
-from lerobot.robots.rebot_b601_follower.readonly_transport import B601ReadonlyJointSpec
+from lerobot.robots.rebot_b601_follower.full_arm_validation import FullArmValidationConfig
+from lerobot.robots.rebot_b601_follower.operator_teleoperation import OperatorTeleoperationConfig
+from lerobot.robots.rebot_b601_follower.readonly_transport import DEFAULT_B601_JOINTS, B601ReadonlyJointSpec
 from lerobot.sensors import SensorConfig
 from lerobot.sensors.x518 import X518SensorConfig
 
@@ -24,6 +27,8 @@ class B601HardwareConfig:
     joint_specs: tuple[B601ReadonlyJointSpec, ...] = ()
     control: B601ControlConfig | None = None
     startup_mode: str | None = None
+    validation: FullArmValidationConfig | None = None
+    operator_teleoperation: OperatorTeleoperationConfig | None = None
 
     def validate(self, safety: SafetyConfig, runtime: RuntimeConfig, joint_names: tuple[str, ...]) -> None:
         """Validate scope and shared limits without opening or constructing a serial handle."""
@@ -56,7 +61,23 @@ class B601HardwareConfig:
             and self.control.profiles[0].mode == "force_pos"
             and self.control.fault_action == "disable_gripper"
         )
-        required_startup = "prepare_disabled_gripper" if gripper_only else "verify_pre_enabled"
+        if self.validation is not None and self.operator_teleoperation is not None:
+            raise ValueError("Choose either operator teleoperation or the separate diagnostic validation")
+        if gripper_only and (self.validation is not None or self.operator_teleoperation is not None):
+            raise ValueError("A full-arm validation capability requires all seven joints")
+        required_startup = (
+            "prepare_disabled_gripper"
+            if gripper_only
+            else (
+                "prepare_disabled_operator_teleoperation"
+                if self.operator_teleoperation is not None
+                else (
+                    "prepare_disabled_full_arm_validation"
+                    if self.validation is not None
+                    else "verify_pre_enabled"
+                )
+            )
+        )
         if self.startup_mode != required_startup:
             raise ValueError(f"b601.startup_mode must explicitly select {required_startup}")
         if gripper_only:
@@ -64,6 +85,12 @@ class B601HardwareConfig:
                 raise ValueError("Physical gripper control requires explicit stall tolerance and timeout")
             # Constructing and validating the disconnected backend performs no I/O.
             self.make_device().preflight_control()
+        else:
+            self.validate_arm_profile()
+            if self.validation is not None or self.operator_teleoperation is not None:
+                # Evidence admission is read-only. The backend still requires fresh
+                # disabled feedback and leader alignment before its explicit start.
+                self.make_device().preflight_control()
         if self.control.fault_action is None:
             raise ValueError("B601 physical fault disposition is unresolved")
         if safety.fault_action != "stop":
@@ -82,11 +109,130 @@ class B601HardwareConfig:
         if gripper.max_relative_deg > safety.max_relative_target_deg:
             raise ValueError("B601 gripper relative limit exceeds the runtime safety envelope")
 
+    def validate_arm_profile(self) -> B601ArmCalibration:
+        """Inspect complete explicit arm configuration without lifting the hardware gate."""
+        if self.control is None:
+            raise ValueError("Full-arm preflight requires explicit command profiles")
+        self.control.validate()
+        expected = {spec.name: spec.motor_id for spec in DEFAULT_B601_JOINTS}
+        if {spec.name: spec.motor_id for spec in self.joint_specs} != expected:
+            raise ValueError("Full-arm preflight requires the seven B601 joint names and motor IDs")
+        required_startup = (
+            "prepare_disabled_operator_teleoperation"
+            if self.operator_teleoperation is not None
+            else (
+                "prepare_disabled_full_arm_validation"
+                if self.validation is not None
+                else "verify_pre_enabled"
+            )
+        )
+        if self.startup_mode != required_startup:
+            raise ValueError(f"Full-arm startup requires explicit {required_startup}")
+        if self.control.fault_action != "disable_selected":
+            raise ValueError("Full-arm fault policy requires explicit disable_selected covering all joints")
+        if self.control.calibration_file is None:
+            raise ValueError("Full-arm preflight requires an existing calibration_file")
+        calibration = B601ArmCalibration.load(self.control.calibration_file, expected)
+        profiles = {profile.name: profile for profile in self.control.profiles}
+        if set(profiles) != set(expected):
+            raise ValueError("Full-arm profiles must cover exactly seven selected joints")
+        for name, profile in profiles.items():
+            required_mode = (
+                "force_pos"
+                if name == "gripper"
+                else "mit"
+                if self.operator_teleoperation is not None
+                else "pos_vel"
+            )
+            if profile.mode != required_mode:
+                raise ValueError(f"Full-arm profile for {name} requires explicit {required_mode}")
+            calibration.require_bounds(name, profile.minimum_deg, profile.maximum_deg)
+        return calibration
+
+    def preflight_report(self, safety: SafetyConfig, runtime: RuntimeConfig) -> dict:
+        """Report file/configuration readiness only; never open a serial port or authorize motion."""
+        report = {
+            "configuration_valid": False,
+            "motion_authorized": False,
+            "hardware_ack": "unknown",
+            "joint_names": list(runtime.joint_names),
+            "hardware_acceptance_required": tuple(runtime.joint_names) != ("gripper",),
+            "errors": [],
+        }
+        try:
+            safety.validate()
+            runtime.validate()
+            self.validate(safety, runtime, runtime.joint_names)
+            if report["hardware_acceptance_required"]:
+                calibration = self.validate_arm_profile()
+                report["calibration"] = {
+                    "path": calibration.path,
+                    "sha256": calibration.sha256,
+                    "mtime_ns": calibration.mtime_ns,
+                }
+                report["acceptance_status"] = (
+                    "operator_teleoperation_config_only"
+                    if self.operator_teleoperation is not None
+                    else (
+                        "bounded_validation_only"
+                        if self.validation is not None
+                        else "hardware_acceptance_incomplete"
+                    )
+                )
+                if self.operator_teleoperation is not None:
+                    report["operator_teleoperation"] = {
+                        "session_id": self.operator_teleoperation.session_id,
+                        "reference_envelope_deg": self.operator_teleoperation.reference_envelope_deg,
+                        "alignment_tolerance_deg": self.operator_teleoperation.alignment_tolerance_deg,
+                        "preload_tolerance_deg": self.operator_teleoperation.preload_tolerance_deg,
+                        "micro_history_required": False,
+                        "fixed_duration_limit_s": None,
+                        "fixed_force_target_N": None,
+                        "hardware_acceptance_confirmed": False,
+                    }
+                    report["micro_history_required"] = False
+                    report["physical_validation_confirmed"] = False
+                    report["next_operator_step"] = "user_operated_unloaded_joint_teleoperation"
+                if self.validation is not None:
+                    report["bounded_validation"] = {
+                        "session_id": self.validation.session_id,
+                        "maximum_duration_s": self.validation.max_duration_s,
+                        "alignment_tolerance_deg": self.validation.alignment_tolerance_deg,
+                        "target_force_N": self.validation.target_force_N,
+                        "production_arm_authorized": False,
+                    }
+                if self.operator_teleoperation is None:
+                    report["required_physical_checks"] = [
+                        "per_joint_direction_limits_and_startup",
+                        "dynamic_command_rx_ordering",
+                        "joint_feedback_freshness_under_load",
+                        "combined_leader_teacher_control",
+                        "selected_fault_disposition_and_cleanup",
+                    ]
+            else:
+                report["acceptance_status"] = "gripper_config_only"
+            report["configuration_valid"] = True
+        except (ValueError, RuntimeError) as exc:
+            report["errors"].append(f"{type(exc).__name__}: {exc}")
+        return report
+
     def make_device(self) -> B601ControlBackend:
         """Construct only; the bus owner alone will connect and perform I/O."""
         if self.control is None or self.port is None:
             raise ValueError("Validate the explicit B601 hardware profile first")
-        return B601ControlBackend(self.port, self.joint_specs, self.control, baudrate=self.baudrate)
+        if self.operator_teleoperation is not None:
+            return B601ControlBackend(
+                self.port,
+                self.joint_specs,
+                self.control,
+                baudrate=self.baudrate,
+                operator_teleoperation=self.operator_teleoperation,
+            )
+        if self.validation is None:
+            return B601ControlBackend(self.port, self.joint_specs, self.control, baudrate=self.baudrate)
+        return B601ControlBackend(
+            self.port, self.joint_specs, self.control, baudrate=self.baudrate, validation=self.validation
+        )
 
 
 def validate_b601_sensor(sensors: dict[str, SensorConfig], runtime: RuntimeConfig) -> None:

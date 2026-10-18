@@ -167,6 +167,7 @@ data/
 outputs/
 
 # Personal FORCE_POS tuning profiles (portable templates live in examples/).
+/b601.json
 /b601_ip_parameters.json
 /b601_ip_parameters_communication.json
 

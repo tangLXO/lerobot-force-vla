@@ -23,7 +23,7 @@ import draccus
 import pytest
 from draccus.utils import DecodingError
 
-from lerobot.sensors import SensorConfig, make_sensors_from_configs
+from lerobot.sensors import SensorConfig, SensorDataUnavailableError, make_sensors_from_configs
 from lerobot.sensors.x518 import X518ChannelConfig, X518Sensor, X518SensorConfig
 from lerobot.sensors.x518.protocol import _ModbusTCPClient, _X518DeviceSettings
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -417,6 +417,41 @@ def test_sensor_read_interfaces_distinguish_fresh_consumed_and_latest_samples() 
         assert fresh.values[_LEFT_FINGER_FORCE] == 3.0
         assert fresh.is_valid
     finally:
+        sensor.disconnect()
+
+
+def test_x518_owner_sequence_boundary_preserves_causality_and_age_diagnostics() -> None:
+    sensor = X518Sensor(_x518_config(max_age_ms=100))
+    _activate_without_hardware(sensor)
+    owner = sensor.acquire_recorder()
+    try:
+        first = sensor._publish_sample(
+            {_LEFT_FINGER_FORCE: 1.0, _RIGHT_FINGER_FORCE: 2.0},
+            1_000_000_000,
+            arrival_timestamp_ns=1_000_000_001,
+        )
+        episode = sensor.acquire_recorder()
+        try:
+            # A new episode starts after this sample; the existing owner may
+            # still select it using its own trace boundary.
+            with pytest.raises(RuntimeError, match="has not produced"):
+                sensor.read_latest_before(1_002_000_000)
+            assert sensor.read_latest_before(1_002_000_000, minimum_sequence=owner.start_sequence) is first
+            sensor._publish_sample(
+                {_LEFT_FINGER_FORCE: 3.0, _RIGHT_FINGER_FORCE: 4.0},
+                1_001_000_000,
+                arrival_timestamp_ns=1_003_000_000,
+            )
+            assert sensor.read_latest_before(1_002_000_000, minimum_sequence=owner.start_sequence) is first
+            with pytest.raises(SensorDataUnavailableError):
+                sensor.read_latest_before(1_002_000_000, minimum_sequence=episode.start_sequence)
+            with pytest.raises(SensorDataUnavailableError):
+                sensor.read_latest_before(1_002_000_000, max_age_ms=1, minimum_sequence=owner.start_sequence)
+            assert tuple(sensor._diagnostics.ages) == (2.0, 2.0)
+        finally:
+            sensor.release_recorder(episode)
+    finally:
+        sensor.release_recorder(owner)
         sensor.disconnect()
 
 

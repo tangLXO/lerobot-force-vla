@@ -220,6 +220,50 @@ def test_unknown_action_processor_rejected():
         LeaderSamplerWorker(FakeLeader(), action_processor=lambda x: x)
 
 
+def test_producer_configuration_change_masks_previous_action():
+    """A mapping change cannot reuse an earlier valid position sample."""
+    source = FakeLeader()
+    changed = threading.Event()
+
+    def guard():
+        if changed.is_set():
+            raise RuntimeError("producer_configuration_changed")
+
+    worker = LeaderSamplerWorker(
+        source, frequency_hz=100, configuration_guard=guard, source_config_sha256="a" * 64
+    )
+    worker.start()
+    try:
+        previous = worker.wait_for_valid()
+        changed.set()
+        deadline = time.monotonic() + 1
+        while worker.latest().is_valid and time.monotonic() < deadline:
+            time.sleep(0.001)
+        invalid = worker.latest()
+        assert invalid.sequence > previous.sequence
+        assert not invalid.is_valid and not invalid.action_deg
+        assert "producer_configuration_changed" in invalid.error
+        assert worker.source_config_sha256 == "a" * 64
+    finally:
+        worker.stop()
+
+
+def test_invalid_producer_configuration_never_opens_leader():
+    source = FakeLeader()
+
+    def guard():
+        raise RuntimeError("producer_configuration_changed")
+
+    worker = LeaderSamplerWorker(source, configuration_guard=guard)
+    worker.start()
+    try:
+        with pytest.raises((RuntimeError, TimeoutError), match="producer_configuration_changed"):
+            worker.wait_for_valid(timeout_s=0.1)
+    finally:
+        worker.stop()
+    assert not source.calls
+
+
 def test_wait_for_valid_is_bounded_and_worker_is_single_use():
     """Startup failures remain explicit and do not indefinitely block startup."""
     source = FakeLeader()

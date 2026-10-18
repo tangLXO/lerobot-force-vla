@@ -199,6 +199,7 @@ class SafetySupervisor:
         lower, upper = cfg.q_min_deg, cfg.q_max_deg
         if cfg.soft_q_min_deg is not None:
             lower, upper = max(lower, cfg.soft_q_min_deg), min(upper, cfg.soft_q_max_deg)
+        work_lower, work_upper = lower, upper
         lower = max(lower, inputs.q_measured_deg - cfg.max_relative_target_deg)
         upper = min(upper, inputs.q_measured_deg + cfg.max_relative_target_deg)
         flags = []
@@ -228,8 +229,37 @@ class SafetySupervisor:
             flags.append("integral_blocked")
         q_candidate = inputs.q_prev_sent_deg + self.close_sign * delta
         raw_u = delta / dt
-        intent_low = max(-cfg.max_open_speed_deg_s, min(0.0, raw_u))
-        intent_high = min(cfg.max_close_speed_deg_s, max(0.0, raw_u))
+        if cfg.max_total_travel_deg is not None:
+            remaining = max(0.0, cfg.max_total_travel_deg - self._total_travel_deg)
+            if remaining <= 1e-10 and abs(delta) > 1e-10:
+                return self.latch_fault("travel_budget_exhausted")
+            lower = max(lower, inputs.q_prev_sent_deg - remaining)
+            upper = min(upper, inputs.q_prev_sent_deg + remaining)
+            if abs(delta) > remaining:
+                flags.append("total_travel")
+        if lower > upper:
+            return self.latch_fault("incompatible_command_limits")
+        # Form rate intent from the allowed position, not a request beyond an endpoint.
+        # This keeps a valid submitted endpoint stationary even if measured inertia
+        # carries the joint into the calibrated margin outside the working range.
+        bounded_q = min(upper, max(lower, q_candidate))
+        bounded_u = self.close_sign * (bounded_q - inputs.q_prev_sent_deg) / dt
+        if cfg.acceleration_limit_deg_s2 is not None and proposal.next_phase in (
+            ControlPhase.FOLLOW,
+            ControlPhase.FOLLOW_WAIT_CLEAR,
+            ControlPhase.POSITION_HOLD,
+        ):
+            boundary = work_upper if self.close_sign * bounded_u >= 0 else work_lower
+            distance = abs(boundary - inputs.q_prev_sent_deg)
+            acceleration = cfg.acceleration_limit_deg_s2
+            # Reserve this tick's v*dt travel as well as the v^2/(2*a) stopping distance.
+            # The equivalent rationalized root avoids cancellation near the endpoint.
+            braking_speed = 2 * distance / (math.hypot(dt, math.sqrt(2 * distance / acceleration)) + dt)
+            if abs(bounded_u) > braking_speed:
+                bounded_u = math.copysign(braking_speed, bounded_u)
+                flags.append("endpoint_braking")
+        intent_low = max(-cfg.max_open_speed_deg_s, min(0.0, bounded_u))
+        intent_high = min(cfg.max_close_speed_deg_s, max(0.0, bounded_u))
         rate_low, rate_high = intent_low, intent_high
         if cfg.acceleration_limit_deg_s2 is not None:
             rate_low = max(rate_low, self._last_u_deg_s - cfg.acceleration_limit_deg_s2 * dt)
@@ -246,14 +276,6 @@ class SafetySupervisor:
                 inputs.q_prev_sent_deg + self.close_sign * rate_high * dt,
             )
         )
-        if cfg.max_total_travel_deg is not None:
-            remaining = max(0.0, cfg.max_total_travel_deg - self._total_travel_deg)
-            if remaining <= 1e-10 and abs(delta) > 1e-10:
-                return self.latch_fault("travel_budget_exhausted")
-            lower = max(lower, inputs.q_prev_sent_deg - remaining)
-            upper = min(upper, inputs.q_prev_sent_deg + remaining)
-            if abs(delta) > remaining:
-                flags.append("total_travel")
         lower, upper = max(lower, rate_q[0]), min(upper, rate_q[1])
         if lower > upper:
             return self.latch_fault("incompatible_command_limits")

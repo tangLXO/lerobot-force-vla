@@ -23,7 +23,8 @@ from lerobot.force_control.config import (
     validate_motion_request,
     validate_profile,
 )
-from lerobot.force_control.fake_hardware import FakeForceSensor, FakeGripper, FakePlant
+from lerobot.force_control.demonstration import DemonstrationController, TeacherRecordConfig
+from lerobot.force_control.fake_hardware import FAKE_B601_JOINT_NAMES, FakeForceSensor, FakeGripper, FakePlant
 from lerobot.force_control.leader import FakeReadonlyLeader, LeaderSamplerWorker
 from lerobot.force_control.owner import OwnerService
 from lerobot.force_control.runtime import ForceRuntime, RuntimeConfig
@@ -32,6 +33,7 @@ from lerobot.force_control.teacher import ForceTeacher
 from lerobot.force_control.trace import BenchTrace, validate_trace
 from lerobot.force_control.types import ControlPhase
 from lerobot.robots.rebot_b601_follower import control_backend
+from lerobot.robots.rebot_b601_follower.full_arm_control_types import leader_configuration_digest
 from lerobot.sensors import SensorConfig, make_sensors_from_configs
 from lerobot.teleoperators.rebot_102_leader import RebotArm102Leader, RebotArm102LeaderTeleopConfig
 
@@ -81,9 +83,16 @@ def finalize_retained_benches() -> list[dict]:
     completed = []
     for session in tuple(_UNSTOPPED_BENCHES):
         service, sensor, trace = session[:3]
-        leader = session[3] if len(session) == 4 else None
+        leader = session[3] if len(session) >= 4 else None
+        capture = session[4] if len(session) >= 5 else None
         if service.has_resources or (leader is not None and leader.has_resources):
             continue
+        if capture is not None:
+            try:
+                capture.close(timeout_s=0.1)
+            except Exception as exc:
+                _remember_exit_errors(trace, [exc])
+                continue
         if leader is not None:
             trace.metadata["leader_shutdown"] = {
                 "resources_retained": False,
@@ -132,6 +141,9 @@ class ForceTeacherRunConfig:
     leader_frequency_hz: float = 50.0
     leader_max_age_s: float = 0.15
     leader_read_budget_s: float = 0.1
+    leader_joint_ids: dict[str, int] | None = None
+    leader_joint_directions: dict[str, int] | None = None
+    leader_joint_ranges: dict[str, list[float]] | None = None
     close_sign: int | None = None
     b601: B601HardwareConfig | None = None
     sensors: dict[str, SensorConfig] = field(default_factory=dict)
@@ -145,12 +157,17 @@ class ForceTeacherRunConfig:
     shutdown_timeout_s: float = 2.0
     raw_queue_capacity: int = 4096
     trace_join_timeout_s: float = 2.0
+    recording: TeacherRecordConfig | None = None
     fake_sample_rate_hz: float = 200.0
     fake_response_time_s: float = 0.03
     fake_relaxation_N_s: float = 0.0
 
     def validate(self, *, sensors=None, joint_names=None):
         """Validate intent and profile before any transport may be opened."""
+        if self.recording is not None:
+            self.recording.validate()
+            if tuple(self.runtime.joint_names) != FAKE_B601_JOINT_NAMES:
+                raise ValueError("Demonstration recording requires the complete seven-joint owner")
         if self.backend not in ("fake", "b601"):
             raise ValueError("backend must be fake or b601")
         for name in ("dry_run", "observe_only", "allow_motion", "explicit_arm"):
@@ -161,8 +178,9 @@ class ForceTeacherRunConfig:
         if self.observe_only and (self.allow_motion or self.explicit_arm):
             raise ValueError("observe_only cannot authorize motion or arm")
         if self.initial_mode == "hybrid":
-            if tuple(joint_names or self.runtime.joint_names) != ("gripper",):
-                raise ValueError("Hybrid sessions only control the calibrated ID-7 gripper")
+            scope = tuple(joint_names or self.runtime.joint_names)
+            if scope != ("gripper",) and set(scope) != set(FAKE_B601_JOINT_NAMES):
+                raise ValueError("Hybrid scope must be calibrated ID-7 or all seven B601 joints")
             if not self.explicit_arm:
                 raise ValueError("Hybrid sessions require explicit_arm")
             if self.leader_backend not in ("fake", "rebot_102"):
@@ -190,11 +208,79 @@ class ForceTeacherRunConfig:
                 positive(name, getattr(self, name))
             if self.leader_read_budget_s >= self.leader_max_age_s:
                 raise ValueError("Leader read budget must leave freshness margin")
-        elif self.leader_backend is not None or self.leader_port is not None:
+            mapping = (self.leader_joint_ids, self.leader_joint_directions, self.leader_joint_ranges)
+            if any(item is not None for item in mapping):
+                if any(item is None or set(item) != set(scope) for item in mapping):
+                    raise ValueError("Explicit leader mapping must cover exactly the selected joints")
+                ids = tuple(self.leader_joint_ids.values())
+                if any(type(value) is not int or not 0 <= value <= 253 for value in ids) or len(
+                    set(ids)
+                ) != len(ids):
+                    raise ValueError("Leader joint IDs must be unique integers in 0..253")
+                if any(
+                    type(value) is not int or value == 0 for value in self.leader_joint_directions.values()
+                ):
+                    raise ValueError("Leader directions must be explicit nonzero integer scales")
+                for name, bounds in self.leader_joint_ranges.items():
+                    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+                        raise ValueError(f"Leader range for {name} requires two bounds")
+                    finite_number(f"{name}.minimum", bounds[0])
+                    finite_number(f"{name}.maximum", bounds[1])
+                    if bounds[0] >= bounds[1]:
+                        raise ValueError(f"Leader range for {name} must increase")
+            elif scope != ("gripper",) and self.leader_backend == "rebot_102":
+                raise ValueError("Physical full-arm hybrid requires explicit leader joint mapping")
+        elif any(
+            item is not None
+            for item in (
+                self.leader_backend,
+                self.leader_port,
+                self.leader_joint_ids,
+                self.leader_joint_directions,
+                self.leader_joint_ranges,
+            )
+        ):
             raise ValueError("Leader configuration requires initial_mode=hybrid")
         if self.backend == "b601":
             if tuple(joint_names or self.runtime.joint_names) != ("gripper",):
-                control_backend.require_b601_control_acceptance()
+                operator = None if self.b601 is None else self.b601.operator_teleoperation
+                if operator is not None:
+                    operator.validate()
+                    if self.initial_mode != "hybrid":
+                        raise ValueError("Operator full-arm teleoperation requires hybrid leader control")
+                    if leader_configuration_digest(leader_configuration_projection(self)) != (
+                        operator.leader_config_sha256
+                    ):
+                        raise ValueError("Operator teleoperation leader configuration changed")
+                    if self.leader_max_age_s != operator.leader_max_age_s:
+                        raise ValueError("Use the same explicit leader age in the run and operator profile")
+                elif self.b601 is None or self.b601.validation is None:
+                    control_backend.require_b601_control_acceptance()
+                else:
+                    capability = self.b601.validation
+                    capability.validate()
+                    if self.initial_mode != "hybrid":
+                        raise ValueError("Bounded full-arm validation requires hybrid leader control")
+                    if self.teacher.force_target_N != capability.target_force_N:
+                        raise ValueError("Bounded full-arm validation requires its reviewed explicit force")
+                    if leader_configuration_digest(leader_configuration_projection(self)) != (
+                        capability.leader_config_sha256
+                    ):
+                        raise ValueError("Bounded full-arm validation leader configuration changed")
+                    if self.duration_s is None or not 0 < self.duration_s <= capability.max_duration_s:
+                        raise ValueError("Bounded full-arm validation requires an explicit bounded duration")
+                    if self.b601.control is None:
+                        raise ValueError("Bounded full-arm validation requires explicit control budgets")
+                    self.b601.control.validate()
+                    positive("shutdown_timeout_s", self.shutdown_timeout_s)
+                    positive("control_hz", self.runtime.control_hz)
+                    margin = (
+                        self.b601.control.startup_budget_s
+                        + self.shutdown_timeout_s
+                        + 1 / self.runtime.control_hz
+                    )
+                    if self.duration_s + margin >= capability.max_duration_s:
+                        raise ValueError("Bounded full-arm duration must leave startup and shutdown margin")
             if self.observe_only or not (self.allow_motion and self.explicit_arm):
                 raise ValueError("Hardware motion requires allow_motion and explicit_arm")
         self.runtime.validate()
@@ -228,25 +314,64 @@ class ForceTeacherRunConfig:
                 raise ValueError(f"{name} must be a positive integer")
 
 
+def leader_configuration_projection(config: ForceTeacherRunConfig) -> dict:
+    """Describe the native absolute leader mapping; no cached offset file is applied."""
+    return {
+        "backend": config.leader_backend,
+        "port": config.leader_port,
+        "baudrate": config.leader_baudrate,
+        "readonly_transport": config.leader_readonly_transport,
+        "joint_ids": config.leader_joint_ids,
+        "joint_directions": config.leader_joint_directions,
+        "joint_ranges": config.leader_joint_ranges,
+        "action_space": "rebot_b601_absolute_degrees_v1",
+        "calibration_source": "native_absolute_mapping_no_offset_file",
+    }
+
+
 def _leader_worker(config: ForceTeacherRunConfig) -> LeaderSamplerWorker | None:
     """Construct a read-only leader only for an explicitly configured hybrid session."""
     if config.initial_mode != "hybrid":
         return None
     if config.leader_backend == "fake":
-        source = FakeReadonlyLeader()
+        source = FakeReadonlyLeader(goals_deg={f"{name}.pos": 0.0 for name in config.runtime.joint_names})
     else:
         source = RebotArm102Leader(
             RebotArm102LeaderTeleopConfig(
                 port=config.leader_port,
                 baudrate=config.leader_baudrate,
                 readonly_transport=config.leader_readonly_transport,
-                joint_ids={"gripper": 6},
-                joint_directions={"gripper": -6},
-                joint_ranges={"gripper": [-270, 0]},
+                joint_ids=config.leader_joint_ids or {"gripper": 6},
+                joint_directions=config.leader_joint_directions or {"gripper": -6},
+                joint_ranges=config.leader_joint_ranges or {"gripper": [-270, 0]},
             )
         )
+    guard, digest = None, None
+    capability = (
+        None
+        if config.b601 is None
+        else (getattr(config.b601, "operator_teleoperation", None) or config.b601.validation)
+    )
+    if capability is not None:
+        digest = leader_configuration_digest(leader_configuration_projection(config))
+        if digest != capability.leader_config_sha256:
+            raise ValueError("Full-arm leader configuration changed")
+        source_pin = asdict(source.config)
+
+        def guard():
+            # Both the reviewed run mapping and actual producer must remain fixed.
+            if (
+                leader_configuration_digest(leader_configuration_projection(config)) != digest
+                or asdict(source.config) != source_pin
+            ):
+                raise RuntimeError("full_arm_validation_leader_configuration_changed")
+
     return LeaderSamplerWorker(
-        source, frequency_hz=config.leader_frequency_hz, max_read_duration_s=config.leader_read_budget_s
+        source,
+        frequency_hz=config.leader_frequency_hz,
+        max_read_duration_s=config.leader_read_budget_s,
+        configuration_guard=guard,
+        source_config_sha256=digest,
     )
 
 
@@ -260,15 +385,17 @@ def _publish_leader(config, worker, service, previous):
     if type(intent.source_sequence) is not int or intent.source_sequence <= 0:
         raise RuntimeError("leader_input_invalid: missing source sequence")
     mapped, raw = dict(intent.action_deg), dict(intent.raw_action_deg)
-    if "gripper.pos" not in mapped or "gripper.pos" not in raw:
-        raise RuntimeError("leader_input_invalid: missing gripper position")
-    for value in (mapped["gripper.pos"], raw["gripper.pos"]):
-        finite_number("leader_gripper_deg", value)
+    expected = {f"{name}.pos" for name in config.runtime.joint_names}
+    if set(mapped) != expected or set(raw) != expected:
+        raise RuntimeError("leader_input_invalid: selected joint coverage mismatch")
+    for name in expected:
+        finite_number(f"leader_mapped_{name}", mapped[name])
+        finite_number(f"leader_raw_{name}", raw[name])
     key = (intent.sequence, service.runtime.epoch)
     if key == previous:
         return previous
     service.submit_arm_intent(
-        {"gripper.pos": mapped["gripper.pos"]},
+        mapped,
         captured_ns=intent.request_started_ns,
         ttl_ms=min(config.runtime.command_ttl_ms, config.leader_max_age_s * 1000),
         metadata={
@@ -278,6 +405,7 @@ def _publish_leader(config, worker, service, previous):
             "leader_response_completed_ns": intent.response_completed_ns,
             "leader_timestamp_source": intent.timestamp_source,
             "leader_joint_diagnostics": [asdict(item) for item in intent.joint_diagnostics],
+            "leader_config_sha256": getattr(worker, "source_config_sha256", None),
         },
     )
     return key
@@ -338,6 +466,8 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
     service = OwnerService(runtime)
     leader = _leader_worker(config)
     leader_version = None
+    capture = None
+    preview_at = 0.0
 
     def publish_leader():
         nonlocal leader_version
@@ -396,7 +526,15 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                 raise TimeoutError("No fresh post-subscription force sample")
             time.sleep(min(1 / config.runtime.control_hz, max(0, ready_by - time.monotonic())))
         service.start(timeout_s=config.startup_timeout_s)
+        if config.recording is not None:
+            capture = DemonstrationController(
+                service,
+                sensor,
+                force_instance=config.runtime.force_instance,
+                provenance={"run_config": asdict(config), "bench_trace_root": str(config.trace_root)},
+            )
         if config.explicit_arm:
+            publish_leader()
             wait_command(service.post("arm"))
             publish_leader()
             wait_command(
@@ -412,25 +550,111 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             if live is not None:
                 live.startup = getattr(device, "startup_receipt", None)
         until = None if config.duration_s is None else time.monotonic() + config.duration_s
-        while until is None or time.monotonic() < until:
-            publish_leader()
+        finish_deadline = None
+        capture_finish_requested = False
+        release_quiesced = False
+        while finish_deadline is not None or until is None or time.monotonic() < until:
+            if live is not None and live.stop.is_set():
+                runtime.request_stop()
+                break
+            if not release_quiesced:
+                publish_leader()
             snapshot = service.snapshot()
             if live is not None:
                 live.latest = snapshot.row
+                if capture is not None:
+                    live.recording = capture.status()
+                    if time.monotonic() >= preview_at:
+                        live.preview = capture.preview()
+                        preview_at = time.monotonic() + 0.25
                 if snapshot.row.get("parameter_update") is not None:
                     live.applied = snapshot.row["parameter_update"]
                 if live.stop.is_set():
                     runtime.request_stop()
                     break
-                pending = live.take()
+                pending = live.take() if finish_deadline is None else None
                 if pending is not None:
                     kind, value = pending
-                    version = service.post(kind, value=value)
+                    if kind.startswith("record_"):
+                        if capture is None:
+                            live.recording = {
+                                "state": "error",
+                                "active": False,
+                                "error": "Prepare recording settings and a seven-joint session before recording",
+                            }
+                        else:
+                            if kind == "record_start" and not value:
+                                value = {"config": asdict(config.recording)}
+                            capture.submit(kind, value)
+                        continue
+                    if kind == "release_and_finish":
+                        if value is not None:
+                            raise ValueError("release_and_finish uses the configured gripper release")
+                        if snapshot.row["phase"] not in (
+                            "FORCE_TRACK",
+                            "POSITION_HOLD",
+                            "APPROACH",
+                            "FOLLOW",
+                            "FOLLOW_WAIT_CLEAR",
+                        ):
+                            raise RuntimeError("release_and_finish requires an active non-faulted controller")
+                        requested_ns = time.perf_counter_ns()
+                        version = service.post("release")
+                        trace.metadata["finish_request"] = {
+                            "kind": kind,
+                            "requested_ns": requested_ns,
+                            "command_version": version,
+                        }
+                    else:
+                        version = service.post(kind, value=value)
                     applied = wait_command(version)
+                    snapshot = applied
                     if kind == "parameters":
                         live.applied = applied.row.get("parameter_update")
+                    elif kind == "release_and_finish":
+                        # Keep polling and forwarding fresh leader observations while the
+                        # existing bounded release runs. Stop always remains a priority event.
+                        finish_deadline = (
+                            time.monotonic() + config.teacher.max_release_time_s + config.shutdown_timeout_s
+                        )
             if snapshot.row["phase"] == "FAULT":
                 raise RuntimeError(snapshot.row.get("failure_reason") or "owner fault")
+            if finish_deadline is not None:
+                if snapshot.row["phase"] == "DISABLED":
+                    trace.metadata["release_and_finish_completed"] = True
+                    if not release_quiesced:
+                        # Stop the physical session before encoding/saving can
+                        # consume its watchdog or bounded validation deadline.
+                        # Controller RELEASE has completed normally, so this
+                        # close does not turn the episode into a user-stop fault.
+                        service.quiesce_after_release(timeout_s=config.shutdown_timeout_s)
+                        release_quiesced = True
+                        trace.metadata["release_stopped_before_save"] = True
+                    if capture is not None:
+                        recording_status = capture.status()
+                        if not capture_finish_requested and recording_status.get("active"):
+                            capture.submit(
+                                "record_finish",
+                                {"task_result": recording_status.get("task_result", "unknown")},
+                            )
+                            capture_finish_requested = True
+                            finish_deadline = time.monotonic() + 30
+                        if capture_finish_requested:
+                            if recording_status.get("state") == "error":
+                                raise RuntimeError(
+                                    "Released demonstration could not be saved: "
+                                    + str(recording_status.get("error"))
+                                )
+                            if recording_status.get("state") != "saved":
+                                if time.monotonic() >= finish_deadline:
+                                    raise TimeoutError(
+                                        "Released demonstration did not finish saving within 30 seconds"
+                                    )
+                                live.stop.wait(1 / config.runtime.control_hz)
+                                continue
+                    break
+                if time.monotonic() >= finish_deadline:
+                    raise TimeoutError("release_and_finish did not reach DISABLED within its release budget")
             # Wake on user stop; control cadence remains solely in OwnerService.
             if live is not None:
                 live.stop.wait(1 / config.runtime.control_hz)
@@ -483,6 +707,14 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             if not any(exc is existing for existing in errors):
                 errors.append(exc)
             complete = False
+        if capture is not None:
+            try:
+                capture.close(timeout_s=config.shutdown_timeout_s)
+            except BaseException as exc:
+                errors.append(exc)
+                complete = False
+            if live is not None:
+                live.recording = capture.status()
         if leader is not None:
             try:
                 leader.stop(timeout_s=config.shutdown_timeout_s)
@@ -493,8 +725,18 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                 "resources_retained": leader.has_resources,
                 "status": leader.latest().error,
             }
-        retained = (service, sensor, trace) if leader is None else (service, sensor, trace, leader)
-        if service.has_resources or (leader is not None and leader.has_resources):
+        retained = (
+            (service, sensor, trace, leader, capture)
+            if capture is not None
+            else (service, sensor, trace)
+            if leader is None
+            else (service, sensor, trace, leader)
+        )
+        if (
+            service.has_resources
+            or (leader is not None and leader.has_resources)
+            or (capture is not None and capture.has_resources)
+        ):
             if live is not None:
                 live.latest = {
                     **(runtime.latest_row or {}),
@@ -526,6 +768,8 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
         trace_root=str(config.trace_root.resolve()),
         shutdown_evidence=runtime.shutdown_evidence,
     )
+    if capture is not None:
+        report["recording"] = capture.status()
     return report
 
 
