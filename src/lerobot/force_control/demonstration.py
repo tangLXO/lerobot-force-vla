@@ -424,6 +424,7 @@ class DemonstrationController:
         self._recorder_factory = recorder_factory
         self._commands: queue.Queue[tuple[str, dict]] = queue.Queue(maxsize=8)
         self._stop = threading.Event()
+        self._completion_cancel = None
         self._lock = threading.Lock()
         self._status: dict = {
             "state": "idle",
@@ -960,11 +961,11 @@ class DemonstrationController:
         self._task_result = task_result
         self._close_files()
         self._write_manifest(complete=False, status="saving")
-        if self._stop.is_set():
+        if self._save_cancelled():
             raise RuntimeError("Session stopped before episode commit")
         self._recorder.prepare_episode(task_info=[self._config.task])
         self._recorder.commit_prepared(self._dataset)
-        if self._stop.is_set():
+        if self._save_cancelled():
             raise RuntimeError("Session stopped during episode commit; Teacher completion withheld")
         self._write_manifest(complete=False, status="verifying")
         # The independent reader performs full video/Raw/Sync/action checks. Release
@@ -978,7 +979,7 @@ class DemonstrationController:
         if not report["valid"]:
             self._write_manifest(complete=False, status="error", error="; ".join(report["errors"]))
             raise RuntimeError("Saved demonstration verification failed: " + "; ".join(report["errors"]))
-        if self._stop.is_set():
+        if self._save_cancelled():
             raise RuntimeError("Session stopped during verification; Teacher completion withheld")
         self._save_evidence.update(completed_ns=time.perf_counter_ns(), end_owner=self._owner_save_state())
         self._write_manifest(complete=True, status="complete")
@@ -998,6 +999,12 @@ class DemonstrationController:
             error=None,
         )
         self._uid = None
+
+    def _save_cancelled(self) -> bool:
+        """The producer can withhold completion while the recorder drains its inputs."""
+        return self._stop.is_set() or (
+            self._completion_cancel is not None and self._completion_cancel.is_set()
+        )
 
     def _owner_save_state(self) -> dict | None:
         """Retain control progress around asynchronous save without posting commands."""

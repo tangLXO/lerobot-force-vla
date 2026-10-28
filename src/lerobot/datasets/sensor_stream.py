@@ -31,6 +31,7 @@ from lerobot.sensors.sensor import SensorRecorderLease
 from lerobot.utils.constants import OBS_TACTILE
 from lerobot.utils.errors import DeviceNotConnectedError
 
+from .sensor_raw_input import RawStreamInput
 from .sensor_spool import SensorParquetSpoolWriter
 from .sensor_transaction import (
     SensorTransaction,
@@ -259,10 +260,13 @@ class SensorDatasetWriterLock:
 class SensorStreamRecorder:
     """Drain independent subscriber queues into per-episode Raw/Sync sidecars."""
 
-    def __init__(self, root: Path, sensors: dict[str, Sensor]) -> None:
+    def __init__(
+        self, root: Path, sensors: dict[str, Sensor], *, raw_inputs: dict[str, RawStreamInput] | None = None
+    ) -> None:
         """Validate the Dataset contract and acquire its single-writer lock."""
         self.root = Path(root)
         self.sensors = sensors
+        self._raw_inputs = raw_inputs
         for instance, sensor in sensors.items():
             if re.fullmatch(r"[a-z][a-z0-9_]*", instance) is None:
                 raise ValueError(f"Invalid Sensor instance namespace: {instance!r}.")
@@ -300,6 +304,11 @@ class SensorStreamRecorder:
         self._minimum_timestamp_ns: int | None = None
         self._closed = False
         self._bound_dataset = None
+
+    @classmethod
+    def from_raw_inputs(cls, root: Path, inputs: dict[str, RawStreamInput]) -> SensorStreamRecorder:
+        """Receive original samples; hardware and sequence leases stay with their producer."""
+        return cls(root, {name: item.descriptor for name, item in inputs.items()}, raw_inputs=inputs)
 
     @property
     def episode_uid(self) -> str | None:
@@ -378,8 +387,9 @@ class SensorStreamRecorder:
         self._transaction = None
         self._minimum_timestamp_ns = None
         try:
-            for instance, sensor in self.sensors.items():
-                self._recorder_leases[instance] = sensor.acquire_recorder()
+            if self._raw_inputs is None:
+                for instance, sensor in self.sensors.items():
+                    self._recorder_leases[instance] = sensor.acquire_recorder()
             self._active = True
             self._transaction = SensorTransaction.begin(self.root, resolved_uid, episode_index)
             self._main_precondition = self._transaction.journal["main_precondition"]
@@ -408,9 +418,14 @@ class SensorStreamRecorder:
                     episode_uid=resolved_uid,
                     instance=instance,
                 )
-                subscription = sensor.subscribe(sensor.config.resolve_recorder_queue_capacity())
+                subscription = (
+                    sensor.subscribe(sensor.config.resolve_recorder_queue_capacity())
+                    if self._raw_inputs is None
+                    else self._raw_inputs[instance].subscription
+                )
                 subscription.diagnostics.label = f"Sensor Raw {instance}"
-                self._recorder_leases[instance].start_sequence = subscription.start_sequence
+                if self._raw_inputs is None:
+                    self._recorder_leases[instance].start_sequence = subscription.start_sequence
                 self._subscriptions[instance] = subscription
                 thread = threading.Thread(
                     target=self._drain,
@@ -482,6 +497,12 @@ class SensorStreamRecorder:
             self.check_health()
             for name in tuple(pending):
                 sensor = self.sensors[name]
+                if self._raw_inputs is not None:
+                    if self._raw_inputs[name].valid_received:
+                        pending.remove(name)
+                    elif time.perf_counter() >= deadlines[name]:
+                        raise SensorRecorderError(f"Required Raw input {name!r} startup timeout.")
+                    continue
                 try:
                     sensor.read_latest_before(time.perf_counter_ns())
                 except (RuntimeError, DeviceNotConnectedError):
@@ -547,6 +568,12 @@ class SensorStreamRecorder:
 
     def check_health(self) -> None:
         """Raise immediately on worker failure or subscriber overflow."""
+        if self._raw_inputs is not None:
+            for name, source in self._raw_inputs.items():
+                try:
+                    source.check_health()
+                except RuntimeError as exc:
+                    raise SensorRecorderError(f"Raw input {name!r} failed: {exc}") from exc
         for instance, lease in self._recorder_leases.items():
             try:
                 self.sensors[instance]._check_recorder_fault()
@@ -734,7 +761,10 @@ class SensorStreamRecorder:
         with self._rows_lock:
             self._accept_sync = False
         for instance, subscription in tuple(self._subscriptions.items()):
-            self.sensors[instance].unsubscribe(subscription)
+            if self._raw_inputs is None:
+                self.sensors[instance].unsubscribe(subscription)
+            elif not subscription.closed:
+                self._raw_inputs[instance].abort("Raw producer tail was not sealed")
         self._stop_event.set()
         for thread in self._threads.values():
             if thread.ident is not None:

@@ -15,6 +15,7 @@ from pathlib import Path
 import draccus
 
 from lerobot.force_control.b601_factory import B601HardwareConfig, validate_b601_sensor
+from lerobot.force_control.capture_process import ProcessDemonstrationController as DemonstrationController
 from lerobot.force_control.config import (
     SafetyConfig,
     TeacherConfig,
@@ -23,7 +24,7 @@ from lerobot.force_control.config import (
     validate_motion_request,
     validate_profile,
 )
-from lerobot.force_control.demonstration import DemonstrationController, TeacherRecordConfig
+from lerobot.force_control.demonstration import TeacherRecordConfig
 from lerobot.force_control.fake_hardware import FAKE_B601_JOINT_NAMES, FakeForceSensor, FakeGripper, FakePlant
 from lerobot.force_control.leader import FakeReadonlyLeader, LeaderSamplerWorker
 from lerobot.force_control.owner import OwnerService

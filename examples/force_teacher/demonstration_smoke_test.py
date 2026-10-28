@@ -86,6 +86,14 @@ class SyntheticOwner:
         self._thread = None
         self.error = None
         self.tick_count = 0
+        self._latest = None
+
+    @property
+    def has_resources(self):
+        return self.is_running
+
+    def snapshot(self):
+        return self._latest
 
     @property
     def is_running(self):
@@ -184,6 +192,7 @@ class SyntheticOwner:
         try:
             while not self._stop.is_set():
                 snapshot = self._snapshot(tick)
+                self._latest = snapshot
                 with self._lock:
                     for subscription in self._subscriptions:
                         try:
