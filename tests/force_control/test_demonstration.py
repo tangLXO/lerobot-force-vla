@@ -369,6 +369,31 @@ def begin(stub):
     return wait_status(controller, lambda status: status["state"] == "recording")
 
 
+def test_preparation_creates_no_episode_and_reuses_resources_when_recording_starts(stub_recording):
+    controller, owner, config = stub_recording
+    owner.is_running = owner.has_resources = False
+    controller.prepare_before_control(config)
+    dataset, cameras, recorder = controller._dataset, controller._cameras, controller._recorder
+    assert controller.status()["state"] == "ready"
+    assert controller._uid is None and not owner.subscriptions and not recorder.is_active
+    assert not dataset.frames and dataset.meta.total_episodes == 0
+    owner.is_running = owner.has_resources = True
+    begin(stub_recording)
+    assert controller._dataset is dataset and controller._cameras is cameras
+    assert controller._recorder is recorder and recorder.is_active
+    owner.post.assert_not_called()
+
+
+@pytest.mark.parametrize("running, opened", [(True, False), (False, True), (True, True)])
+def test_preparation_rejects_started_motor_owner(stub_recording, running, opened):
+    controller, owner, config = stub_recording
+    owner.is_running, owner.has_resources = running, opened
+    with pytest.raises(RuntimeError, match="unopened motor owner"):
+        controller.prepare_before_control(config)
+    assert controller._dataset is None and controller._cameras is None
+    owner.post.assert_not_called()
+
+
 def test_manual_finish_saves_without_release_or_other_motor_commands(stub_recording):
     controller, owner, config = stub_recording
     begin(stub_recording)

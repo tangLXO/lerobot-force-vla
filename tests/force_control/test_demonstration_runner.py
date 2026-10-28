@@ -73,6 +73,10 @@ class Capture:
     def preview(self):
         return {}
 
+    def prepare_before_control(self, config):
+        assert not self.owner.has_resources and not self.owner.is_running
+        self.prepared = True
+
     def submit(self, kind, value):
         self.events.append((kind, value))
         self.owner_open_during_events.append(self.owner.has_resources)
@@ -114,6 +118,7 @@ def test_recording_events_dispatch_to_capture_and_stop_preserves_final_status(tm
     assert all(capture.owner_open_during_events)
     assert [kind for kind, _ in motor_events] == ["arm", "start"]
     assert capture.closed and capture.closed_after_owner
+    assert capture.prepared
     assert result["recording"] == live.recording == capture.status()
     assert result["recording"]["received_events"] == 4
 
@@ -126,6 +131,28 @@ def test_unconfigured_recording_event_cannot_reach_motor_owner(tmp_path, monkeyp
     assert live.recording["state"] == "error"
     assert "seven-joint" in live.recording["error"]
     assert [kind for kind, _ in motor_events] == ["arm", "start"]
+
+
+@pytest.mark.parametrize("outcome", ["failure", "stop"])
+def test_capture_preparation_failure_or_stop_never_opens_motor_owner(tmp_path, monkeypatch, outcome):
+    live = Requests([])
+
+    class FailedPreparation(Capture):
+        instances = []
+
+        def prepare_before_control(self, config):
+            super().prepare_before_control(config)
+            if outcome == "failure":
+                raise RuntimeError("injected camera initialization failure")
+            live.stop.set()
+
+    monkeypatch.setattr(runner, "DemonstrationController", FailedPreparation)
+    motor_events = observe_commands(monkeypatch)
+    with pytest.raises(RuntimeError, match="initialization failure|user_stop_before_owner_start"):
+        runner.run(hybrid_config(tmp_path), live=live)
+    capture = FailedPreparation.instances[0]
+    assert capture.owner._thread is None and motor_events == []
+    assert capture.closed and not capture.sensor.has_resources
 
 
 def test_full_arm_explicit_release_saves_capture_only_after_disabled(tmp_path, monkeypatch):

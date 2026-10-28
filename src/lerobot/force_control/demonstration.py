@@ -471,6 +471,21 @@ class DemonstrationController:
         with self._lock:
             return copy.deepcopy(self._status)
 
+    def prepare_before_control(self, config: TeacherRecordConfig) -> None:
+        """Open capture resources synchronously before the motor owner starts.
+
+        Only the session startup caller may use this method, before dispatching
+        recording events. Device enumeration and first codec/image imports can
+        hold the interpreter long enough to starve an already active controller.
+        """
+        if self.owner.is_running or self.owner.has_resources or self._uid is not None:
+            raise RuntimeError("Capture startup preparation requires an unopened motor owner")
+        config.validate()
+        self._prepare(config)
+        self._dataset.prepare_episode_recording()
+        self.preview()
+        self._update(state="ready", active=False)
+
     def _update(self, **values) -> None:
         with self._lock:
             self._status.update(values)

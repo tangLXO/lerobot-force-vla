@@ -510,6 +510,16 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                     raise TimeoutError(f"102 has no valid snapshot: {leader.latest().error}")
                 time.sleep(min(0.005, max(0, deadline - time.monotonic())))
         sensor.connect()
+        if config.recording is not None:
+            capture = DemonstrationController(
+                service,
+                sensor,
+                force_instance=config.runtime.force_instance,
+                provenance={"run_config": asdict(config), "bench_trace_root": str(config.trace_root)},
+            )
+            capture.prepare_before_control(config.recording)
+            if live is not None:
+                live.recording = capture.status()
         trace.start()
         started = True
         ready_by = time.monotonic() + config.startup_timeout_s
@@ -528,13 +538,6 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                 raise TimeoutError("No fresh post-subscription force sample")
             time.sleep(min(1 / config.runtime.control_hz, max(0, ready_by - time.monotonic())))
         service.start(timeout_s=config.startup_timeout_s)
-        if config.recording is not None:
-            capture = DemonstrationController(
-                service,
-                sensor,
-                force_instance=config.runtime.force_instance,
-                provenance={"run_config": asdict(config), "bench_trace_root": str(config.trace_root)},
-            )
         if config.explicit_arm:
             publish_leader()
             wait_command(service.post("arm"))
