@@ -413,7 +413,7 @@ class ProcessDemonstrationController:
                     self._send("outcome", value)
                 self._drain()
                 if time.monotonic() >= next_owner:
-                    self._send("owner", (self.owner.is_running, self.owner.snapshot()))
+                    self._send("owner", (self.owner.is_running, self.owner.snapshot(allow_empty=True)))
                     next_owner = time.monotonic() + 0.05
                 self._stop.wait(0.002)
         except BaseException as exc:

@@ -244,12 +244,14 @@ class OwnerService:
             self._arm_version = max(self._arm_version, version)
             return version
 
-    def snapshot(self):
-        """Copy the latest published evidence without reading a device or sensor."""
+    def snapshot(self, *, allow_empty: bool = False):
+        """Copy published evidence; telemetry may opt into None before the first tick."""
         with self._condition:
             if self._error is not None:
                 raise self._error
             if self._latest is None:
+                if allow_empty:
+                    return None
                 raise RuntimeError("No owner tick has been published")
             return copy.deepcopy(self._latest)
 

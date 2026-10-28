@@ -3,6 +3,7 @@
 import json
 import time
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from lerobot.datasets.sensor_raw_input import RawStreamDescriptor, RawStreamInpu
 from lerobot.force_control.capture_process import ProcessDemonstrationController, _CompletedTicks
 from lerobot.force_control.demonstration import JOINT_NAMES, TeacherRecordConfig
 from lerobot.force_control.fake_hardware import FakeForceSensor, FakePlant
+from lerobot.force_control.owner import OwnerService
 from lerobot.sensors import SensorSample
 
 
@@ -52,9 +54,15 @@ class LargePreviewCameras(SyntheticCameras):
 
 def test_large_preview_pipe_cannot_hold_child_open(tmp_path):
     sensor = FakeForceSensor(FakePlant())
-    capture = ProcessDemonstrationController(
-        SyntheticOwner(sensor), sensor, camera_factory=LargePreviewCameras
+    owner = OwnerService(
+        SimpleNamespace(
+            config=SimpleNamespace(joint_names=JOINT_NAMES, control_hz=50),
+            device=SimpleNamespace(has_resources=False),
+        )
     )
+    with pytest.raises(RuntimeError, match="No owner tick"):
+        owner.snapshot()
+    capture = ProcessDemonstrationController(owner, sensor, camera_factory=LargePreviewCameras)
     settings = replace(
         config(tmp_path / "dataset"),
         camera_configs={
@@ -66,9 +74,18 @@ def test_large_preview_pipe_cannot_hold_child_open(tmp_path):
         capture.prepare_before_control(settings)
         time.sleep(0.3)
         assert sum(len(item["jpeg"]) for item in capture.preview().values()) > 50_000
+        assert capture.status()["state"] == "ready"
+        assert owner.snapshot(allow_empty=True) is None
     finally:
         capture.close(timeout_s=5)
     assert not capture.has_resources
+
+
+def test_optional_empty_snapshot_does_not_hide_owner_failure():
+    owner = OwnerService(SimpleNamespace())
+    owner._error = RuntimeError("owner transport failed")
+    with pytest.raises(RuntimeError, match="owner transport failed"):
+        owner.snapshot(allow_empty=True)
 
 
 def test_raw_input_preserves_original_identity_and_refuses_missing_tail():

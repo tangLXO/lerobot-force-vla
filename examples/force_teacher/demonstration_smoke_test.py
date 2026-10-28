@@ -92,7 +92,7 @@ class SyntheticOwner:
     def has_resources(self):
         return self.is_running
 
-    def snapshot(self):
+    def snapshot(self, *, allow_empty=False):
         return self._latest
 
     @property
