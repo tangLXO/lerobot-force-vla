@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 
 from lerobot.force_control.hardware_types import JointFeedback, JointSendResult, JointSnapshot, SendReceipt
 
+from .calibration_reader import _CalibrationReader
 from .control_protocol import (
     encode_disable,
     encode_enable,
@@ -25,6 +26,9 @@ class FullArmValidationSession:
     """One guarded all-joint lifecycle; diagnostic and operator admission remain separate."""
 
     def __init__(self, device, configuration, admission, *, operator=False):
+        # Equality with these validated deep copies rejects later configuration drift.
+        device.config.validate()
+        configuration.validate()
         self.device, self.configuration, self.admission = device, configuration, admission
         self.operator = operator
         self.kind = "operator_teleoperation" if operator else "bounded_full_arm_validation"
@@ -51,6 +55,24 @@ class FullArmValidationSession:
         self.observed_statuses = {}
         self.returned_sequences = {}
         self.last_observation = None
+        self._calibration_reader = None
+
+    @property
+    def has_binding_resources(self) -> bool:
+        """Keep the calibration handle in the owner's cleanup accounting."""
+        return self._calibration_reader is not None and self._calibration_reader.has_resources
+
+    def open_binding(self) -> None:
+        """Prepare a verified read-only handle before transport startup."""
+        if self._calibration_reader is not None:
+            raise RuntimeError("Calibration binding is single-use; create a fresh session")
+        self._calibration_reader = _CalibrationReader(self.calibration_identity)
+        self._calibration_reader.open()
+
+    def close_binding(self) -> None:
+        """Close the file independently of motor fault-disposition success."""
+        if self._calibration_reader is not None:
+            self._calibration_reader.close()
 
     def require_binding(self, *, cleanup=False):
         """Keep cleanup independent of changed files while every normal write revalidates them."""
@@ -63,9 +85,15 @@ class FullArmValidationSession:
             raise RuntimeError("Full-arm validation command configuration/budgets changed during its session")
         if self.configuration != self.pinned_configuration:
             raise RuntimeError("Full-arm validation capability changed during its session")
-        self.configuration.validate()
-        self.admission.require_unchanged()
-        self.calibration_identity.require_contents_unchanged()
+        # Content reads still check path identity before and after every read.
+        # Reuse only the OS handle; never cache calibration bytes or their hash.
+        for pin in self.admission.file_identities:
+            if pin is not self.calibration_identity:
+                pin.require_unchanged()
+        if self._calibration_reader is None:
+            self.calibration_identity.require_contents_unchanged()
+        else:
+            self._calibration_reader.require_contents_unchanged()
 
     def leader(self):
         """Read a cache only and refuse mapping/epoch/sequence changes."""

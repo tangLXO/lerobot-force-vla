@@ -199,6 +199,12 @@ class B601ControlBackend(ReadonlyB601Transport):
             )
 
     @property
+    def has_resources(self) -> bool:
+        """Account for the owner-scoped calibration handle and serial transport."""
+        session = getattr(self, "_full_validation_session", None)
+        return super().has_resources or (session is not None and session.has_binding_resources)
+
+    @property
     def operator_teleoperation_config(self):
         """Expose explicit current operator choices, separate from historical diagnostic admission."""
         return self._operator_teleoperation
@@ -429,7 +435,10 @@ class B601ControlBackend(ReadonlyB601Transport):
         if _acceptance_cleanup and self._full_validation_session is not None:
             self._full_validation_session.require_binding(cleanup=True)
             return
-        self.config.validate()
+        # Full-arm sessions validate and deep-pin configuration at admission;
+        # require_binding below rejects any drift before each normal write.
+        if self._full_validation_session is None:
+            self.config.validate()
         if {p.name: p for p in self.config.profiles} != self._profiles or {
             s.name: s for s in self.joint_specs
         } != self._specs:
@@ -486,7 +495,20 @@ class B601ControlBackend(ReadonlyB601Transport):
         if self.calibration is not None:
             self.calibration.require_unchanged()
         self.bind_io_owner()
-        super().open()
+        session = self._full_validation_session
+        if session is not None:
+            session.open_binding()
+        try:
+            super().open()
+        except BaseException as error:
+            if session is not None:
+                try:
+                    session.close_binding()
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "Transport open and calibration cleanup failed", [error, cleanup_error]
+                    ) from None
+            raise
         self._control_session = True
         self._motion_session = (
             not self.gripper_only and self._acceptance is None and self._full_validation_session is None
@@ -1779,12 +1801,18 @@ class B601ControlBackend(ReadonlyB601Transport):
             )
         # A failed close leaves the serial handle, lease and motion-session
         # state intact. A second cleanup attempts close, never another send.
-        try:
-            super().close()
-            self._motion_session = False
-            self._control_session = False
-        except BaseException as exc:
-            errors.append(exc)
+        if super().has_resources:
+            try:
+                super().close()
+                self._motion_session = False
+                self._control_session = False
+            except BaseException as exc:
+                errors.append(exc)
+        if self._full_validation_session is not None:
+            try:
+                self._full_validation_session.close_binding()
+            except BaseException as exc:
+                errors.append(exc)
         if len(errors) == 1:
             raise errors[0]
         if errors:

@@ -445,6 +445,46 @@ def test_mask_does_not_hide_successful_submission_from_trace(tmp_path):
     assert any("software receipt" in error for error in validate_trace(trace.root)["errors"])
 
 
+@pytest.mark.parametrize("failed_axis", [0, 1, 5, 6])
+def test_partial_arm_stop_preserves_unknown_frame_and_unattempted_gripper(tmp_path, failed_axis):
+    from lerobot.robots.rebot_b601_follower.full_arm_control_types import JOINT_NAMES
+
+    results = [
+        {
+            "name": name,
+            "status": "success"
+            if index < failed_axis
+            else "unknown"
+            if index == failed_axis
+            else "not_attempted",
+            "submitted_deg": 0.1 if index < failed_axis else None,
+        }
+        for index, name in enumerate(JOINT_NAMES)
+    ]
+    row = control_row(
+        phase="FAULT",
+        send_status="unknown",
+        q_sent_deg=None,
+        label_valid=False,
+        failure_reason="user_stop",
+        per_joint_results=results,
+    )
+    trace, _, _ = write_run(tmp_path, [row])
+    errors = validate_trace(trace.root)["errors"]
+    assert not any("software receipt" in error for error in errors)
+
+
+def test_partial_action_cannot_claim_complete_submission(tmp_path):
+    row = control_row(
+        per_joint_results=[
+            {"name": "shoulder_pan", "status": "unknown", "submitted_deg": None},
+            {"name": "gripper", "status": "success", "submitted_deg": 0.1},
+        ]
+    )
+    trace, _, _ = write_run(tmp_path, [row])
+    assert any("software receipt" in error for error in validate_trace(trace.root)["errors"])
+
+
 def test_validator_refuses_labels_with_missing_age_budget_or_wrong_units(tmp_path):
     trace, _, _ = write_run(tmp_path)
     path = trace.root / "manifest.json"

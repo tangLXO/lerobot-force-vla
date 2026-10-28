@@ -281,18 +281,34 @@ def test_full_calibration_hash_still_rejects_same_stat_changed_bytes(scope):
 
 
 def test_each_full_write_binding_only_reads_calibration_contents_after_admission(scope, monkeypatch):
-    reads = []
+    reads, opens = [], []
     original = builtins.open
+    reader = scope.device._full_validation_session._calibration_reader
+    stream = reader._stream
+
+    class ObservedStream:
+        closed = False
+
+        def seek(self, offset):
+            return stream.seek(offset)
+
+        def read(self, size):
+            reads.append(size)
+            return stream.read(size)
+
+        def close(self):
+            stream.close()
 
     def opened(file, *args, **kwargs):
-        reads.append(os.fspath(file))
+        opens.append(os.fspath(file))
         return original(file, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", opened)
+    monkeypatch.setattr(reader, "_stream", ObservedStream())
     for _ in range(3):
         scope.device._require_scope()
-    expected = scope.device._full_validation_session.admission.calibration.path
-    assert reads == [expected] * 3
+    assert reads == [reader.identity.size_bytes + 1] * 3
+    assert opens == []
 
 
 def test_disabled_state_proof_retains_position_violation_independently(scope):

@@ -850,11 +850,25 @@ def _validate_rows(
         elif row["q_sent_deg"] is not None:
             errors.append(prefix + "unconfirmed submission cannot have q_sent_deg")
         if row.get("per_joint_results"):
-            gripper = next((item for item in row["per_joint_results"] if item.get("name") == "gripper"), None)
+            results = row["per_joint_results"]
+            gripper = next((item for item in results if item.get("name") == "gripper"), None)
+            # Overall submission covers the complete action. A stop on an arm
+            # joint can leave the gripper not attempted and the frame unknown.
+            all_submitted = all(item.get("status") == "success" for item in results)
+            valid_results = all(
+                item.get("status") in {"success", "unknown", "not_attempted"}
+                and (
+                    _finite(item.get("submitted_deg"))
+                    if item.get("status") == "success"
+                    else item.get("submitted_deg") is None
+                )
+                for item in results
+            )
             if gripper is None or (
-                (gripper.get("status") == "success") != submitted
-                or gripper.get("submitted_deg") != row["q_sent_deg"]
-                or (not submitted and gripper.get("status") != row["send_status"])
+                not valid_results
+                or all_submitted != submitted
+                or (submitted and gripper.get("submitted_deg") != row["q_sent_deg"])
+                or (not submitted and row["send_status"] != "unknown")
             ):
                 errors.append(prefix + "final target disagrees with per-joint software receipt")
         if fault_epoch is not None:
