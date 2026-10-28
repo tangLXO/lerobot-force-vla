@@ -21,8 +21,9 @@ import math
 import os
 import platform
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Any
 
 from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for numpy.typing
@@ -38,6 +39,7 @@ from lerobot.utils.errors import DeviceNotConnectedError
 from ..camera import Camera
 from ..utils import get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
+from .device_binding import resolve_device_path
 
 # NOTE(Steven): The maximum opencv device index depends on your operating system. For instance,
 # if you have 3 cameras, they should be associated to index 0, 1, and 2. This is the case
@@ -47,6 +49,16 @@ from .configuration_opencv import ColorMode, OpenCVCameraConfig
 MAX_OPENCV_INDEX = 60
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class OpenCVFrameSnapshot:
+    """One real capture with an atomic frame identity in the host clock domain."""
+
+    image: NDArray[Any]
+    sequence: int
+    timestamp_ns: int
+    arrival_timestamp_ns: int
 
 
 class OpenCVCamera(Camera):
@@ -113,8 +125,12 @@ class OpenCVCamera(Camera):
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
+        self._snapshot_condition = Condition(self.frame_lock)
+        self._snapshot_error: Exception | None = None
         self.latest_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        self._capture_sequence = -1
+        self._latest_capture: OpenCVFrameSnapshot | None = None
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
@@ -141,6 +157,11 @@ class OpenCVCamera(Camera):
         """Checks if the camera is currently connected and opened."""
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
+    @property
+    def has_resources(self) -> bool:
+        """Include partial connection and an unconfirmed reader shutdown."""
+        return self.videocapture is not None or self.thread is not None
+
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
         """
@@ -159,9 +180,17 @@ class OpenCVCamera(Camera):
             RuntimeError: If the camera opens but fails to apply requested settings.
         """
 
+        if self.has_resources:
+            raise RuntimeError("Camera cleanup is unconfirmed; disconnect before reconnecting")
         # Use 1 thread for OpenCV operations to avoid potential conflicts or
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
+
+        if self.config.device_path is not None:
+            binding = resolve_device_path(self.config.device_path, int(self.backend))
+            self.index_or_path = binding["index"]
+        if self.index_or_path is None:
+            raise ValueError("Camera identity could not be resolved")
 
         self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
@@ -243,6 +272,25 @@ class OpenCVCamera(Camera):
             # On Windows with DSHOW, changing the resolution can silently override the FOURCC setting.
             # Set FOURCC last to make sure the requested pixel format is actually enforced.
             self._validate_fourcc()
+
+        self._configure_exposure()
+
+    def _configure_exposure(self) -> None:
+        """Apply an explicit native exposure without changing unconfigured cameras."""
+        if self.config.exposure is None:
+            return
+        if self.videocapture is None:
+            raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+        accepted = self.videocapture.set(cv2.CAP_PROP_EXPOSURE, float(self.config.exposure))
+        actual = self.videocapture.get(cv2.CAP_PROP_EXPOSURE)
+        if not accepted or not math.isclose(actual, self.config.exposure, rel_tol=1e-3, abs_tol=1e-6):
+            logger.warning(
+                "%s requested exposure=%s but backend returned exposure=%s (accepted=%s)",
+                self,
+                self.config.exposure,
+                actual,
+                accepted,
+            )
 
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
@@ -470,12 +518,18 @@ class OpenCVCamera(Camera):
         while not stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
+                capture_timestamp_ns = time.perf_counter_ns()
                 processed_frame = self._postprocess_image(raw_frame)
                 capture_time = time.perf_counter()
 
                 with self.frame_lock:
                     self.latest_frame = processed_frame
                     self.latest_timestamp = capture_time
+                    self._capture_sequence += 1
+                    self._latest_capture = OpenCVFrameSnapshot(
+                        processed_frame, self._capture_sequence, capture_timestamp_ns, time.perf_counter_ns()
+                    )
+                    self._snapshot_condition.notify_all()
                 self.new_frame_event.set()
                 failure_count = 0
 
@@ -486,6 +540,9 @@ class OpenCVCamera(Camera):
                     failure_count += 1
                     logger.warning(f"Error reading frame in background thread for {self}: {e}")
                 else:
+                    with self._snapshot_condition:
+                        self._snapshot_error = e
+                        self._snapshot_condition.notify_all()
                     raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
 
     def _start_read_thread(self) -> None:
@@ -493,6 +550,7 @@ class OpenCVCamera(Camera):
         self._stop_read_thread()
 
         self.stop_event = Event()
+        self._snapshot_error = None
         self.thread = Thread(target=self._read_loop, args=(), name=f"{self}_read_loop")
         self.thread.daemon = True
         self.thread.start()
@@ -502,11 +560,13 @@ class OpenCVCamera(Camera):
         """Signals the background read thread to stop and waits for it to join."""
         if self.stop_event is not None:
             self.stop_event.set()
+        with self._snapshot_condition:
+            self._snapshot_condition.notify_all()
 
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
             if self.thread.is_alive():
-                logger.warning(f"{self} read thread did not terminate within timeout.")
+                raise TimeoutError(f"{self} read thread shutdown unconfirmed; resources retained")
 
         self.thread = None
         self.stop_event = None
@@ -514,27 +574,15 @@ class OpenCVCamera(Camera):
         with self.frame_lock:
             self.latest_frame = None
             self.latest_timestamp = None
+            self._latest_capture = None
             self.new_frame_event.clear()
 
     def _cleanup_resources(self) -> None:
         """Stop background reads and release the capture, including after partial setup."""
-        read_thread = self.thread
-        videocapture = self.videocapture
-
-        try:
-            self._stop_read_thread()
-        finally:
+        self._stop_read_thread()
+        if self.videocapture is not None:
+            self.videocapture.release()
             self.videocapture = None
-            try:
-                if videocapture is not None:
-                    videocapture.release()
-            finally:
-                # Releasing the device may unblock a hardware read that outlived
-                # the first bounded join in _stop_read_thread().
-                if read_thread is not None and read_thread.is_alive():
-                    read_thread.join(timeout=2.0)
-                    if read_thread.is_alive():  # pragma: no cover
-                        logger.warning(f"{self} read thread remained alive after releasing the capture.")
 
     @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
@@ -613,6 +661,64 @@ class OpenCVCamera(Camera):
 
         return frame
 
+    @check_if_not_connected
+    def read_latest_snapshot(self, after_sequence: int | None = None) -> OpenCVFrameSnapshot | None:
+        """Copy a new capture atomically without consuming the legacy read event.
+
+        A repeated poll returns None when no new hardware read completed. The
+        timestamp marks host capture return, not exposure or sensor conversion.
+        """
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+        with self.frame_lock:
+            captured = self._latest_capture
+            if captured is None or (after_sequence is not None and captured.sequence <= after_sequence):
+                return None
+            return OpenCVFrameSnapshot(
+                captured.image.copy(), captured.sequence, captured.timestamp_ns, captured.arrival_timestamp_ns
+            )
+
+    @check_if_not_connected
+    def wait_for_snapshot(
+        self,
+        after_sequence: int | None,
+        timeout_ms: float = 100,
+        stop_event: Event | None = None,
+    ) -> OpenCVFrameSnapshot | None:
+        """Wait for a newer atomic capture without consuming another reader's notification.
+
+        The sequence predicate and notification share the cache lock, so an early
+        publication cannot be lost. Each caller keeps its own cursor. Idle timeout
+        or caller cancellation returns None; source failure remains an error.
+        """
+        if not math.isfinite(timeout_ms) or timeout_ms < 0:
+            raise ValueError("Snapshot timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self._snapshot_condition:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                if self._snapshot_error is not None:
+                    raise RuntimeError(f"{self} background capture failed") from self._snapshot_error
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise RuntimeError(f"{self} background capture is stopping")
+                if self.thread is None or not self.thread.is_alive():
+                    raise RuntimeError(f"{self} read thread is not running.")
+                captured = self._latest_capture
+                if captured is not None and (after_sequence is None or captured.sequence > after_sequence):
+                    return OpenCVFrameSnapshot(
+                        captured.image.copy(),
+                        captured.sequence,
+                        captured.timestamp_ns,
+                        captured.arrival_timestamp_ns,
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                # A caller's Event cannot notify this Condition; bound cancellation
+                # and source health checks even when it supplies a long timeout.
+                self._snapshot_condition.wait(min(remaining, 0.1))
+
     def disconnect(self) -> None:
         """
         Disconnects from the camera and cleans up resources.
@@ -623,7 +729,7 @@ class OpenCVCamera(Camera):
         Raises:
             DeviceNotConnectedError: If the camera is already disconnected.
         """
-        if not self.is_connected and self.thread is None:
+        if not self.has_resources:
             raise DeviceNotConnectedError(f"{self} not connected.")
 
         self._cleanup_resources()

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,7 +43,7 @@ class OpenCVCameraConfig(CameraConfig):
 
     Attributes:
         index_or_path: Either an integer representing the camera device index,
-                      or a Path object pointing to a video file.
+                      or a Path object pointing to a video file. None when device_path is selected.
         fps: Requested frames per second for the color stream.
         width: Requested frame width in pixels for the color stream.
         height: Requested frame height in pixels for the color stream.
@@ -51,6 +52,9 @@ class OpenCVCameraConfig(CameraConfig):
         warmup_s: Time reading frames before returning from connect (in seconds)
         fourcc: FOURCC code for video format (e.g., "MJPG", "YUYV", "I420"). Defaults to None (auto-detect).
         backend: OpenCV backend identifier (https://docs.opencv.org/3.4/d4/d15/group__videoio__flags__base.html). Defaults to ANY.
+        exposure: Optional native backend exposure value. None preserves the device setting.
+        device_path: Optional native device identity, resolved anew at connect on an explicit backend.
+                     Mutually exclusive with index_or_path; supports cameras with identical names.
 
     Note:
         - Only 3-channel color output (RGB/BGR) is currently supported.
@@ -58,17 +62,34 @@ class OpenCVCameraConfig(CameraConfig):
         - Setting FOURCC can help achieve higher frame rates on some cameras.
     """
 
-    index_or_path: int | Path
+    index_or_path: int | Path | None = None
     color_mode: ColorMode = ColorMode.RGB
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
     fourcc: str | None = None
     backend: Cv2Backends = Cv2Backends.ANY
+    exposure: float | None = None
+    device_path: str | None = None
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
         self.rotation = Cv2Rotation(self.rotation)
         self.backend = Cv2Backends(self.backend)
+
+        if self.device_path is not None:
+            if not isinstance(self.device_path, str) or not self.device_path.strip():
+                raise ValueError("device_path must be a nonempty native device identity")
+            if self.index_or_path is not None or self.backend == Cv2Backends.ANY:
+                raise ValueError("Choose device_path with an explicit backend and no index_or_path")
+        elif self.index_or_path is None:
+            raise ValueError("Choose exactly one of index_or_path and device_path")
+
+        if self.exposure is not None and (
+            isinstance(self.exposure, bool)
+            or not isinstance(self.exposure, (int, float))
+            or not math.isfinite(self.exposure)
+        ):
+            raise ValueError("`exposure` must be a finite native backend value or None")
 
         if self.fourcc is not None and (not isinstance(self.fourcc, str) or len(self.fourcc) != 4):
             raise ValueError(

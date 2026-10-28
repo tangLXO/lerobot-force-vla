@@ -20,14 +20,14 @@ def recording_config(tmp_path):
     return TeacherRecordConfig(
         root=str(tmp_path / "demonstrations"),
         task="拿起并放下",
-        camera_configs={"front": {"index_or_path": 0, "fps": 30, "width": 64, "height": 64}},
+        camera_configs={"front": {"index_or_path": 0, "fps": 50, "width": 64, "height": 64}},
     )
 
 
 def hybrid_config(tmp_path):
     config = run_config(tmp_path, armed=True)
     config.initial_mode, config.leader_backend = "hybrid", "fake"
-    config.runtime = replace(config.runtime, joint_names=FAKE_B601_JOINT_NAMES)
+    config.runtime = replace(config.runtime, joint_names=FAKE_B601_JOINT_NAMES, control_hz=50)
     config.teacher = replace(config.teacher, gripper_follow_speed_deg_s=5, contact_force_threshold_N=0.1)
     config.recording = recording_config(tmp_path)
     return config
@@ -218,7 +218,7 @@ def test_supervisor_decodes_draft_recording_before_runtime_validation(supervised
     )
     _, decoded = supervised.load_reviewed(path)
     assert isinstance(decoded.recording, TeacherRecordConfig)
-    assert decoded.recording.task == "拿起并放下" and decoded.recording.fps == 30
+    assert decoded.recording.task == "拿起并放下" and decoded.recording.fps == 50
     assert decoded.runtime.joint_names == FAKE_B601_JOINT_NAMES
 
 

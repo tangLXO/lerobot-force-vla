@@ -170,6 +170,8 @@ outputs/
 /b601.json
 /b601_ip_parameters.json
 /b601_ip_parameters_communication.json
+/b601_capture_parameters.json
+/b601_camera_bindings.json
 
 # Translations
 *.mo

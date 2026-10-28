@@ -1,5 +1,11 @@
 # FORCE_POS 交付范围与回退
 
+## 2026-10-28 采集版
+
+`codex/teacher-capture` 从 `d82f5d52` 建立独立 worktree；原 `codex/forcepos-teacher`、本机参数与数据保留。只迁入相机稳定绑定/原子快照、NVENC 和视频完整性相关功能，沿用基线 Teacher、Owner、安全及 Sensor Sidecar，不迁入后续实验/准入体系。新数据使用独立目录，录制和控制统一 50 Hz，Raw 力独立 400 Hz，具体契约与流程见 [DEMONSTRATION_RECORDING.md](DEMONSTRATION_RECORDING.md)。
+
+下文为基线已有的历史整理记录，不代表本轮起点或当前功能范围。
+
 本轮从 `c241b29d` 的 `force-vla` 基线建立 `codex/forcepos-teacher`，仅形成本地提交。
 
 ## 提交结构

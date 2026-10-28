@@ -166,6 +166,8 @@ class ForceTeacherRunConfig:
         """Validate intent and profile before any transport may be opened."""
         if self.recording is not None:
             self.recording.validate()
+            if self.runtime.control_hz != 50:
+                raise ValueError("Teacher capture requires 50 Hz control and recording")
             if tuple(self.runtime.joint_names) != FAKE_B601_JOINT_NAMES:
                 raise ValueError("Demonstration recording requires the complete seven-joint owner")
         if self.backend not in ("fake", "b601"):

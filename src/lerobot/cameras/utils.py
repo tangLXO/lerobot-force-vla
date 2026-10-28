@@ -23,6 +23,16 @@ from .configs import CameraConfig, Cv2Rotation
 
 
 def make_cameras_from_configs(camera_configs: dict[str, CameraConfig]) -> dict[str, Camera]:
+    path_owners: dict[str, str] = {}
+    for key, cfg in camera_configs.items():
+        path = getattr(cfg, "device_path", None) if cfg.type == "opencv" else None
+        if path is not None:
+            if path in path_owners:
+                raise ValueError(
+                    f"Camera roles {path_owners[path]!r} and {key!r} select the same device path: {path}"
+                )
+            path_owners[path] = key
+
     cameras: dict[str, Camera] = {}
 
     for key, cfg in camera_configs.items():

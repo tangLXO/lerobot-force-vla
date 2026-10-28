@@ -70,7 +70,7 @@ def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
     assert (path.read_bytes(), path.stat().st_mtime_ns) == (original, mtime)
     saved = tuning.save_settings(tmp_path / "canonical.json", restored, switches, source)
     encoded = json.loads(saved.read_text(encoding="utf-8"))
-    assert encoded["schema_version"] == 8
+    assert encoded["schema_version"] == 9
     assert encoded["values"] == values
     assert not LEGACY_TEACHER_FIELDS.keys() & encoded["values"].keys()
     config = tuning.build_config(restored, switches, calibration, tmp_path / "trace")

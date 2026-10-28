@@ -58,7 +58,7 @@ from lerobot.scripts.lerobot_force_teacher import ForceTeacherRunConfig
 from lerobot.sensors.x518 import X518Sensor
 
 OUTPUTS = Path("outputs/force_teacher_tuning")
-DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "b601_ip_parameters.json"
+DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "b601_capture_parameters.json"
 _UNSTOPPED_PREVIEWS = []
 
 
@@ -722,7 +722,7 @@ class Tuner:
         self.points, self.fixed_widgets, self.optional_widgets = deque(), [], []
         self.other_widgets = []
         self.fields, self.toggles = {}, {}
-        root.title("B601 · MIT 六臂 + FORCE_POS / I-P 夹爪 · 故障恢复 · 连接自动复核")
+        root.title("B601 · 50 Hz 采集版 · MIT 六臂 + FORCE_POS / I-P 夹爪")
         root.geometry("1320x920")
         root.minsize(1000, 740)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -2420,6 +2420,9 @@ def main(argv=None):
     parser.add_argument("--connect", action="store_true", help="Start query-only monitoring; never enable")
     parser.add_argument("--calibration-file", type=Path, default=DEFAULT_GRIPPER_CALIBRATION)
     parser.add_argument("--settings-file", type=Path, default=DEFAULT_SETTINGS)
+    parser.add_argument(
+        "--recording-config", type=Path, help="Prefill the recording form only; does not connect or enable"
+    )
     parser.add_argument("--gripper-only", action="store_true", help="Use the standalone gripper entry")
     args = parser.parse_args(argv)
     window = tk.Tk()
@@ -2429,6 +2432,20 @@ def main(argv=None):
         settings_path=args.settings_file,
         default_full_arm_mit=not args.gripper_only,
     )
+    if args.recording_config is not None:
+        document = json.loads(args.recording_config.read_text(encoding="utf-8"))
+        from lerobot.force_control.demonstration import TeacherRecordConfig
+
+        TeacherRecordConfig(**document).validate()
+        for key, variable in app.recording_page.fields.items():
+            if key in document:
+                variable.set(str(document[key]))
+        app.recording_page.cameras.delete("1.0", "end")
+        app.recording_page.cameras.insert(
+            "1.0", json.dumps(document["camera_configs"], ensure_ascii=False, indent=2)
+        )
+        app.recording_page.resume.set(document.get("resume", False))
+        app.recording_page.enabled.set(True)
     if args.smoke_test:
         window.after(250, app.close)
     elif args.connect:

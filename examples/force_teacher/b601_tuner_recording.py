@@ -43,6 +43,7 @@ def recording_config(values, cameras_text):
             raise ValueError(f"{name} 须为正整数")
         config[name] = value
     config["resume"] = values.get("resume") is True
+    config["h264_encoder"] = str(values.get("h264_encoder", "nvenc"))
     cameras = json.loads(cameras_text)
     if not isinstance(cameras, dict) or not cameras or len(cameras) > 4:
         raise ValueError("配置一至四路相机，JSON 根对象为相机名称映射")
@@ -120,18 +121,19 @@ class RecordingPage:
         self.configuration_widgets.append(enable)
         ttk.Label(
             parent,
-            text="默认主数据 / 视频 30 Hz；开始录制不使能。\n先在全臂会话中遥操，放下并手动张开后结束保存。",
+            text="采集版：控制 / 主数据 / 视频统一 50 Hz，默认 NVENC。\n先在全臂会话中遥操，放下并手动张开后结束保存。",
             wraplength=430,
         ).pack(anchor="w", pady=6)
         form = ttk.Frame(parent)
         form.pack(fill="x")
         definitions = (
-            ("root", "数据目录", "outputs/teacher_demonstrations"),
+            ("root", "数据目录", "outputs/teacher_capture_50hz"),
             ("repo_id", "数据集 ID", "local/force_teacher_demo"),
             ("task", "任务描述", ""),
             ("object_id", "物体", ""),
             ("contact_condition_id", "接触条件", ""),
-            ("fps", "主数据 / 视频 Hz", "30"),
+            ("fps", "主数据 / 视频 Hz", "50"),
+            ("h264_encoder", "H.264 编码器 nvenc / software", "nvenc"),
             ("camera_max_age_ms", "相机最大年龄 ms", "100"),
             ("queue_capacity", "录制队列容量", "128"),
             ("target_episode_count", "目标 episode 数", "10"),
@@ -149,12 +151,13 @@ class RecordingPage:
         self.configuration_widgets.append(resume)
         ttk.Label(parent, text="相机配置 JSON（设备仅在后端准备时打开）").pack(anchor="w")
         self.cameras = tk.Text(parent, height=5, width=48, wrap="word")
-        self.cameras.insert("1.0", "{}")
+        bindings = Path(__file__).resolve().parents[2] / "b601_camera_bindings.json"
+        self.cameras.insert("1.0", bindings.read_text(encoding="utf-8") if bindings.is_file() else "{}")
         self.cameras.pack(fill="x")
         self.configuration_widgets.append(self.cameras)
         ttk.Label(
             parent,
-            text='本机已只读验证 front=1、wrist=0；示例：{"front":{"type":"opencv","index_or_path":1,"backend":700,"fps":30,"width":640,"height":480}}',
+            text="按 device_path 绑定 front / wrist，相机接入时重新解析设备索引；双摄均为 50 Hz。缺失设备直接报错。",
             wraplength=430,
         ).pack(anchor="w", pady=4)
         profiles = ttk.LabelFrame(profile_parent or parent, text="全臂明确配置与预检", padding=6)

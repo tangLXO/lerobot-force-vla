@@ -31,6 +31,7 @@ import datasets
 import numpy as np
 import pandas as pd
 import PIL.Image
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
@@ -202,11 +203,12 @@ class DatasetWriter:
         else:
             self.image_writer.save_image(image=image, fpath=fpath, compress_level=compress_level)
 
-    def prepare_episode_recording(self, timeout_s: float = 30) -> None:
+    def prepare_episode_recording(self, timeout_s: float = 30, *, collect_garbage: bool = True) -> None:
         """Open streaming codecs before capture, without adding frames to the episode.
 
         Args:
             timeout_s: Shared deadline in seconds for all camera codecs to become ready.
+            collect_garbage: Run explicit startup GC; disable when a live control loop shares the process.
         """
         if self._finalized:
             raise RuntimeError("Cannot prepare a finalized writer.")
@@ -241,7 +243,7 @@ class DatasetWriter:
             )
         encoder.wait_until_ready(timeout_s=timeout_s)
         codecs_ready = time.perf_counter()
-        if newly_started:
+        if newly_started and collect_garbage:
             # Imports and codec construction can bring generation 2 close to its
             # automatic threshold. Collect before subscribing Sensors, not during
             # the first few real frames; keep automatic GC enabled throughout.
@@ -335,6 +337,12 @@ class DatasetWriter:
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
 
+        # Strict callers must prove video completion before mutating main metadata,
+        # Parquet files, or even the episode buffer. Legacy callers keep their order.
+        streaming_results = None
+        if self._streaming_encoder is not None and self._streaming_encoder.strict_integrity:
+            streaming_results = self._streaming_encoder.finish_episode(expected_frames=episode_buffer["size"])
+
         # size and task are special cases that won't be added to hf_dataset
         episode_length = episode_buffer.pop("size")
         tasks = episode_buffer.pop("task")
@@ -383,7 +391,8 @@ class DatasetWriter:
         ep_metadata = self._save_episode_data(episode_buffer)
 
         if use_streaming:
-            streaming_results = self._streaming_encoder.finish_episode()
+            if streaming_results is None:
+                streaming_results = self._streaming_encoder.finish_episode()
             for video_key in self._meta.video_keys:
                 normalization_factor = 255.0 if video_key not in self._meta.depth_keys else 1.0
                 temp_path, video_stats = streaming_results[video_key]
@@ -500,9 +509,27 @@ class DatasetWriter:
         # Use metadata features as the authoritative schema
         hf_features = get_hf_features_from_features(self._meta.features)
         ep_dict = {key: episode_buffer[key] for key in hf_features}
-        ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
-        ep_dataset = embed_images(ep_dataset)
-        ep_num_frames = len(ep_dataset)
+        flat_numeric = all(
+            self._meta.features[key]["dtype"] in ("float32", "float64", "int32", "int64", "bool")
+            and len(self._meta.features[key]["shape"]) <= 1
+            for key in hf_features
+        )
+        if flat_numeric:
+            # Teacher videos are already encoded separately. Avoid HF's Python
+            # per-row image embedding/feature encoding on the live control host.
+            table = pa.Table.from_pydict(
+                {
+                    key: value.tolist() if isinstance(value, np.ndarray) else value
+                    for key, value in ep_dict.items()
+                },
+                schema=hf_features.arrow_schema,
+            )
+        else:
+            ep_dataset = datasets.Dataset.from_dict(ep_dict, features=hf_features, split="train")
+            if self._meta.image_keys:
+                ep_dataset = embed_images(ep_dataset)
+            table = ep_dataset.with_format("arrow")[:]
+        ep_num_frames = len(table)
 
         if self._latest_episode is None:
             chunk_idx, file_idx = 0, 0
@@ -544,7 +571,6 @@ class DatasetWriter:
         self._meta._register_sensor_artifact(path, "data")
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        table = ep_dataset.with_format("arrow")[:]
         if not self._pq_writer:
             self._pq_writer = pq.ParquetWriter(
                 path, schema=table.schema, compression="snappy", use_dictionary=True

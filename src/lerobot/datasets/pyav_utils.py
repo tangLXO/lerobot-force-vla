@@ -109,6 +109,12 @@ def _check_option_value(vcodec: str, label: str, value: Any, opt: av.option.Opti
     """Range-check numeric *value* and choice-check string *value* against *opt*."""
     type_name = opt.type.name
     if type_name in FFMPEG_NUMERIC_OPTION_TYPES:
+        # FFmpeg integer enums also accept their published symbolic constants
+        # (for example NVENC preset="p4"). Unknown strings still fail below.
+        if isinstance(value, str) and value in {
+            choice.name for choice in (getattr(opt, "choices", None) or [])
+        }:
+            return
         if isinstance(value, bool):
             raise ValueError(
                 f"{label}={value!r} is not numeric; codec {vcodec!r} expects a number for this option."

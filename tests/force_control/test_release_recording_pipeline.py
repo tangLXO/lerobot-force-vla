@@ -28,13 +28,14 @@ def test_real_files_finish_after_owner_quiesce_and_respect_user_stop(monkeypatch
     finishing = threading.Event()
     config = run_config(tmp_path, armed=True)
     config.initial_mode, config.leader_backend = "hybrid", "fake"
-    config.runtime = replace(config.runtime, joint_names=FAKE_B601_JOINT_NAMES)
+    config.runtime = replace(config.runtime, joint_names=FAKE_B601_JOINT_NAMES, control_hz=50)
     config.teacher = replace(config.teacher, gripper_follow_speed_deg_s=5, contact_force_threshold_N=0.1)
     config.duration_s, config.shutdown_timeout_s = None, 10
     config.recording = TeacherRecordConfig(
         root=str(tmp_path / "dataset"),
         task="Synthetic asynchronous save lifecycle",
-        fps=10,
+        fps=50,
+        h264_encoder="software",
         camera_configs={"front": {"index_or_path": 0, "fps": 60, "width": 64, "height": 48}},
         queue_capacity=512,
     )

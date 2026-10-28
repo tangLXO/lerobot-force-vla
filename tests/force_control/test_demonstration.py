@@ -29,8 +29,9 @@ def record_config(tmp_path, **changes):
     return demo.TeacherRecordConfig(
         root=str(tmp_path / "dataset"),
         task="抓取并放下",
-        fps=30,
-        camera_configs={"front": {"index_or_path": 0, "fps": 30, "width": 16, "height": 16}},
+        fps=50,
+        h264_encoder="software",
+        camera_configs={"front": {"index_or_path": 0, "fps": 50, "width": 16, "height": 16}},
         **changes,
     )
 
@@ -75,6 +76,7 @@ def snapshot(tick=0, *, anchor=1_000_000_000, sequence=1):
         "joint_feedback_max_age_ms": 100,
         "force_left_N": 0.5,
         "force_right_N": 0.75,
+        "force_target_effective_N": 2.0,
         "send_start_ns": anchor + 10,
         "send_end_ns": anchor + 20,
         "per_joint_results": receipts,
@@ -208,7 +210,7 @@ class StubOwner:
     """A cache/subscription source with trap motor operations."""
 
     def __init__(self):
-        self.runtime = SimpleNamespace(config=SimpleNamespace(joint_names=demo.JOINT_NAMES, control_hz=100))
+        self.runtime = SimpleNamespace(config=SimpleNamespace(joint_names=demo.JOINT_NAMES, control_hz=50))
         self.is_running = True
         self.subscriptions = []
         self.post = Mock(side_effect=AssertionError("recording must not issue motion commands"))
@@ -258,7 +260,7 @@ class StubDataset:
         instance.finalized = False
         return instance
 
-    def prepare_episode_recording(self):
+    def prepare_episode_recording(self, **kwargs):
         pass
 
     def add_frame(self, frame):
@@ -384,6 +386,24 @@ def test_manual_finish_saves_without_release_or_other_motor_commands(stub_record
     assert metadata["complete"] and metadata["task_result"] == "success"
 
 
+def test_every_submitted_tick_is_kept_despite_early_or_late_intervals(stub_recording):
+    controller, owner, config = stub_recording
+    begin(stub_recording)
+    for tick, offset in enumerate((0, 19_000_000, 40_000_000, 81_000_000)):
+        publish_frame(controller, owner, tick, anchor=1_000_000_000 + offset)
+        wait_status(controller, lambda status, count=tick + 1: status["frame_count"] == count)
+    controller.submit("record_finish", {"task_result": "unknown"})
+    saved = wait_status(controller, lambda status: status["state"] == "saved")
+    metadata = json.loads(
+        (Path(config.root) / "meta/teacher_episodes" / f"{saved['episode_uid']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert metadata["frame_count"] == 4 and metadata["complete"]
+    assert metadata["timing"]["intervals_over_30ms"] == 1
+    assert metadata["task_result"] == "unknown"
+
+
 def test_discard_and_rerecord_uses_new_uid_without_committing_discard(stub_recording):
     controller, owner, config = stub_recording
     initial = begin(stub_recording)["episode_uid"]
@@ -439,6 +459,9 @@ def test_resume_refuses_main_episodes_without_teacher_attachments(stub_recording
     root = tmp_path / "orphaned"
     (root / "meta").mkdir(parents=True)
     (root / "meta/info.json").write_text(json.dumps({"total_episodes": 1}), encoding="utf-8")
+    from lerobot.force_control.capture_contract import capture_contract
+
+    (root / "meta/teacher_capture.json").write_text(json.dumps(capture_contract()), encoding="utf-8")
     with pytest.raises(ValueError, match="lack complete Teacher"):
         controller._check_resume(root)
 

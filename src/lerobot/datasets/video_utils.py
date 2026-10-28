@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import ctypes
 import glob
 import importlib
 import logging
@@ -24,6 +25,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -53,6 +55,73 @@ from .depth_utils import quantize_depth
 from .pyav_utils import get_pix_fmt_channels
 
 logger = logging.getLogger(__name__)
+_NATIVE_CODEC_LOG_LOCK = Lock()
+_SVT_LOG_OWNER = "_LEROBOT_SVT_LOG_FILE_OWNER"
+_NATIVE_SVT_LOG_PATH: Path | None = None
+
+
+def _prepare_native_svt_logging(vcodec: str) -> Path | None:
+    """Give Windows SVT's legacy CRT a persistent, process-owned log target.
+
+    Its native stderr handle can become invalid when Python redirects descriptors.
+    SVT_LOG_FILE preserves all native messages without changing codec settings or
+    log levels. Python and legacy MSVCRT keep separate environment tables, so the
+    supported CRT setter must synchronize this one variable before codec startup.
+    """
+    if os.name != "nt" or vcodec != "libsvtav1":
+        return None
+    global _NATIVE_SVT_LOG_PATH
+    with _NATIVE_CODEC_LOG_LOCK:
+        value = os.environ.get("SVT_LOG_FILE")
+        if _NATIVE_SVT_LOG_PATH is not None and (not value or Path(value).absolute() != _NATIVE_SVT_LOG_PATH):
+            raise RuntimeError(
+                "SVT diagnostic log is already owned by this process; use a new process to change it"
+            )
+        owner, separator, owned_path = os.environ.get(_SVT_LOG_OWNER, "").partition("|")
+        inherited = bool(separator and owned_path == value and owner != str(os.getpid()))
+        if value is None or inherited:
+            directory = Path(tempfile.gettempdir()) / "lerobot-native-codec-logs"
+            directory.mkdir(parents=True, exist_ok=True)
+            path = directory / f"svt-av1-{os.getpid()}-{uuid.uuid4().hex}.log"
+            path.touch(exist_ok=False)
+            value = str(path)
+            os.environ["SVT_LOG_FILE"] = value
+            os.environ[_SVT_LOG_OWNER] = f"{os.getpid()}|{value}"
+        if not value:
+            raise ValueError("SVT_LOG_FILE must name a persistent native codec log file")
+        encoded = value.encode("mbcs")
+        crt = ctypes.CDLL("msvcrt")
+        crt._putenv_s.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+        crt._putenv_s.restype = ctypes.c_int
+        crt.getenv.argtypes = [ctypes.c_char_p]
+        crt.getenv.restype = ctypes.c_char_p
+        if crt.getenv(b"SVT_LOG_FILE") != encoded and crt._putenv_s(b"SVT_LOG_FILE", encoded):
+            raise RuntimeError("Could not configure the native SVT diagnostic log")
+        if crt.getenv(b"SVT_LOG_FILE") != encoded:
+            raise RuntimeError("Could not configure the native SVT diagnostic log")
+        # Native SVT owns its FILE until process shutdown. Never remove or rotate
+        # this file during per-episode cleanup, including failed initialization.
+        _NATIVE_SVT_LOG_PATH = Path(value).absolute()
+        return _NATIVE_SVT_LOG_PATH
+
+
+@contextlib.contextmanager
+def _python_libav_log_level(level):
+    """Restore only the Python logger we change; the caller owns PyAV's callback.
+
+    FFmpeg's callback is process-global. Switching it to native stderr from a
+    worker or probe can outlive redirected Windows stdio handles, including
+    pytest's descriptor capture. It also changes logging for unrelated codecs.
+    """
+    libav_logger = logging.getLogger("libav")
+    previous_level = libav_logger.level
+    if level is not None:
+        libav_logger.setLevel(level)
+    try:
+        yield
+    finally:
+        if level is not None:
+            libav_logger.setLevel(previous_level)
 
 
 def decode_video_frames(
@@ -500,14 +569,10 @@ def encode_video_frames(
         width, height = dummy_image.size
 
     video_options = video_encoder.get_codec_options(encoder_threads, as_strings=True)
-
-    # Set logging level
-    if log_level is not None:
-        # "While less efficient, it is generally preferable to modify logging with Python's logging"
-        logging.getLogger("libav").setLevel(log_level)
+    _prepare_native_svt_logging(vcodec)
 
     # Create and open output file (overwrite by default)
-    with av.open(str(video_path), "w") as output:
+    with _python_libav_log_level(log_level), av.open(str(video_path), "w") as output:
         output_stream = output.add_stream(vcodec, fps, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
@@ -537,10 +602,6 @@ def encode_video_frames(
         packet = output_stream.encode()
         if packet:
             output.mux(packet)
-
-    # Reset logging level
-    if log_level is not None:
-        av.logging.restore_default_callback()
 
     if not video_path.exists():
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
@@ -587,15 +648,13 @@ def reencode_video(
     video_options = video_encoder.get_codec_options(encoder_threads, as_strings=True)
     vcodec = video_encoder.vcodec
     pix_fmt = video_encoder.pix_fmt
+    _prepare_native_svt_logging(vcodec)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    if log_level is not None:
-        logging.getLogger("libav").setLevel(log_level)
-
     try:
-        with av.open(input_video_path, mode="r") as src:
+        with _python_libav_log_level(log_level), av.open(input_video_path, mode="r") as src:
             try:
                 in_stream = src.streams.video[0]
             except IndexError as e:
@@ -644,10 +703,6 @@ def reencode_video(
     except Exception:
         Path(tmp_output_video_path).unlink(missing_ok=True)
         raise
-    finally:
-        if log_level is not None:
-            av.logging.restore_default_callback()
-
     if not output_video_path.exists():
         raise OSError(f"Video re-encoding did not work. File not found: {output_video_path}.")
 
@@ -785,11 +840,14 @@ class _CameraEncoderThread(threading.Thread):
         self.stop_event = stop_event
         self.encoder_threads = encoder_threads
         self.frame_size = frame_size
+        self.native_log_path = _prepare_native_svt_logging(video_encoder.vcodec)
         self.ready = threading.Event()
         self.error: Exception | None = None
 
     def _open_container(self, height: int, width: int):
         """Open the actual episode codec, without submitting a synthetic frame."""
+        if self.stop_event.is_set():
+            raise RuntimeError("Encoder initialization cancelled")
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
         container = av.open(str(self.video_path), "w")
         try:
@@ -802,6 +860,8 @@ class _CameraEncoderThread(threading.Thread):
             stream.width = width
             stream.height = height
             stream.time_base = Fraction(1, self.fps)
+            if self.stop_event.is_set():
+                raise RuntimeError("Encoder initialization cancelled")
             container.start_encoding()
         except BaseException:
             container.close()
@@ -815,9 +875,9 @@ class _CameraEncoderThread(threading.Thread):
         output_stream = None
         stats_tracker = RunningQuantileStats()
         frame_count = 0
+        self.encoded_frame_count = 0
 
         try:
-            logging.getLogger("libav").setLevel(av.logging.WARNING)
             if self.frame_size is not None:
                 container, output_stream = self._open_container(*self.frame_size)
                 self.ready.set()
@@ -878,6 +938,7 @@ class _CameraEncoderThread(threading.Thread):
                 stats_tracker.update(img_for_stats)
 
                 frame_count += 1
+                self.encoded_frame_count = frame_count
 
             # Flush encoder
             if output_stream is not None:
@@ -887,8 +948,6 @@ class _CameraEncoderThread(threading.Thread):
 
             if container is not None:
                 container.close()
-
-            av.logging.restore_default_callback()
 
             # Get stats and put on result queue
             if frame_count >= 2:
@@ -928,6 +987,7 @@ class StreamingVideoEncoder:
         depth_encoder: DepthEncoderConfig | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        strict_integrity: bool = False,
     ):
         """
         Args:
@@ -941,12 +1001,16 @@ class StreamingVideoEncoder:
                 back-pressure drops frames.
             encoder_threads: Number of encoder threads (global setting).
                 ``None`` lets the codec decide.
+            strict_integrity: Latch lost frames and reject incomplete completion.
         """
         self.fps = fps
         self._rgb_encoder = rgb_encoder or rgb_encoder_defaults()
         self._depth_encoder = depth_encoder or depth_encoder_defaults()
         self._encoder_threads = encoder_threads
         self.queue_maxsize = queue_maxsize
+        self.strict_integrity = strict_integrity
+        self._integrity_error: str | None = None
+        self._accepted_frames: dict[str, int] = {}
 
         self._frame_queues: dict[str, queue.Queue] = {}
         self._result_queues: dict[str, queue.Queue] = {}
@@ -954,6 +1018,7 @@ class StreamingVideoEncoder:
         self._stop_events: dict[str, threading.Event] = {}
         self._video_paths: dict[str, Path] = {}
         self._dropped_frames: dict[str, int] = {}
+        self._native_log_paths: set[Path] = set()
         self._episode_active = False
         self._closed = False
         self._cancelling = False
@@ -962,6 +1027,11 @@ class StreamingVideoEncoder:
     def episode_active(self) -> bool:
         """Whether resources are owned by an episode, including failed cleanup."""
         return self._episode_active
+
+    @property
+    def native_log_paths(self) -> tuple[Path, ...]:
+        """Persistent runtime diagnostics, never part of Dataset or Sidecar manifests."""
+        return tuple(sorted(self._native_log_paths))
 
     def wait_until_ready(self, timeout_s: float = 30) -> None:
         """Wait for every actual codec to open, using one shared startup deadline."""
@@ -1007,6 +1077,8 @@ class StreamingVideoEncoder:
             raise ValueError("frame_sizes must describe every video key.")
 
         self._dropped_frames.clear()
+        self._accepted_frames.clear()
+        self._integrity_error = None
 
         if depth_video_keys is None:
             depth_video_keys = []
@@ -1045,6 +1117,8 @@ class StreamingVideoEncoder:
             self._result_queues[video_key] = result_queue
             self._threads[video_key] = encoder_thread
             self._stop_events[video_key] = stop_event
+            if encoder_thread.native_log_path is not None:
+                self._native_log_paths.add(encoder_thread.native_log_path)
             encoder_thread.start()
 
     def feed_frame(self, video_key: str, image: np.ndarray) -> None:
@@ -1064,9 +1138,13 @@ class StreamingVideoEncoder:
         """
         if not self._episode_active or self._cancelling:
             raise RuntimeError("No active episode. Call start_episode() first.")
+        if self._integrity_error is not None:
+            raise RuntimeError(self._integrity_error)
 
         thread = self._threads[video_key]
         if not thread.is_alive():
+            if self.strict_integrity:
+                self._integrity_error = f"Encoder thread for {video_key} stopped before completion"
             # Check for error
             try:
                 status, msg = self._result_queues[video_key].get_nowait()
@@ -1078,9 +1156,13 @@ class StreamingVideoEncoder:
 
         try:
             self._frame_queues[video_key].put(image.copy(), timeout=0.1)
+            self._accepted_frames[video_key] = self._accepted_frames.get(video_key, 0) + 1
         except queue.Full:
             self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
             count = self._dropped_frames[video_key]
+            if self.strict_integrity:
+                self._integrity_error = f"Encoder queue full for {video_key}: episode lost a frame"
+                raise RuntimeError(self._integrity_error) from None
             # Log periodically to avoid spam (1st, then every 10th)
             if count == 1 or count % 10 == 0:
                 logger.warning(
@@ -1088,7 +1170,7 @@ class StreamingVideoEncoder:
                     f"Consider using vcodec='auto' for hardware encoding or increasing encoder_queue_maxsize."
                 )
 
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+    def finish_episode(self, *, expected_frames: int | None = None) -> dict[str, tuple[Path, dict | None]]:
         """Finish encoding the current episode.
 
         Sends sentinel values, waits for encoder threads to complete,
@@ -1099,6 +1181,8 @@ class StreamingVideoEncoder:
         """
         if not self._episode_active or self._cancelling:
             raise RuntimeError("No active episode to finish.")
+        if self._integrity_error is not None:
+            raise RuntimeError(self._integrity_error)
 
         results = {}
 
@@ -1125,9 +1209,24 @@ class StreamingVideoEncoder:
             try:
                 status, data = self._result_queues[video_key].get(timeout=5)
                 if status == "error":
+                    if self.strict_integrity:
+                        self._integrity_error = f"Encoder thread for {video_key} failed: {data}"
                     raise RuntimeError(f"Encoder thread for {video_key} failed: {data}")
+                if self.strict_integrity and (
+                    status != "ok"
+                    or self._dropped_frames.get(video_key, 0)
+                    or self._accepted_frames.get(video_key, 0) != expected_frames
+                    or getattr(self._threads[video_key], "encoded_frame_count", None) != expected_frames
+                    or not self._video_paths[video_key].is_file()
+                    or self._video_paths[video_key].stat().st_size == 0
+                ):
+                    self._integrity_error = f"Video frame count/result mismatch for {video_key}"
+                    raise RuntimeError(self._integrity_error)
                 results[video_key] = (self._video_paths[video_key], data)
             except queue.Empty:
+                if self.strict_integrity:
+                    self._integrity_error = f"No result from encoder thread for {video_key}"
+                    raise RuntimeError(self._integrity_error) from None
                 logger.error(f"No result from encoder thread for {video_key}")
                 results[video_key] = (self._video_paths[video_key], None)
 
@@ -1221,17 +1320,12 @@ with warnings.catch_warnings():
 
 
 def get_audio_info(video_path: Path | str) -> dict:
-    # Set logging level
-    logging.getLogger("libav").setLevel(av.logging.WARNING)
-
     # Getting audio stream information
     audio_info = {}
     with av.open(str(video_path), "r") as audio_file:
         try:
             audio_stream = audio_file.streams.audio[0]
         except IndexError:
-            # Reset logging level
-            av.logging.restore_default_callback()
             return {"has_audio": False}
 
         audio_info["audio.channels"] = audio_stream.channels
@@ -1245,9 +1339,6 @@ def get_audio_info(video_path: Path | str) -> dict:
         audio_info["audio.bit_depth"] = audio_stream.format.bits
         audio_info["audio.channel_layout"] = audio_stream.layout.name
         audio_info["has_audio"] = True
-
-    # Reset logging level
-    av.logging.restore_default_callback()
 
     return audio_info
 
@@ -1272,16 +1363,12 @@ def get_video_info(
         ``True`` only when ``video_encoder`` is a
         :class:`~lerobot.configs.video.DepthEncoderConfig`.
     """
-    logging.getLogger("libav").setLevel(av.logging.WARNING)
-
     # Getting video stream information
     video_info = {}
     with av.open(str(video_path), "r") as video_file:
         try:
             video_stream = video_file.streams.video[0]
         except IndexError:
-            # Reset logging level
-            av.logging.restore_default_callback()
             return {}
 
         video_info["video.height"] = video_stream.height
@@ -1293,14 +1380,12 @@ def get_video_info(
         video_info["video.fps"] = int(video_stream.base_rate)
         video_info["video.channels"] = get_pix_fmt_channels(video_stream.pix_fmt)
 
-    # Reset logging level
-    av.logging.restore_default_callback()
-
     # Adding audio stream information
     video_info.update(**get_audio_info(video_path))
 
     # Add additional encoder configuration if provided
     if video_encoder is not None:
+        video_info["video.encoder"] = video_encoder.vcodec
         for field_name, field_value in asdict(video_encoder).items():
             # vcodec is already populated from the video stream
             if field_name == "vcodec":

@@ -23,7 +23,6 @@ import draccus
 import numpy as np
 import pyarrow.parquet as pq
 
-from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.sensor_stream import SensorStreamRecorder
 from lerobot.datasets.sensor_transaction import SensorTransaction, _episode_rows
@@ -281,7 +280,8 @@ def main(argv=None) -> int:
             encoder_threads=2,
             encoder_queue_maxsize=30,
             video_backend="pyav",
-            rgb_encoder=RGBEncoderConfig(vcodec="h264", preset="veryfast", crf=23, g=2),
+            rgb_encoder=recording.video_encoder(),
+            strict_video_integrity=True,
         )
         _atomic_json(report_path, report)
         dataset.prepare_episode_recording()
@@ -355,7 +355,8 @@ def main(argv=None) -> int:
             deadline += 1 / recording.fps
             now = time.perf_counter()
             if now >= deadline:
-                raise RuntimeError("Readonly capture exceeded its configured frame slot")
+                report["missed_slots"] = report.get("missed_slots", 0) + 1
+                deadline += (math.floor((now - deadline) * recording.fps) + 1) / recording.fps
             time.sleep(deadline - now)
         recorder.save_episode(dataset, task_info=[recording.task])
         report["capture_duration_s"] = time.perf_counter() - started

@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import Counter, deque
 from dataclasses import asdict, dataclass, field, is_dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,7 +48,7 @@ JOINT_NAMES = (
     "wrist_roll",
     "gripper",
 )
-EPISODE_SCHEMA = "teacher_demo_episode_v1"
+EPISODE_SCHEMA = "teacher_capture_episode_v1"
 RESULTS = ("unknown", "success", "failure")
 
 
@@ -91,12 +92,19 @@ class TeacherRecordConfig:
     repo_id: str = "local/force_teacher_demo"
     object_id: str = "unspecified"
     contact_condition_id: str = "unspecified"
-    fps: int = 30
+    fps: int = 50
     camera_configs: dict[str, dict] = field(default_factory=dict)
     camera_max_age_ms: float = 100.0
     queue_capacity: int = 128
     resume: bool = False
     target_episode_count: int = 10
+    h264_encoder: str = "nvenc"
+
+    def video_encoder(self) -> RGBEncoderConfig:
+        """Select one explicit encoder; unavailable NVENC never silently falls back."""
+        if self.h264_encoder == "nvenc":
+            return RGBEncoderConfig(vcodec="h264_nvenc", preset="p4", crf=23, g=2, extra_options={"bf": 0})
+        return RGBEncoderConfig(vcodec="h264", preset="veryfast", crf=23, g=2)
 
     def validate(self) -> None:
         """Check recording schema, limits and camera intent without hardware I/O."""
@@ -106,8 +114,10 @@ class TeacherRecordConfig:
         for name in ("fps", "queue_capacity", "target_episode_count"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"recording.{name} must be a positive integer")
-        if self.fps > 100:
-            raise ValueError("Recording fps cannot exceed the 100 Hz default owner rate")
+        if self.fps != 50:
+            raise ValueError("Teacher capture requires 50 Hz control and main data")
+        if self.h264_encoder not in ("nvenc", "software"):
+            raise ValueError("h264_encoder must be nvenc or software")
         if (
             isinstance(self.camera_max_age_ms, bool)
             or not isinstance(self.camera_max_age_ms, (int, float))
@@ -124,6 +134,7 @@ class TeacherRecordConfig:
         if not isinstance(self.camera_configs, dict) or not 1 <= len(self.camera_configs) <= 4:
             raise ValueError("Configure one to four named RGB OpenCV cameras")
         configs = {}
+        identities = set()
         for name, raw in self.camera_configs.items():
             if not isinstance(name, str) or not name.isidentifier() or not isinstance(raw, dict):
                 raise ValueError("Camera entries require bare names and configuration objects")
@@ -131,6 +142,10 @@ class TeacherRecordConfig:
             if values.pop("type", "opencv") != "opencv":
                 raise ValueError("Teacher recording currently supports timestamped OpenCV RGB cameras")
             config = OpenCVCameraConfig(**values)
+            if config.device_path is not None:
+                if config.device_path in identities:
+                    raise ValueError("Camera roles must not select the same device path")
+                identities.add(config.device_path)
             if str(config.color_mode.value) != "rgb":
                 raise ValueError("Teacher recording cameras must use RGB color_mode")
             for dimension in (config.width, config.height):
@@ -208,12 +223,26 @@ class CameraCapture:
         self.stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.error: BaseException | None = None
+        self.bindings: dict[str, dict] = {}
+        self._sequences: dict[str, int] = {}
 
     def start(self) -> None:
         """Connect cameras outside the owner and await the first captures."""
         try:
-            for camera in self.cameras.values():
+            for name, camera in self.cameras.items():
+                if camera.config.device_path is None:
+                    raise ValueError(
+                        "Teacher hardware cameras require a stable device_path, not a saved index"
+                    )
                 camera.connect()
+                self.bindings[name] = {
+                    "device_path": camera.config.device_path,
+                    "resolved_index": camera.index_or_path,
+                    "backend": int(camera.backend),
+                    "width": camera.width,
+                    "height": camera.height,
+                    "fps": camera.fps,
+                }
             self._thread = threading.Thread(target=self._run, name="teacher-camera-cache", daemon=False)
             self._thread.start()
             deadline = time.monotonic() + 5
@@ -231,12 +260,12 @@ class CameraCapture:
         try:
             while not self.stop.is_set():
                 for name, camera in self.cameras.items():
-                    # Atomic OpenCV capture snapshot: read_latest() returns pixels only.
-                    with camera.frame_lock:
-                        image = camera.latest_frame
-                        capture_time = camera.latest_timestamp
-                    if image is not None and capture_time is not None:
-                        self.buffers[name].publish(image, round(capture_time * 1e9), time.perf_counter_ns())
+                    captured = camera.read_latest_snapshot(self._sequences.get(name))
+                    if captured is not None:
+                        self._sequences[name] = captured.sequence
+                        self.buffers[name].publish(
+                            captured.image, captured.timestamp_ns, captured.arrival_timestamp_ns
+                        )
                 self.stop.wait(0.002)
         except BaseException as exc:
             self.error = exc
@@ -255,7 +284,7 @@ class CameraCapture:
                 raise TimeoutError("Camera cache shutdown unconfirmed; resources retained")
         failures = []
         for camera in self.cameras.values():
-            if camera.is_connected:
+            if camera.has_resources:
                 try:
                     camera.disconnect()
                 except Exception as exc:
@@ -316,10 +345,14 @@ def completed_tick_frame(
     ):
         raise ValueError("Nonfinite observation or submitted action")
     tactile = [row["force_left_N"], row["force_right_N"]]
+    target = row.get("force_target_effective_N")
+    if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target):
+        raise ValueError("A main frame requires the effective force target in N")
     frame = {
         "observation.state": np.asarray(state, dtype=np.float32),
         "observation.tactile": np.asarray(tactile, dtype=np.float32),
         "action": np.asarray(action, dtype=np.float32),
+        "observation.force_target": np.asarray([target], dtype=np.float32),
         "task": config.task,
     }
     camera_metadata = {}
@@ -353,6 +386,9 @@ def completed_tick_frame(
         "state_deg": state,
         "action_deg": action,
         "tactile_N": tactile,
+        "force_target_N": target,
+        "teacher_phase": row["phase"],
+        "action_valid": row.get("action_label_valid") is True,
         "force_sequence": row["force_sequence"],
         "force_timestamp_ns": force_timestamp,
         "force_arrival_timestamp_ns": arrival,
@@ -380,6 +416,9 @@ class DemonstrationController:
         """Start an idle worker without touching robot, Sensor or camera transports."""
         self.owner, self.sensor, self.force_instance = owner, sensor, force_instance
         self.provenance = copy.deepcopy(provenance or {})
+        from .capture_contract import capture_source
+
+        self.provenance["source"] = capture_source()
         self._camera_factory = camera_factory
         self._dataset_factory = dataset_factory
         self._recorder_factory = recorder_factory
@@ -406,7 +445,6 @@ class DemonstrationController:
         self._stages: Counter = Counter()
         self._force_labels = self._action_labels = 0
         self._normal_release = False
-        self._next_frame_ns: int | None = None
         self._first_anchor: int | None = None
         self._last_anchor: int | None = None
         self._first_control: int | None = None
@@ -416,6 +454,10 @@ class DemonstrationController:
         self._task_result = "unknown"
         self._start_sequence = 0
         self._cleanup_pending = False
+        self._timing_misses = 0
+        self._maximum_interval_ns = 0
+        self._started_utc: str | None = None
+        self._save_evidence: dict = {}
         self._thread = threading.Thread(target=self._run, name="teacher-demonstrations", daemon=False)
         self._thread.start()
 
@@ -583,6 +625,7 @@ class DemonstrationController:
                 "names": [f"{n}.pos" for n in JOINT_NAMES],
             },
             "action": {"dtype": "float32", "shape": (7,), "names": [f"{n}.pos" for n in JOINT_NAMES]},
+            "observation.force_target": {"dtype": "float32", "shape": (1,), "names": ["mean_normal_force"]},
             "observation.tactile": {
                 "dtype": "float32",
                 "shape": (2,),
@@ -611,7 +654,14 @@ class DemonstrationController:
                 config.fps,
                 config.camera_configs,
                 config.camera_max_age_ms,
-            ) != (previous.repo_id, previous.fps, previous.camera_configs, previous.camera_max_age_ms):
+                config.h264_encoder,
+            ) != (
+                previous.repo_id,
+                previous.fps,
+                previous.camera_configs,
+                previous.camera_max_age_ms,
+                previous.h264_encoder,
+            ):
                 raise ValueError("Dataset root, fps and camera schema are fixed for this session")
             return
         self._update(state="preparing", error=None)
@@ -633,7 +683,8 @@ class DemonstrationController:
                     streaming_encoding=True,
                     encoder_queue_maxsize=30,
                     video_backend="pyav",
-                    rgb_encoder=RGBEncoderConfig(vcodec="h264", preset="veryfast", crf=23, g=2),
+                    rgb_encoder=config.video_encoder(),
+                    strict_video_integrity=True,
                 )
                 if dataset.fps != config.fps or any(
                     any(
@@ -665,8 +716,12 @@ class DemonstrationController:
                     encoder_queue_maxsize=30,
                     encoder_threads=2,
                     video_backend="pyav",
-                    rgb_encoder=RGBEncoderConfig(vcodec="h264", preset="veryfast", crf=23, g=2),
+                    rgb_encoder=config.video_encoder(),
+                    strict_video_integrity=True,
                 )
+                from .capture_contract import capture_contract
+
+                _atomic_json(root / "meta/teacher_capture.json", capture_contract())
             recorder_factory = self._recorder_factory or SensorStreamRecorder
             recorder = recorder_factory(root, {self.force_instance: self.sensor})
             self._dataset = dataset
@@ -717,6 +772,14 @@ class DemonstrationController:
     def _check_resume(self, root: Path) -> None:
         """Refuse incomplete Teacher roots instead of inventing or repairing evidence."""
         info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+        from .capture_contract import capture_contract
+
+        contract_path = root / "meta/teacher_capture.json"
+        if (
+            not contract_path.is_file()
+            or json.loads(contract_path.read_text(encoding="utf-8")) != capture_contract()
+        ):
+            raise ValueError("Resume requires this capture version; choose a new root for historical data")
         manifests = list((root / "meta/teacher_episodes").glob("*.json"))
         complete_indices = set()
         for path in manifests:
@@ -755,8 +818,8 @@ class DemonstrationController:
         config.validate()
         if tuple(self.owner.runtime.config.joint_names) != JOINT_NAMES:
             raise ValueError("Full demonstration recording requires the configured seven-joint owner")
-        if config.fps > self.owner.runtime.config.control_hz:
-            raise ValueError("Dataset fps cannot exceed configured owner control rate")
+        if self.owner.runtime.config.control_hz != config.fps:
+            raise ValueError("Teacher capture requires control_hz = Dataset fps = 50")
         if not self.owner.is_running:
             raise RuntimeError("Start the explicitly armed teleoperation session before recording")
         self._prepare(config)
@@ -767,17 +830,20 @@ class DemonstrationController:
         self._stages.clear()
         self._force_labels = self._action_labels = 0
         self._normal_release = False
-        self._next_frame_ns = self._first_anchor = self._last_anchor = None
+        self._first_anchor = self._last_anchor = None
         self._first_control = self._last_control = self._last_tick_id = self._epoch = None
         self._task_result = "unknown"
+        self._started_utc = datetime.now(UTC).isoformat()
+        self._timing_misses = self._maximum_interval_ns = 0
+        self._save_evidence = {}
         self._camera_start_counts = {name: buffer.count for name, buffer in self._cameras.buffers.items()}
         directory = Path(config.root).resolve() / "teacher" / self._uid
         directory.mkdir(parents=True, exist_ok=False)
         self._control_file = (directory / "control.jsonl").open("x", encoding="utf-8")
         self._frames_file = (directory / "frames.jsonl").open("x", encoding="utf-8")
         self._write_manifest(complete=False, status="preparing")
-        # Warm codec and GC before either Sensor or owner recording subscriptions.
-        self._dataset.prepare_episode_recording()
+        # Warm codecs before subscriptions without forcing GC while Owner runs.
+        self._dataset.prepare_episode_recording(collect_garbage=False)
         self._recorder.start_episode(self._episode_index, episode_uid=self._uid, dataset=self._dataset)
         self._recorder.wait_until_ready()
         self._start_sequence = self._recorder._subscriptions[self.force_instance].start_sequence
@@ -812,6 +878,10 @@ class DemonstrationController:
         anchor = row.get("decision_anchor_ns")
         if isinstance(anchor, int):
             self._first_control = anchor if self._first_control is None else self._first_control
+            if self._last_control is not None:
+                interval = anchor - self._last_control
+                self._maximum_interval_ns = max(self._maximum_interval_ns, interval)
+                self._timing_misses += interval > 1.5e9 / self._config.fps
             self._last_control = anchor
         if row.get("phase") == "FAULT" or row.get("failure_reason"):
             raise RuntimeError(f"Owner fault during demonstration: {row.get('failure_reason')}")
@@ -819,8 +889,6 @@ class DemonstrationController:
             # Keep masked/disabled rows in full-rate evidence; they are not fabricated actions.
             return
         if row.get("force_sequence") is None or row["force_sequence"] < self._start_sequence:
-            return
-        if self._next_frame_ns is not None and anchor < self._next_frame_ns:
             return
         frame, capture, evidence = completed_tick_frame(
             snapshot,
@@ -835,10 +903,8 @@ class DemonstrationController:
         self._frame_count += 1
         self._first_anchor = anchor if self._first_anchor is None else self._first_anchor
         self._last_anchor = anchor
-        # Absolute target slots, never replay late frames to catch up.
-        self._next_frame_ns = self._first_anchor + round(self._frame_count * 1e9 / self._config.fps)
-        if anchor > self._next_frame_ns + 1e9 / self._config.fps:
-            raise RuntimeError("Main recording missed an entire frame slot")
+        # Owner owns the absolute 50 Hz schedule. Record each submitted tick once;
+        # real intervals remain evidence, without a second clock that drops early ticks.
         self._update(frame_count=self._frame_count, stage_counts=dict(self._stages))
 
     def _freeze_and_drain(self) -> None:
@@ -872,6 +938,7 @@ class DemonstrationController:
         if self._uid is None:
             raise RuntimeError("No demonstration is recording")
         self._update(state="saving")
+        self._save_evidence = {"started_ns": time.perf_counter_ns(), "start_owner": self._owner_save_state()}
         self._freeze_and_drain()
         if self._frame_count == 0:
             raise RuntimeError("Cannot save an empty demonstration")
@@ -898,6 +965,7 @@ class DemonstrationController:
             raise RuntimeError("Saved demonstration verification failed: " + "; ".join(report["errors"]))
         if self._stop.is_set():
             raise RuntimeError("Session stopped during verification; Teacher completion withheld")
+        self._save_evidence.update(completed_ns=time.perf_counter_ns(), end_owner=self._owner_save_state())
         self._write_manifest(complete=True, status="complete")
         self._recorder = (self._recorder_factory or SensorStreamRecorder)(
             self._dataset.root, {self.force_instance: self.sensor}
@@ -915,6 +983,20 @@ class DemonstrationController:
             error=None,
         )
         self._uid = None
+
+    def _owner_save_state(self) -> dict | None:
+        """Retain control progress around asynchronous save without posting commands."""
+        try:
+            snapshot = getattr(self.owner, "snapshot", lambda: None)()
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        if snapshot is None:
+            return None
+        return {
+            "tick_id": snapshot.tick_id,
+            "phase": snapshot.row.get("phase"),
+            "failure_reason": snapshot.row.get("failure_reason"),
+        }
 
     def _close_files(self) -> None:
         errors = []
@@ -977,6 +1059,14 @@ class DemonstrationController:
             "provenance": self.provenance,
             "error": error,
             "hardware_ack": "unknown",
+            "started_utc": self._started_utc,
+            "save": self._save_evidence,
+            "camera_bindings": getattr(self._cameras, "bindings", {}),
+            "timing": {
+                "intervals_over_30ms": self._timing_misses,
+                "maximum_control_interval_ns": self._maximum_interval_ns,
+                "file_completeness_independent_of_rate": True,
+            },
             "durability": "process-crash incomplete marker; no power-loss guarantee",
         }
         sensor_metadata_path = root / "meta/sensor_episodes" / f"{self._uid}.json"

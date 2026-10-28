@@ -109,8 +109,9 @@ def _verify_episode(
     parsed = uuid.UUID(uid)
     if parsed.version != 4 or str(parsed) != uid or manifest_path.stem != uid:
         raise ValueError("Teacher episode UID is not a matching canonical UUID4")
-    if manifest.get("schema") != "teacher_demo_episode_v1":
+    if manifest.get("schema") not in ("teacher_demo_episode_v1", "teacher_capture_episode_v1"):
         raise ValueError("Unsupported Teacher demonstration schema")
+    capture_version = manifest["schema"] == "teacher_capture_episode_v1"
     index, frame_count = manifest["episode_index"], manifest["frame_count"]
     if type(index) is not int or index < 0 or type(frame_count) is not int or frame_count <= 0:
         raise ValueError("Teacher episode index/frame count is invalid")
@@ -220,6 +221,12 @@ def _verify_episode(
             raise ValueError("Teacher frame send timestamps are not ordered")
         if not _vector(frame["tactile_N"], [row.get("force_left_N"), row.get("force_right_N")], 2):
             raise ValueError("Teacher tactile differs from selected control force")
+        if capture_version and (
+            frame.get("teacher_phase") != row.get("phase")
+            or frame.get("action_valid") != (row.get("action_label_valid") is True)
+            or not _vector([frame.get("force_target_N")], [row.get("force_target_effective_N")], 1)
+        ):
+            raise ValueError("Teacher target/phase/action validity differs from completed control tick")
         if any(
             not _causal(item.get("timestamp_ns"), item.get("arrival_timestamp_ns"), anchor)
             for item in frame.get("cameras", {}).values()
@@ -267,6 +274,13 @@ def _verify_episode(
                 if row["sequence"] in required:
                     raw_samples[row["sequence"]] = row
     info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+    if capture_version:
+        from .capture_contract import capture_contract
+
+        if json.loads((root / "meta/teacher_capture.json").read_text(encoding="utf-8")) != capture_contract():
+            raise ValueError("Capture field contract is missing or incompatible")
+        if info["fps"] != 50 or manifest["config"]["fps"] != 50:
+            raise ValueError("Capture main data must declare 50 Hz")
     for key, vector in (("observation.state", joint_names), ("action", joint_names)):
         spec = info["features"][key]
         if spec.get("names") != [f"{name}.pos" for name in vector] or tuple(spec["shape"]) != (7,):
@@ -291,6 +305,10 @@ def _verify_episode(
             main = next(main_rows, None)
             if main is None or main.get("frame_index") != frame["frame_index"]:
                 raise ValueError("Main frame indices differ from Teacher metadata")
+            if capture_version and not _vector(
+                [main.get("observation.force_target")], [frame["force_target_N"]], 1
+            ):
+                raise ValueError("Main effective force target differs from Teacher frame")
             for key, expected_vector, width in (
                 ("observation.state", frame["state_deg"], 7),
                 ("action", frame["action_deg"], 7),
@@ -394,7 +412,7 @@ def validate_demonstration(
                     metadata = json.loads(path.read_text(encoding="utf-8"))
                     uid = metadata.get("episode_uid")
                     if (
-                        metadata.get("schema") == "teacher_demo_episode_v1"
+                        metadata.get("schema") in ("teacher_demo_episode_v1", "teacher_capture_episode_v1")
                         and metadata.get("complete") is False
                         and metadata.get("status") in {"discarded", "interrupted", "error"}
                         and uid == path.stem

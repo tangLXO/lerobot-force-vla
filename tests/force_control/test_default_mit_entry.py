@@ -90,7 +90,7 @@ def test_main_uses_saved_settings_and_default_mit_without_connecting(panel, monk
     assert calls[0][0] is window
     assert calls[0][1]["default_full_arm_mit"] is True
     assert Path(calls[0][1]["settings_path"]) == (
-        Path(__file__).resolve().parents[2] / "b601_ip_parameters.json"
+        Path(__file__).resolve().parents[2] / "b601_capture_parameters.json"
     )
 
 
@@ -207,7 +207,7 @@ def test_all_arm_limits_save_reload_and_build_the_same_session(default_tuner, pa
     saved = tmp_path / "all-control-settings.json"
     app.save_parameters_file(saved)
     document = json.loads(saved.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 8 and document["arm_settings"] == expected_arm
+    assert document["schema_version"] == 9 and document["arm_settings"] == expected_arm
     assert not {"supported_arm", "reference_deg", "confirmed", "enabled"} & expected_arm.keys()
     app.arm_page.operator_values["reference_envelope_deg"].set("10")
     app.load_parameters_file(saved)

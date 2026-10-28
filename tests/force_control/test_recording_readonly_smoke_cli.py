@@ -417,6 +417,7 @@ def test_full_readonly_cli_roundtrip_uses_only_query_transport_with_real_artifac
             {
                 "task": "Readonly synthetic integration",
                 "repo_id": "test/readonly-cli",
+                "h264_encoder": "software",
                 "camera_configs": {
                     "front": {"type": "opencv", "index_or_path": 0, "fps": 60, "width": 64, "height": 48}
                 },

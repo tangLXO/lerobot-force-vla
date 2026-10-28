@@ -79,12 +79,13 @@ class SyntheticOwner:
 
     def __init__(self, sensor):
         self.sensor = sensor
-        self.runtime = SimpleNamespace(config=SimpleNamespace(joint_names=JOINT_NAMES, control_hz=100))
+        self.runtime = SimpleNamespace(config=SimpleNamespace(joint_names=JOINT_NAMES, control_hz=50))
         self._subscriptions = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
         self.error = None
+        self.tick_count = 0
 
     @property
     def is_running(self):
@@ -165,7 +166,7 @@ class SyntheticOwner:
             "q_after_safety_deg": 1.2,
             "u_label_deg_s": 0.0,
             "prev_successful_tick_id": tick - 1 if tick else None,
-            "dt_control_s": 0.01,
+            "dt_control_s": 0.02,
             "close_sign": 1,
             "safety_override": False,
             "deadline_miss": False,
@@ -190,10 +191,11 @@ class SyntheticOwner:
                         except queue.Full:
                             subscription.error = "Synthetic owner capture queue overflow"
                 tick += 1
-                deadline += 0.01
+                self.tick_count = tick
+                deadline += 0.02
                 now = time.perf_counter()
                 if now > deadline:
-                    deadline += (math.floor((now - deadline) / 0.01) + 1) * 0.01
+                    deadline += (math.floor((now - deadline) / 0.02) + 1) * 0.02
                 self._stop.wait(max(0, deadline - time.perf_counter()))
         except BaseException as exc:
             self.error = exc
@@ -228,6 +230,7 @@ def main() -> int:
     parser.add_argument("--episodes", type=int, default=10)
     parser.add_argument("--duration-s", type=float, default=0.5)
     parser.add_argument("--resume", action="store_true", help="Append to an existing synthetic smoke Dataset")
+    parser.add_argument("--encoder", choices=("software", "nvenc"), default="software")
     args = parser.parse_args()
     if args.root.exists() and not args.resume:
         parser.error("--root must be a new directory")
@@ -237,6 +240,7 @@ def main() -> int:
         parser.error("--episodes must be positive and --duration-s must be at least 0.2")
     sensor = FakeForceSensor(FakePlant(position_deg=1.2, contact_position_deg=1.0), sample_rate_hz=400)
     owner, controller = SyntheticOwner(sensor), None
+    saves = []
     try:
         sensor.connect()
         # Establish the initial synthetic sample before the owner can select it.
@@ -254,8 +258,10 @@ def main() -> int:
             "object_id": "synthetic_object",
             "contact_condition_id": "synthetic_contact",
             "camera_configs": {
-                "front": {"type": "opencv", "index_or_path": 0, "fps": 60, "width": 64, "height": 48}
+                name: {"type": "opencv", "index_or_path": index, "fps": 50, "width": 640, "height": 480}
+                for index, name in enumerate(("front", "wrist"))
             },
+            "h264_encoder": args.encoder,
             "target_episode_count": args.episodes,
             "resume": args.resume,
         }
@@ -267,8 +273,15 @@ def main() -> int:
                 if owner.error is not None or controller.status()["state"] == "error":
                     raise RuntimeError(controller.status().get("error") or str(owner.error))
                 time.sleep(0.01)
+            before_save = owner.tick_count
             controller.submit("record_finish", {"task_result": "unknown"})
             saved = _wait_state(controller, owner, {"saved"})
+            saves.append(
+                {
+                    "episode_uid": saved["episode_uid"],
+                    "owner_ticks_during_save": owner.tick_count - before_save,
+                }
+            )
             print(
                 json.dumps(
                     {
@@ -294,6 +307,7 @@ def main() -> int:
         physical_demonstrations=0,
         synthetic_episodes=len(report["episodes"]),
         added_episodes=args.episodes,
+        saves=saves,
     )
     report_path = args.root / "software_smoke_report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

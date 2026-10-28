@@ -21,7 +21,7 @@ def recording_values(tmp_path):
         "task": "pick and place",
         "object_id": "block",
         "contact_condition_id": "rubber",
-        "fps": "30",
+        "fps": "50",
         "camera_max_age_ms": "100",
         "queue_capacity": "128",
         "target_episode_count": "10",
@@ -32,10 +32,10 @@ def recording_values(tmp_path):
 def test_recording_form_builds_explicit_json_config_without_creating_directory(recording, recording_values):
     from lerobot.force_control.demonstration import TeacherRecordConfig
 
-    cameras = {"front": {"type": "opencv", "index_or_path": 0, "fps": 30, "width": 640, "height": 480}}
+    cameras = {"front": {"type": "opencv", "index_or_path": 0, "fps": 50, "width": 640, "height": 480}}
     result = recording.recording_config(recording_values, json.dumps(cameras))
     assert result["camera_configs"] == cameras
-    assert result["fps"] == 30 and result["target_episode_count"] == 10
+    assert result["fps"] == 50 and result["target_episode_count"] == 10
     assert result["resume"] is False and result["object_id"] == "block"
     TeacherRecordConfig(**result).validate()
     from pathlib import Path

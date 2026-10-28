@@ -417,6 +417,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         depth_encoder: DepthEncoderConfig | None,
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
+        strict_video_integrity: bool = False,
     ) -> StreamingVideoEncoder:
         return StreamingVideoEncoder(
             fps=fps,
@@ -424,6 +425,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             depth_encoder=depth_encoder,
             queue_maxsize=encoder_queue_maxsize,
             encoder_threads=encoder_threads,
+            strict_integrity=strict_video_integrity,
         )
 
     # ── Metadata properties ───────────────────────────────────────────
@@ -485,7 +487,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     # ── Writer-delegated methods ──────────────────────────────────────
 
-    def prepare_episode_recording(self, timeout_s: float = 30) -> None:
+    def prepare_episode_recording(self, timeout_s: float = 30, *, collect_garbage: bool = True) -> None:
         """Prepare streaming video codecs before starting Sensor or frame capture.
 
         No frames are added. Repeated calls on an empty episode are safe; an episode
@@ -493,13 +495,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         Args:
             timeout_s: Shared deadline in seconds for all camera codecs to become ready.
+            collect_garbage: Run explicit startup GC; defaults to the existing behavior.
 
         Raises:
             RuntimeError: If read-only, already recording, or codec initialization fails.
             TimeoutError: If codec initialization or worker cleanup times out.
         """
         self._require_writer("prepare_episode_recording")
-        self.writer.prepare_episode_recording(timeout_s=timeout_s)
+        self.writer.prepare_episode_recording(timeout_s=timeout_s, collect_garbage=collect_garbage)
 
     def add_frame(self, frame: dict) -> None:
         """Add a single frame to the current episode buffer.
@@ -827,6 +830,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         video_files_size_in_mb: int | None = None,
         data_files_size_in_mb: int | None = None,
+        strict_video_integrity: bool = False,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -863,10 +867,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 during capture instead of writing images first.
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
+            strict_video_integrity: Require complete streaming video before main writes.
+                Defaults to False; enabled by Teacher recording only.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
         """
+        if strict_video_integrity and not streaming_encoding:
+            raise ValueError("Strict video integrity requires streaming_encoding=True")
         obj = cls.__new__(cls)
         obj.meta = LeRobotDatasetMetadata.create(
             repo_id=repo_id,
@@ -900,7 +908,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+                fps,
+                rgb_encoder,
+                depth_encoder,
+                encoder_queue_maxsize,
+                encoder_threads,
+                strict_video_integrity,
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,
@@ -938,6 +951,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         *,
         token: str | bool | None = None,
+        strict_video_integrity: bool = False,
     ) -> "LeRobotDataset":
         """Resume recording on an existing dataset.
 
@@ -973,10 +987,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
             token: Authentication token used if metadata must be downloaded
                 from the Hub. The token is not retained on the dataset instance.
+            strict_video_integrity: Require complete streaming video before main writes.
+                Defaults to False; enabled by Teacher recording only.
 
         Returns:
             A :class:`LeRobotDataset` in write mode, ready to append episodes.
         """
+        if strict_video_integrity and not streaming_encoding:
+            raise ValueError("Strict video integrity requires streaming_encoding=True")
         if not root:
             raise ValueError(
                 "resume() requires an explicit 'root' directory because it creates a DatasetWriter. "
@@ -1018,7 +1036,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_enc = None
         if streaming_encoding and len(obj.meta.video_keys) > 0:
             streaming_enc = cls._build_streaming_encoder(
-                obj.meta.fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+                obj.meta.fps,
+                rgb_encoder,
+                depth_encoder,
+                encoder_queue_maxsize,
+                encoder_threads,
+                strict_video_integrity,
             )
         obj.writer = DatasetWriter(
             meta=obj.meta,

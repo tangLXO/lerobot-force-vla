@@ -53,7 +53,7 @@ VIDEO_ENCODER_INFO_FIELD_NAMES: frozenset[str] = frozenset(
 )
 VIDEO_ENCODER_INFO_KEYS: frozenset[str] = frozenset(
     f"video.{name}" for name in VIDEO_ENCODER_INFO_FIELD_NAMES
-)
+) | {"video.encoder"}
 
 # Default depth quantization and encoding parameters.
 DEPTH_QUANT_BITS: int = 12
@@ -122,6 +122,11 @@ class VideoEncoderConfig:
             value = video_info.get(src_key)
             if value is not None:
                 kwargs[dst_field] = value
+        # H.264 is the bitstream codec for both libx264 and NVENC. Preserve the
+        # actual encoder so hardware-specific options survive resume/re-encode.
+        actual_encoder = video_info.get("video.encoder")
+        if isinstance(actual_encoder, str) and actual_encoder:
+            kwargs["vcodec"] = actual_encoder
 
         for field_name in VIDEO_ENCODER_INFO_FIELD_NAMES:
             value = video_info.get(f"video.{field_name}")

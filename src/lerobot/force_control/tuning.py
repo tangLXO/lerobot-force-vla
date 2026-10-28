@@ -100,7 +100,7 @@ FIELDS = (
     ("device", "drive_percent", "FORCE_POS 电流 / 力矩比例 (%)", "2", float, False, None),
     ("device", "watchdog_ticks", "看门狗 TIMEOUT ticks (50 μs/tick)", "2000", int, False, None),
     ("device", "parameter_write_settle_s", "参数写入后等待读回 (s)", "0.01", float, False, None),
-    ("device", "control_hz", "控制目标频率 (Hz)", "100", float, False, None),
+    ("device", "control_hz", "控制目标频率 (Hz)", "50", float, False, None),
     ("device", "scheduler_sleep_slice_ms", "调度最长分段休眠 (ms)", "5", float, False, None),
     (
         "device",
@@ -181,7 +181,7 @@ FIELD_PAGES = {
     for section, key, *_ in FIELDS
 }
 SETTINGS_FORMAT = "b601_ip_tuner_settings"
-SETTINGS_SCHEMA_VERSION = 8
+SETTINGS_SCHEMA_VERSION = 9
 LEADER_FIELDS = frozenset(key for _, key, *_ in FIELDS if key.startswith("leader_"))
 MOTION_FIELDS = {
     "gripper_follow_speed_deg_s",
@@ -253,7 +253,7 @@ def read_settings(path, *, on_unit_conversion=None, on_arm_settings=None):
         or set(document) not in (keys, keys | {"arm_settings"})
         or document["format"] != SETTINGS_FORMAT
         or type(document["schema_version"]) is not int
-        or document["schema_version"] not in (1, 2, 3, 4, 5, 6, 7, SETTINGS_SCHEMA_VERSION)
+        or document["schema_version"] not in (1, 2, 3, 4, 5, 6, 7, 8, SETTINGS_SCHEMA_VERSION)
         or document["controller_type"] != "ip"
         or not isinstance(document["calibration_file"], str)
         or not document["calibration_file"].strip()
@@ -356,7 +356,8 @@ def sensor_config(v):
         acquisition_queue_capacity=v["acquisition_queue_capacity"],
         recorder_queue_capacity=v["raw_queue_capacity"],
         acquisition_mode="process",
-        sample_rate_hz=None,
+        sample_rate_hz=400,
+        expected_sample_rate_hz=400,
         expected_unit="kg",
         max_age_ms=v["force_max_age_ms"],
         required=True,
