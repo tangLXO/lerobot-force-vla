@@ -52,6 +52,34 @@ class LargePreviewCameras(SyntheticCameras):
             self.buffers[name].publish(image, time.perf_counter_ns(), time.perf_counter_ns())
 
 
+class DelayedPreparationCameras(SyntheticCameras):
+    def start(self):
+        time.sleep(0.3)
+        super().start()
+
+
+def test_preparation_does_not_fill_ipc_before_child_receives(tmp_path):
+    sensor = FakeForceSensor(FakePlant())
+    owner = OwnerService(
+        SimpleNamespace(
+            config=SimpleNamespace(joint_names=JOINT_NAMES, control_hz=50),
+            device=SimpleNamespace(has_resources=False),
+        )
+    )
+    capture = ProcessDemonstrationController(owner, sensor, camera_factory=DelayedPreparationCameras)
+    # Two telemetry messages would fill this queue in 100 ms, well before the
+    # child can finish the deliberately delayed preparation (or Windows spawn).
+    capture._incoming.close()
+    capture._incoming = capture._context.Queue(maxsize=2)
+    try:
+        capture.prepare_before_control(config(tmp_path / "dataset"))
+        assert capture.status()["state"] == "ready"
+        assert not owner.is_running and not sensor.has_resources
+    finally:
+        capture.close(timeout_s=5)
+    assert not capture.has_resources
+
+
 def test_large_preview_pipe_cannot_hold_child_open(tmp_path):
     sensor = FakeForceSensor(FakePlant())
     owner = OwnerService(

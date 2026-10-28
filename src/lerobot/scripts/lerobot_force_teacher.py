@@ -99,7 +99,10 @@ def finalize_retained_benches() -> list[dict]:
                 "resources_retained": False,
                 "status": leader.latest().error,
             }
-        trace.metadata["shutdown_evidence"] = service.runtime.shutdown_evidence
+        # A pre-owner preparation failure has no runtime receipt. Preserve the
+        # explicit unopened/closed observation recorded by the startup caller.
+        shutdown = service.runtime.shutdown_evidence or trace.metadata.get("shutdown_evidence")
+        trace.metadata["shutdown_evidence"] = shutdown
         errors = []
         _close_trace_then_sensor(
             sensor,
@@ -115,7 +118,7 @@ def finalize_retained_benches() -> list[dict]:
         completed.append(
             {
                 "trace_root": str(trace.root.resolve()),
-                "shutdown_evidence": service.runtime.shutdown_evidence,
+                "shutdown_evidence": shutdown,
                 "cleanup_errors": list(trace.metadata.get("cleanup_errors", [])),
                 "valid": False,
             }
@@ -721,6 +724,15 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             if not any(exc is existing for existing in errors):
                 errors.append(exc)
             complete = False
+        shutdown = runtime.shutdown_evidence
+        if not owner_start_attempted and not service.has_resources:
+            shutdown = {
+                "transport_closed": True,
+                "owner_start_attempted": False,
+                "fault_disposition": None,
+                "completed_ns": time.perf_counter_ns(),
+            }
+        trace.metadata["shutdown_evidence"] = shutdown
         if capture is not None:
             try:
                 capture.close(timeout_s=config.shutdown_timeout_s)
@@ -761,7 +773,6 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             errors.append(RuntimeError("Owner or leader shutdown unconfirmed; dependent resources retained"))
             _remember_exit_errors(trace, errors)
         else:
-            trace.metadata["shutdown_evidence"] = runtime.shutdown_evidence
             _close_trace_then_sensor(
                 sensor,
                 trace,
@@ -775,14 +786,7 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
         if live is not None:
             # The supervisor must retain closure facts even if preparation failed
             # before trace.start() could create a manifest. This is no motor-off claim.
-            live.shutdown = runtime.shutdown_evidence
-            if not owner_start_attempted and not service.has_resources:
-                live.shutdown = {
-                    "transport_closed": True,
-                    "owner_start_attempted": False,
-                    "fault_disposition": None,
-                    "completed_ns": time.perf_counter_ns(),
-                }
+            live.shutdown = shutdown
     if errors:
         if len(errors) == 1:
             raise errors[0]

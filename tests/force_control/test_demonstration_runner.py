@@ -209,6 +209,43 @@ def test_full_arm_explicit_release_saves_capture_only_after_disabled(tmp_path, m
     assert capture.closed_after_owner
 
 
+def test_delayed_preowner_cleanup_preserves_unopened_transport_receipt(tmp_path, monkeypatch):
+    class RetainedPreparation(Capture):
+        instances = []
+        release_cleanup = False
+
+        def prepare_before_control(self, config):
+            super().prepare_before_control(config)
+            raise RuntimeError("injected resume preparation failure")
+
+        def close(self, timeout_s):
+            if not self.release_cleanup:
+                raise TimeoutError("injected delayed capture cleanup")
+            super().close(timeout_s)
+
+    monkeypatch.setattr(runner, "DemonstrationController", RetainedPreparation)
+    monkeypatch.setattr(runner, "_UNSTOPPED_BENCHES", [])
+    live = Requests([])
+    try:
+        with pytest.raises(BaseExceptionGroup):
+            runner.run(hybrid_config(tmp_path), live=live)
+        capture = RetainedPreparation.instances[0]
+        assert capture.owner._thread is None and not capture.sensor.has_resources
+        receipt = live.shutdown
+        assert receipt["owner_start_attempted"] is False and receipt["transport_closed"]
+        assert receipt["fault_disposition"] is None
+        assert runner.finalize_retained_benches() == []
+        capture.release_cleanup = True
+        recovered = runner.finalize_retained_benches()
+        assert len(recovered) == 1 and not recovered[0]["valid"]
+        assert recovered[0]["shutdown_evidence"] == receipt
+        assert not runner._UNSTOPPED_BENCHES
+    finally:
+        for capture in RetainedPreparation.instances:
+            capture.release_cleanup = True
+        runner.finalize_retained_benches()
+
+
 def test_unconfirmed_capture_shutdown_retains_sensor_until_retry(tmp_path, monkeypatch):
     class RetainedCapture(Capture):
         instances = []

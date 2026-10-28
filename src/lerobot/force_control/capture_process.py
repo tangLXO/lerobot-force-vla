@@ -412,7 +412,10 @@ class ProcessDemonstrationController:
                 elif kind == "record_outcome":
                     self._send("outcome", value)
                 self._drain()
-                if time.monotonic() >= next_owner:
+                # Resume verification may take longer than the entire queue's
+                # capacity. The unopened Owner has no evidence to forward until
+                # the writer finishes preparation and starts receiving messages.
+                if self._ready.is_set() and time.monotonic() >= next_owner:
                     self._send("owner", (self.owner.is_running, self.owner.snapshot(allow_empty=True)))
                     next_owner = time.monotonic() + 0.05
                 self._stop.wait(0.002)
