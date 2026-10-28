@@ -19,9 +19,13 @@ uv run --no-sync python examples/force_teacher/b601_tuner.py
 4. 点击“结束并保存”。后台完成视频、主表、Raw、Sync 与 Teacher 附件核验，期间 Teacher 继续运行。状态为 `saved` 且文件完整后，可以开始下一段。
 5. 连续完成三段后，停止控制并等候失能、串口关闭；退出界面。再次打开，选择相同目录和配置并勾选“续录”，追加下一段。续录检查已有全部完整证据及数据契约，不覆盖旧段。
 
-勾选准备录制后，启动会话先完成相机连接、Dataset/Sidecar 初始化、编码器及预览预热，再打开电机 Owner。准备失败或期间停止时不会使能；进入遥操后点击“开始录制”复用已准备资源。首次准备可能需要数秒，等待期间不要重复启动。
+勾选准备录制后，启动会话先完成相机连接、Dataset/Sidecar 初始化、编码器及预览预热，再启动主臂和力采样，最后打开电机 Owner。准备失败或期间停止时不会使能；进入遥操后点击“开始录制”复用已准备资源。首次准备可能需要数秒，等待期间不要重复启动。若准备已创建空 Dataset 后启动失败，重试同一目录也需勾选“续录”，接受已有内容核验。
+
+启动顺序对照官方 LeRobot [`d3793b7` 的录制入口](https://github.com/huggingface/lerobot/blob/d3793b7e36522321c1c455f0dc4826db3793dceb/src/lerobot/scripts/lerobot_record.py#L412)：先创建或续接 Dataset，再连接 teleoperator，最后连接 robot。Teacher 将双摄及编码预热也放在主臂采样前，避免首次初始化占用主臂读取期限。官方 [`B601.disconnect`](https://github.com/huggingface/lerobot/blob/d3793b7e36522321c1c455f0dc4826db3793dceb/src/lerobot/robots/rebot_b601_follower/rebot_b601_follower.py#L398) 的 disable、clear_error、close 可作为故障维护参考；本版仍保留原始故障证据及独立只读核验，不能将清错命令返回当成失能确认。
 
 目标力以当前参数和 Owner 生效回执为准；本机既有 2 N 参数无需为采集修改。安全保护、反馈新鲜度、Raw 超力及 Stop/Esc 保持原流程。普通节拍波动保存为统计，不单独否定文件保存；安全故障与数据丢失仍会中断采集。
+
+准备阶段失败也保存 Owner 是否尝试启动及串口关闭事实，不声称电机已失能。历史关闭回执缺失时，空闲面板仍可请求全臂只读复核：查询传输先取得现有跨进程独占锁，再打开串口；占用或锁不可访问即失败。只有同一端口、同一校准下新观察到七轴全部 DISABLED 且查询串口关闭，才解锁后续操作。原失败记录保留，机械确认仍由现场操作者完成。
 
 ## 相机与视频
 

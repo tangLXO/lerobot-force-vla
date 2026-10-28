@@ -5,6 +5,7 @@ import json
 import threading
 from dataclasses import asdict, replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import draccus
 import pytest
@@ -110,6 +111,16 @@ def test_recording_events_dispatch_to_capture_and_stop_preserves_final_status(tm
         ("record_outcome", {"task_result": "failure"}),
     ]
     config = hybrid_config(tmp_path)
+    leader = runner._leader_worker(config)
+    monkeypatch.setattr(runner, "_leader_worker", lambda config: leader)
+    original_start = leader.start
+
+    def start_after_capture():
+        assert Capture.instances[0].prepared
+        assert not Capture.instances[0].sensor.has_resources
+        original_start()
+
+    monkeypatch.setattr(leader, "start", start_after_capture)
     live = Requests(events)
     result = runner.run(config, live=live)
     capture = Capture.instances[0]
@@ -147,12 +158,20 @@ def test_capture_preparation_failure_or_stop_never_opens_motor_owner(tmp_path, m
             live.stop.set()
 
     monkeypatch.setattr(runner, "DemonstrationController", FailedPreparation)
+    config = hybrid_config(tmp_path)
+    leader = runner._leader_worker(config)
+    monkeypatch.setattr(leader, "start", Mock(wraps=leader.start))
+    monkeypatch.setattr(runner, "_leader_worker", lambda config: leader)
     motor_events = observe_commands(monkeypatch)
     with pytest.raises(RuntimeError, match="initialization failure|user_stop_before_owner_start"):
-        runner.run(hybrid_config(tmp_path), live=live)
+        runner.run(config, live=live)
     capture = FailedPreparation.instances[0]
     assert capture.owner._thread is None and motor_events == []
     assert capture.closed and not capture.sensor.has_resources
+    leader.start.assert_not_called()
+    assert live.shutdown["transport_closed"]
+    assert live.shutdown["owner_start_attempted"] is False
+    assert live.shutdown["fault_disposition"] is None
 
 
 def test_full_arm_explicit_release_saves_capture_only_after_disabled(tmp_path, monkeypatch):
@@ -270,8 +289,9 @@ def test_supervisor_rejects_recording_schema_before_runtime(supervised, calibrat
         supervised.load_reviewed(path)
 
 
+@pytest.mark.parametrize("preparation_failure", [False, True])
 def test_supervisor_saved_result_includes_final_recording_status(
-    supervised, panel, calibration, settings, tmp_path, monkeypatch
+    supervised, panel, calibration, settings, tmp_path, monkeypatch, preparation_failure
 ):
     config = panel.build_config(*settings, calibration, tmp_path / "trace")
     path = tmp_path / "reviewed.json"
@@ -288,7 +308,18 @@ def test_supervisor_saved_result_includes_final_recording_status(
     )
     live = Requests([])
     live.recording = {"state": "closed", "file_complete": False, "error": "interrupted"}
-    monkeypatch.setattr(supervised, "run_runtime", lambda *args, **kwargs: {"valid": False, "errors": []})
+
+    def execute(*args, **kwargs):
+        live.shutdown = {"transport_closed": True, "owner_start_attempted": False}
+        if preparation_failure:
+            raise RuntimeError("preparation failed before trace creation")
+        return {"valid": False, "errors": []}
+
+    monkeypatch.setattr(supervised, "run_runtime", execute)
     result = supervised.run(tmp_path / "run", execute=True, reviewed_config=path, live=live)
     saved = json.loads((tmp_path / "run/result.json").read_text(encoding="utf-8"))
     assert saved["recording"] == result["recording"] == live.recording
+    assert saved["shutdown_evidence"] == live.shutdown
+    if preparation_failure:
+        assert saved["errors"] == ["RuntimeError: preparation failed before trace creation"]
+        assert not (tmp_path / "run/stream").exists()

@@ -114,6 +114,17 @@ def test_seven_axis_recovery_uses_only_queries_and_closes_owner(readonly_scope, 
     assert_query_only(scope.serial)
 
 
+def test_recovery_cannot_query_while_another_owner_holds_the_bus(readonly_scope, recovery_module):
+    scope = readonly_scope
+    owner = scope.factory("FAKE_FOLLOWER", readonly.DEFAULT_B601_JOINTS, baudrate=921600)
+    owner.open()
+    receipt = inspect(scope, recovery_module)
+    assert not receipt["complete"] and not receipt["all_joints_disabled_observed"]
+    assert "already has an owner" in "; ".join(receipt["errors"])
+    assert scope.serial.writes == []
+    assert owner.has_resources  # Recovery cannot close or steal the other owner's port.
+
+
 @pytest.mark.parametrize("fault", ["enabled", "bounds", "missing", "stale", "calibration", "stop", "close"])
 def test_failed_seven_axis_observation_never_unlocks(readonly_scope, recovery_module, fault):
     scope = readonly_scope
@@ -416,8 +427,9 @@ def prepare_unknown_full_arm(app):
     app.unconfirmed_calibration = asdict(app.calibration)
 
 
+@pytest.mark.parametrize("previous_closed", [True, False])
 def test_explicit_full_arm_recovery_saves_new_receipt_then_unlocks(
-    default_tuner, readonly_scope, panel, monkeypatch, tmp_path
+    default_tuner, readonly_scope, panel, monkeypatch, tmp_path, previous_closed
 ):
     app, _, _, _ = default_tuner
     scope = readonly_scope
@@ -425,6 +437,7 @@ def test_explicit_full_arm_recovery_saves_new_receipt_then_unlocks(
     monkeypatch.setattr(app, "launch", tasks.append)
     monkeypatch.setattr(panel, "ReadonlyB601Transport", scope.factory)
     prepare_unknown_full_arm(app)
+    app.unconfirmed_transport_closed = previous_closed
     previous = tmp_path / "original-result.json"
     previous.write_text('{"motion_exit": "unknown"}', encoding="utf-8")
     original = previous.read_bytes(), previous.stat().st_mtime_ns
@@ -484,8 +497,8 @@ def test_unknown_full_arm_start_only_queues_readonly_recovery(default_tuner, mon
     assert app.connection_recovery is None
 
 
-@pytest.mark.parametrize("problem", ["worker", "transport", "port", "calibration", "retained"])
-def test_full_arm_recovery_cannot_open_before_owner_identity_and_closure_match(
+@pytest.mark.parametrize("problem", ["worker", "running", "port", "calibration", "retained"])
+def test_full_arm_recovery_cannot_open_before_idle_owner_and_identity_match(
     default_tuner, panel, monkeypatch, problem
 ):
     app, _, _, _ = default_tuner
@@ -493,8 +506,8 @@ def test_full_arm_recovery_cannot_open_before_owner_identity_and_closure_match(
     monkeypatch.setattr(app, "launch", lambda function: pytest.fail("unadmitted recovery opened an owner"))
     if problem == "worker":
         app.worker = SimpleNamespace(is_alive=lambda: True)
-    elif problem == "transport":
-        app.unconfirmed_transport_closed = False
+    elif problem == "running":
+        app.running = True
     elif problem == "port":
         app.unconfirmed_port = "ANOTHER_PORT"
     elif problem == "retained":
@@ -535,7 +548,7 @@ def test_explicit_full_arm_recovery_button_remains_visible_at_minimum_size(defau
         app.poll()
         root.update_idletasks()
         button = app.full_arm_recovery_button
-        assert "故障恢复" in root.title()
+        assert "50 Hz 采集版" in root.title()
         assert button.winfo_ismapped() and str(button.cget("state")) == "normal"
         for parent in (root, button.master):
             x = button.winfo_rootx() - parent.winfo_rootx()

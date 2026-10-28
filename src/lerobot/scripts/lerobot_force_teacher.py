@@ -497,9 +497,26 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                     raise
 
     errors, started, complete = [], False, False
+    owner_start_attempted = False
     try:
         if live is not None and live.stop.is_set():
             raise RuntimeError("user_stop_before_connect")
+        if config.recording is not None:
+            if live is not None:
+                live.recording = {"state": "preparing", "active": False, "file_complete": False}
+            capture = DemonstrationController(
+                service,
+                sensor,
+                force_instance=config.runtime.force_instance,
+                provenance={"run_config": asdict(config), "bench_trace_root": str(config.trace_root)},
+            )
+            # First camera/codec initialization can also starve the read-only
+            # leader's serial deadline. Prepare before either sampling worker.
+            capture.prepare_before_control(config.recording)
+            if live is not None:
+                live.recording = capture.status()
+        if live is not None and live.stop.is_set():
+            raise RuntimeError("user_stop_before_owner_start")
         if leader is not None:
             leader.start()
             deadline = time.monotonic() + config.startup_timeout_s
@@ -510,16 +527,6 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
                     raise TimeoutError(f"102 has no valid snapshot: {leader.latest().error}")
                 time.sleep(min(0.005, max(0, deadline - time.monotonic())))
         sensor.connect()
-        if config.recording is not None:
-            capture = DemonstrationController(
-                service,
-                sensor,
-                force_instance=config.runtime.force_instance,
-                provenance={"run_config": asdict(config), "bench_trace_root": str(config.trace_root)},
-            )
-            capture.prepare_before_control(config.recording)
-            if live is not None:
-                live.recording = capture.status()
         trace.start()
         started = True
         ready_by = time.monotonic() + config.startup_timeout_s
@@ -537,6 +544,7 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             if time.monotonic() >= ready_by:
                 raise TimeoutError("No fresh post-subscription force sample")
             time.sleep(min(1 / config.runtime.control_hz, max(0, ready_by - time.monotonic())))
+        owner_start_attempted = True
         service.start(timeout_s=config.startup_timeout_s)
         if config.explicit_arm:
             publish_leader()
@@ -763,6 +771,17 @@ def run(config: ForceTeacherRunConfig, *, live=None) -> dict:
             )
             if sensor.has_resources or trace.has_resources:
                 _UNSTOPPED_BENCHES.append(retained)
+        if live is not None:
+            # The supervisor must retain closure facts even if preparation failed
+            # before trace.start() could create a manifest. This is no motor-off claim.
+            live.shutdown = runtime.shutdown_evidence
+            if not owner_start_attempted and not service.has_resources:
+                live.shutdown = {
+                    "transport_closed": True,
+                    "owner_start_attempted": False,
+                    "fault_disposition": None,
+                    "completed_ns": time.perf_counter_ns(),
+                }
     if errors:
         if len(errors) == 1:
             raise errors[0]

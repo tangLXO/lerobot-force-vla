@@ -1031,7 +1031,7 @@ class Tuner:
             self.status.set(
                 "历史全臂退出未确认；点击连接将自动复核七关节，完成后继续只读监测。"
                 if self.unconfirmed_transport_closed
-                else "历史全臂退出未确认，原串口关闭证据不足；请先等待旧 owner 停止并退出。"
+                else "历史全臂退出未确认，原关闭回执缺失；可独占只读复核，串口仍被占用时拒绝查询。"
             )
         self.update_optional()
         self.poll()
@@ -1428,11 +1428,16 @@ class Tuner:
         )
 
     def full_arm_recovery_ready(self):
-        """Only a finished owner and recorded port closure permit another read-only owner."""
+        """An idle panel may request a query; the shared lease/serial open exclude other owners.
+
+        A preparation failure can precede all follower I/O and leave no closure
+        receipt. Missing historical evidence never authorizes motion: only a new
+        seven-axis DISABLED receipt can unlock the panel. Query-only transport
+        must acquire the existing process-shared lease before opening the port.
+        """
         return bool(
             not self.exit_confirmed
             and self.unconfirmed_full_arm
-            and getattr(self, "unconfirmed_transport_closed", False)
             and self.worker is None
             and not self.running
             and not self.monitoring
@@ -1485,7 +1490,7 @@ class Tuner:
     def recover_full_arm_readonly(self, *, continue_monitor=False):
         """Run one explicit seven-axis observation, never a disable or reconfiguration."""
         if not self.full_arm_recovery_ready():
-            self.status.set("全臂只读复核未开始：须先等待原 owner 退出并确认原串口已关闭。")
+            self.status.set("全臂只读复核未开始：须先等待当前 owner 和待清理资源退出。")
             return
         try:
             if self.calibration is None:

@@ -101,7 +101,7 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
         errors.extend(exception_messages(exc))
     manifest_path = output / "stream/manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
-    shutdown = manifest.get("metadata", {}).get("shutdown_evidence", {})
+    shutdown = manifest.get("metadata", {}).get("shutdown_evidence") or getattr(live, "shutdown", None) or {}
     errors = list(result.get("errors") or []) + errors
     result.update(
         errors=errors,
