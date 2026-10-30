@@ -23,6 +23,7 @@ from b601_supervised_bench import run
 from b601_tuner_process import ProcessLive, run_in_process
 from b601_tuner_recording import TASK_RESULTS, RecordingPage, load_full_arm_profile
 from build_operator_teleoperation_profile import build_operator_document
+from communication_options import communication_description, resolve_command_tx_gap
 
 from lerobot.force_control.config import (
     finite_number,
@@ -703,9 +704,11 @@ class Tuner:
         default_full_arm_mit=False,
         command_feedback_mode=None,
         command_tx_gap_us=120.0,
+        command_tx_gap_source="配置",
     ):
         self.command_feedback_mode = command_feedback_mode
         self.command_tx_gap_us = command_tx_gap_us
+        self.command_tx_gap_source = command_tx_gap_source
         self.default_full_arm_mit = default_full_arm_mit
         self.default_mit_profile_file = None
         self.root, self.worker = root, None
@@ -744,6 +747,12 @@ class Tuner:
         self.points, self.fixed_widgets, self.optional_widgets = deque(), [], []
         self.other_widgets = []
         self.fields, self.toggles = {}, {}
+        communication = communication_description(
+            command_feedback_mode,
+            command_tx_gap_us,
+            command_tx_gap_source,
+            gripper_only=not default_full_arm_mit,
+        )
         root.title(
             f"B601 · 50 Hz 采集版 · MIT 六臂 + FORCE_POS / I-P 夹爪 · {command_feedback_mode or '配置模式'}"
         )
@@ -759,6 +768,7 @@ class Tuner:
         ttk.Label(
             outer, text="Δθ = Ki · dt · (目标 − 原始平均力) − Kp · Δ原始平均力    |    只累计最终成功提交位置"
         ).pack(anchor="w", pady=(4, 10))
+        ttk.Label(outer, text=communication, wraplength=1050).pack(anchor="w", pady=(0, 6))
         bar = ttk.Frame(outer)
         bar.pack(fill="x")
         self.calibration_label = tk.StringVar(value="校准文件未加载")
@@ -1200,8 +1210,8 @@ class Tuner:
             title="保存 I-P 参数草稿",
             defaultextension=".json",
             filetypes=[("I-P 参数 JSON", "*.json")],
-            initialfile=self.settings_path.name if self.settings_path else "b601_ip_parameters.json",
-            initialdir=str(self.settings_path.parent if self.settings_path else Path.cwd()),
+            initialfile=DEFAULT_SETTINGS.name,
+            initialdir=str(DEFAULT_SETTINGS.parent),
         )
         if path:
             try:
@@ -2386,7 +2396,7 @@ class Tuner:
                     canvas.create_line(*segment, fill=color, width=1.5)
 
 
-def main(argv=None):
+def main(argv=None, *, resolved_tx_gap=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-test", action="store_true", help="Build and close the UI; no device I/O")
     parser.add_argument("--connect", action="store_true", help="Start query-only monitoring; never enable")
@@ -2399,15 +2409,23 @@ def main(argv=None):
     parser.add_argument(
         "--command-feedback-mode",
         choices=("sequential", "pipelined", "cached"),
-        help="Startup-only seven-axis communication mode; default remains sequential",
+        default="cached",
+        help="Startup-only seven-axis communication mode; daily capture defaults to cached",
     )
     parser.add_argument(
         "--command-tx-gap-us",
         type=float,
-        default=120.0,
-        help="Minimum pipelined write-start interval in microseconds",
+        default=None,
+        help="Minimum asynchronous write-start interval: CLI > MOTORBRIDGE_TX_GAP_US > 120 us",
     )
     args = parser.parse_args(argv)
+    try:
+        gap, gap_source = resolved_tx_gap or resolve_command_tx_gap(args.command_tx_gap_us)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(
+        communication_description(args.command_feedback_mode, gap, gap_source, gripper_only=args.gripper_only)
+    )
     window = tk.Tk()
     app = Tuner(
         window,
@@ -2415,7 +2433,8 @@ def main(argv=None):
         settings_path=args.settings_file,
         default_full_arm_mit=not args.gripper_only,
         command_feedback_mode=args.command_feedback_mode,
-        command_tx_gap_us=args.command_tx_gap_us,
+        command_tx_gap_us=gap,
+        command_tx_gap_source=gap_source,
     )
     if args.recording_config is not None:
         document = json.loads(args.recording_config.read_text(encoding="utf-8"))

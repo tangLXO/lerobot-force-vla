@@ -17,7 +17,8 @@ if errorlevel 1 (
 
 rem Load native six-joint MIT defaults and saved gripper settings into the panel.
 rem Device connection and motion require explicit UI actions.
-uv run --no-sync python "%~dp0examples\force_teacher\b601_tuner.py" %*
+set "PYTHONPATH=%~dp0src;%~dp0"
+uv run --no-sync python "%~dp0examples\force_teacher\b601_desktop.py" %*
 set "FORCEPOS_EXIT_CODE=%ERRORLEVEL%"
 if not "%FORCEPOS_EXIT_CODE%"=="0" (
     echo.

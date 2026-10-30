@@ -347,6 +347,9 @@ all = [
     # "lerobot[unitree_g1]", TODO: Unitree requires specific installation instructions for unitree_sdk2
 ]
 
+force-teacher-ui = ["PySide6>=6.8,<7", "pyqtgraph>=0.13.7,<0.15"]
+force-teacher-ui-test = ["lerobot[force-teacher-ui]", "pytest-qt>=4.4,<5"]
+
 [project.scripts]
 lerobot-force-teacher="lerobot.scripts.lerobot_force_teacher:main"
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
@@ -534,6 +537,7 @@ exclude = ["src/lerobot/policies/molmoact2/molmoact2_hf_model"]
 # Uncomment [tool.mypy] first, then uncomment individual module overrides as they get proper type annotations
 
 [tool.pytest.ini_options]
+pythonpath = ["src", "."]
 markers = [
     "multigpu: distributed tests needing 2-4 GPUs (CI: docker_publish.yml lane)",
     "multigpu_heavy: 8-GPU sweeps and soak tests; never run in CI",

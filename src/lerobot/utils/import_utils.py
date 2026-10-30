@@ -261,3 +261,7 @@ def register_third_party_plugins() -> None:
             attempt_import(dist_name)
 
     logging.debug("Third-party plugin import summary: imported=%s failed=%s", imported, failed)
+
+
+_pyside6_available = is_package_available("PySide6")
+_pyqtgraph_available = is_package_available("pyqtgraph")

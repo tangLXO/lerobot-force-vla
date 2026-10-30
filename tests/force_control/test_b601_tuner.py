@@ -1,5 +1,6 @@
 """Offline UI mapping, calibration, reporting and visible I-P parameter tests."""
 
+import importlib
 import json
 import math
 import time
@@ -27,6 +28,52 @@ class _Variable:
 class _Widget:
     def configure(self, **kwargs):
         pass
+
+
+@pytest.mark.parametrize("entrypoint", ["direct", "desktop_legacy"])
+@pytest.mark.parametrize(
+    "args,mode,gap",
+    [
+        ([], "cached", 120.0),
+        (["--command-feedback-mode", "sequential"], "sequential", 120.0),
+        (["--command-feedback-mode", "pipelined", "--command-tx-gap-us", "120"], "pipelined", 120.0),
+    ],
+)
+@pytest.mark.parametrize("environment", [None, "1000"])
+def test_legacy_entry_passes_daily_communication_defaults(
+    panel, monkeypatch, entrypoint, args, mode, gap, environment
+):
+    monkeypatch.delenv("MOTORBRIDGE_TX_GAP_US", raising=False)
+    if environment is not None:
+        monkeypatch.setenv("MOTORBRIDGE_TX_GAP_US", environment)
+    if "--command-tx-gap-us" not in args and environment is not None:
+        gap = float(environment)
+
+    captured = {}
+
+    class StartupCapturedError(Exception):
+        pass
+
+    def capture_tuner(window, **kwargs):
+        captured.update(kwargs)
+        raise StartupCapturedError
+
+    monkeypatch.setattr(panel.tk, "Tk", lambda: object())
+    monkeypatch.setattr(panel, "Tuner", capture_tuner)
+    with pytest.raises(StartupCapturedError):
+        if entrypoint == "direct":
+            panel.main(args)
+        else:
+            importlib.import_module("b601_desktop").main(["--legacy-ui", *args])
+    assert captured["command_feedback_mode"] == mode
+    assert captured["command_tx_gap_us"] == gap
+    assert captured["command_tx_gap_source"] == (
+        "命令行"
+        if "--command-tx-gap-us" in args
+        else "环境变量 MOTORBRIDGE_TX_GAP_US"
+        if environment is not None
+        else "官方默认"
+    )
 
 
 @pytest.mark.parametrize("hz,expected", [(50, "20 ms / 整拍硬截止 40 ms"), (100, "10 ms / 整拍硬截止 20 ms")])
