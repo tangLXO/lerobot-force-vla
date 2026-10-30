@@ -81,6 +81,22 @@ uv run --no-sync python examples/force_teacher/validate_demonstration.py "output
 
 默认检查主表、动作证据、Raw/Sync 引用、当前力、目标力、因果时间和视频逐帧解码。`--skip-video-decode` 只用于诊断，不能作为视频验收。
 
+## Hugging Face 上传与读取
+
+`LeRobotDataset.push_to_hub(private=True)` 会上传主表、视频、Sensor Sidecar 和 Teacher 审计附件，排除 Sensor staging、quarantine 和 Writer 锁。登录有权限的 Hugging Face 账号后，可直接读取：
+
+```python
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+dataset = LeRobotDataset("你的账号/数据集名称", video_backend="pyav")
+# 只下载指定段的审计附件、Raw/Sync 和对应主文件：
+subset = LeRobotDataset("你的账号/数据集名称", episodes=[1], video_backend="pyav")
+```
+
+正常加载会自动补全 `meta/teacher_capture.json`、所选段的 `meta/teacher_episodes/<uid>.json` 及 `teacher/<uid>/{control,frames}.jsonl`，无需另行调用 `snapshot_download`。旧加载器留下的缓存也会补全。附件与 Sensor 已提交事务的 UID、段号、帧数必须一致；缺失文件、未完成标记或附件 SHA256 不符会使加载失败。所有补充下载沿用同一固定提交、认证和缓存目录；完整的本地数据无需联网，读取不会修复或改写已提交数据。
+
+全量下载后可对 `dataset.root` 运行上述独立核验；子集只核验所选 UID，例如 `validate_demonstration(subset.root, episode_uid=uid)`，不能将子集目录当成完整数据集核验。普通加载检查附件身份、完整标记和文件哈希；逐行语义、跨文件引用与完整视频解码仍由独立核验负责。
+
 ## 软件与只读验证
 
 ```powershell

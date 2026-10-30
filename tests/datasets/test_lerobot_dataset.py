@@ -195,6 +195,7 @@ def test_metadata_without_root_uses_hub_cache_snapshot_download(
             "meta/episodes/**/*.parquet",
             "meta/sensor_streams.json",
             "meta/sensor_episodes/*.json",
+            "meta/teacher_capture.json",
         ],
         "ignore_patterns": None,
     }

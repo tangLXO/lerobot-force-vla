@@ -312,7 +312,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         from .sensor_hub import ensure_sensor_subset
 
         has_sensor_sidecar = (self.root / "meta/sensor_streams.json").is_file()
-        if has_sensor_sidecar:
+        teacher_required = self.meta.robot_type == "rebot_b601_teacher"
+        if has_sensor_sidecar or teacher_required or (self.root / "meta/teacher_capture.json").exists():
             ensure_sensor_subset(
                 self.root,
                 self.episodes,
@@ -320,6 +321,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 lambda paths: self._download_sensor_files(paths, token=token),
                 refresh=force_cache_sync,
                 main_paths=self.reader.get_episodes_file_paths(),
+                teacher_required=teacher_required,
             )
 
         # Sensor localization validates selected journals before downloading large artifacts.
