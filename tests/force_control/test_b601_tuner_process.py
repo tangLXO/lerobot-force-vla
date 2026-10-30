@@ -1,6 +1,7 @@
 """Windows-compatible spawn with explicit I-P bundles, priority events and stop."""
 
 import importlib
+import multiprocessing
 import os
 import queue
 import threading
@@ -35,6 +36,12 @@ def preview_control(output, reviewed_config, live, results):
     results.put((True, {"stopped": True}))
 
 
+def observe_stop_transitions(stop, commands, results):
+    for _ in range(3):
+        commands.get(timeout=10)
+        results.put(stop.is_set())
+
+
 @pytest.fixture
 def bridge(monkeypatch):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "examples/force_teacher"))
@@ -49,6 +56,43 @@ def wait_for(predicate, live, timeout=10):
             return
         time.sleep(live.poll_s)
     pytest.fail("IPC event not received")
+
+
+def test_stop_flag_timeout_wakeup_and_reset(bridge):
+    live = bridge.ProcessLive(poll_s=0.01)
+    try:
+        assert not live.stop.wait(0)
+        thread = threading.Thread(target=lambda: (time.sleep(0.02), live.stop.set()))
+        thread.start()
+        assert live.stop.wait(2)
+        thread.join()
+        assert live.stop.is_set() and live.stop.wait(0)
+        live.stop.clear()
+        assert not live.stop.is_set() and not live.stop.wait(0)
+    finally:
+        live.close()
+
+
+def test_stop_flag_transitions_visible_across_spawn(bridge):
+    context = multiprocessing.get_context("spawn")
+    live = bridge.ProcessLive(poll_s=0.01)
+    commands, results = context.Queue(), context.Queue()
+    child = context.Process(target=observe_stop_transitions, args=(live.stop, commands, results))
+    child.start()
+    try:
+        for expected in (False, True, False):
+            live.stop.set() if expected else live.stop.clear()
+            commands.put(True)
+            assert results.get(timeout=10) is expected
+        child.join(10)
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join()
+        commands.close()
+        results.close()
+        live.close()
 
 
 def test_spawn_isolates_owner_and_carries_new_parameters_and_priority_stop(bridge, tmp_path):
@@ -75,10 +119,8 @@ def test_spawn_isolates_owner_and_carries_new_parameters_and_priority_stop(bridg
         live.submit("parameters", bundle)
         wait_for(lambda: live.applied is not None, live)
         assert live.applied == ("parameters", bundle)
-        live.submit("freeze")
-        wait_for(lambda: live.applied[0] == "freeze", live)
-        live.submit("step", -0.01)
-        wait_for(lambda: live.applied == ("step", -0.01), live)
+        live.submit("resume")
+        wait_for(lambda: live.applied == ("resume", None), live)
         live.submit("target", 3.0)
         wait_for(lambda: live.applied == ("target", 3.0), live)
         live.submit("approach", {"gripper_follow_speed_deg_s": 1, "contact_force_threshold_N": 0.5})
@@ -120,13 +162,24 @@ def test_invalid_bundle_never_enters_mailbox_and_mode_has_separate_slot(bridge):
             )
         bundle = {"teacher": TeacherConfig.fake(), "safety": SafetyConfig.fake()}
         live.submit("parameters", bundle)
-        live.submit("freeze")
+        live.submit("resume")
         time.sleep(0.05)
-        assert live.take() == ("freeze", None)
+        assert live.take() == ("resume", None)
         assert live.take() == ("parameters", bundle)
         live.stop.set()
         with pytest.raises(RuntimeError, match="停止"):
             live.submit("resume")
+    finally:
+        live.close()
+
+
+@pytest.mark.parametrize("kind", ["freeze", "step"])
+def test_removed_commands_never_enter_process_mailbox(bridge, kind):
+    live = bridge.ProcessLive(poll_s=0.01)
+    try:
+        with pytest.raises(ValueError, match="Unknown control event"):
+            live.submit(kind)
+        assert live.take() is None
     finally:
         live.close()
 
@@ -148,12 +201,12 @@ def test_release_finish_uses_existing_limits_and_requires_an_available_event_slo
         with pytest.raises(ValueError, match="已配置"):
             live.submit("release_and_finish", {"release_speed_deg_s": 999})
         assert not live.finishing
-        live.submit("freeze")
+        live.submit("resume")
         with pytest.raises(queue.Full):
             live.submit("release_and_finish")
         assert not live.finishing
         time.sleep(0.05)
-        assert live.take() == ("freeze", None)
+        assert live.take() == ("resume", None)
         live.submit("release_and_finish")
         assert live.finishing
         time.sleep(0.05)
@@ -217,9 +270,9 @@ def test_recording_events_have_bounded_independent_slot_and_never_latch_motion_f
         live.submit("record_start", {"config": {"task": "pick"}})
         with pytest.raises(queue.Full):
             live.submit("record_finish", {"task_result": "success"})
-        live.submit("freeze")
+        live.submit("resume")
         time.sleep(0.05)
-        assert live.take() == ("freeze", None)
+        assert live.take() == ("resume", None)
         assert live.take() == ("record_start", {"config": {"task": "pick"}})
         live.submit("record_finish", {"task_result": "success"})
         time.sleep(0.05)

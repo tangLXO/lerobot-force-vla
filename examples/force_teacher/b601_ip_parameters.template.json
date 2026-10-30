@@ -1,6 +1,6 @@
 {
   "format": "b601_ip_tuner_settings",
-  "schema_version": 6,
+  "schema_version": 10,
   "controller_type": "ip",
   "calibration_file": "operator-gripper-calibration.json",
   "values": {
@@ -16,7 +16,6 @@
     "max_close_speed_deg_s": "0.2",
     "max_open_speed_deg_s": "0.2",
     "acceleration_limit_deg_s2": "0.5",
-    "manual_step_deg": "",
     "release_speed_deg_s": "0.2",
     "release_travel_deg": "0.5",
     "max_release_time_s": "3",
@@ -44,6 +43,7 @@
     "watchdog_ticks": "2000",
     "parameter_write_settle_s": "0.01",
     "control_hz": "100",
+    "scheduler_sleep_slice_ms": "5",
     "feedback_budget_ms": "15",
     "tick_deadline_ms": "40",
     "command_ttl_ms": "200",

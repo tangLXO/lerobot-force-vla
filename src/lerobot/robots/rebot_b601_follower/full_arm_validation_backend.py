@@ -19,6 +19,7 @@ from .control_protocol import (
 )
 from .control_state import read_control_state
 from .full_arm_control_types import JOINT_NAMES, FullArmLeaderSample
+from .pipelined_control import PipelinedControl
 from .readonly_transport import ReadonlyB601Transport
 
 
@@ -56,6 +57,10 @@ class FullArmValidationSession:
         self.returned_sequences = {}
         self.last_observation = None
         self._calibration_reader = None
+        self.pipeline = PipelinedControl(self)
+        self.sequential_feedback_group = None
+        self.control_snapshot = None
+        self.control_deadline_ns = None
 
     @property
     def has_binding_resources(self) -> bool:
@@ -123,6 +128,13 @@ class FullArmValidationSession:
         self.guard()
         self.leader()
         now = time.perf_counter_ns()
+        if self.control_deadline_ns is not None:
+            self.device._remaining(self.control_deadline_ns)
+            if any(
+                not 0 <= now - row.receive_timestamp_ns <= self.pinned_control.feedback_max_age_s * 1e9
+                for row in self.control_snapshot.joints
+            ):
+                raise RuntimeError("Frozen control feedback expired during submission")
         if (
             not self.operator
             and self.started_ns is not None
@@ -378,6 +390,7 @@ class FullArmValidationSession:
         if pending is None or pending["packet_hex"] != packet.hex():
             raise RuntimeError("Full-arm validation command response ownership is ambiguous")
         pending["submission"] = "entered_unknown"
+        pending["write_entered_ns"] = time.perf_counter_ns()
 
     def command_write_submitted(self, packet):
         """Pin a full host submission even if the subsequent deadline check fails."""
@@ -387,6 +400,7 @@ class FullArmValidationSession:
         if pending is None or pending["packet_hex"] != packet.hex():
             raise RuntimeError("Full-arm validation submitted command differs from its pending owner")
         pending["submission"] = "complete"
+        pending["write_completed_ns"] = time.perf_counter_ns()
 
     def uses_reference_envelope(self, name: str) -> bool:
         """Keep operator gripper travel in its own working/calibrated bounds.
@@ -445,6 +459,8 @@ class FullArmValidationSession:
                 packet, min(deadline_ns, item["send_start_ns"] + int(self.device.config.send_budget_s * 1e9))
             )
             self.pending_response["submission"] = "complete"
+            item["write_entered_ns"] = self.pending_response["write_entered_ns"]
+            item["write_completed_ns"] = self.pending_response["write_completed_ns"]
             item["status"] = "submitted"
             self.last_command_ns[name] = time.perf_counter_ns()
         except BaseException:
@@ -738,7 +754,7 @@ class FullArmValidationSession:
         finally:
             self.starting = False
 
-    def send(self, goals, snapshot):
+    def send(self, goals, snapshot, *, deadline_ns=None):
         """Preserve seven sequential receipts and clipped wire targets behind the bounded capability."""
         if not self.ready or not self.device._motion_session:
             raise RuntimeError("Full-arm validation has not completed explicit startup")
@@ -761,8 +777,23 @@ class FullArmValidationSession:
                 self.device._mapping_values(name),
             )
         started = time.perf_counter_ns()
-        deadline = started + int(self.device.config.send_budget_s * 1e9)
+        deadline = (
+            (started + int(self.device.config.send_budget_s * 1e9)) if deadline_ns is None else deadline_ns
+        )
+        if self.device.config.command_feedback_mode == "cached":
+            if type(deadline_ns) is not int:
+                raise ValueError("Cached control requires the tick's absolute deadline_ns")
+            deadline = min(
+                deadline,
+                min(row.receive_timestamp_ns for row in snapshot.joints)
+                + int(self.pinned_control.feedback_max_age_s * 1e9),
+            )
+            self.control_snapshot, self.control_deadline_ns = snapshot, deadline
+        pipelined = self.device.config.command_feedback_mode in ("pipelined", "cached")
+        if pipelined:
+            self.pipeline.begin(started, deadline)
         results, failure = [], None
+        exchanges = []
         for name in JOINT_NAMES:
             target = encoded[name]
             begin = end = None
@@ -776,16 +807,26 @@ class FullArmValidationSession:
                     ):
                         raise RuntimeError("Full-arm validation feedback expired before submission")
                     begin = time.perf_counter_ns()
-                    self.exchange(
-                        "operator_control" if self.operator else "validation_control",
-                        name,
-                        target.packet,
-                        1,
-                        deadline,
-                    )
+                    if pipelined:
+                        self.pipeline.submit(name, target.packet)
+                    else:
+                        exchanges.append(
+                            self.exchange(
+                                "operator_control" if self.operator else "validation_control",
+                                name,
+                                target.packet,
+                                1,
+                                deadline,
+                            )
+                        )
                     status = "success"
                 except BaseException as exc:
                     failure, error = exc, f"{type(exc).__name__}: {exc}"
+                    if pipelined:
+                        command = self.pipeline.cycle["commands"].get(name, {})
+                        status = {"complete": "success", "entered_unknown": "unknown"}.get(
+                            command.get("submission"), "not_attempted"
+                        )
                 finally:
                     end = time.perf_counter_ns()
             results.append(
@@ -801,6 +842,20 @@ class FullArmValidationSession:
                 )
             )
         receipt = SendReceipt(tuple(results), started, time.perf_counter_ns())
+        self.control_snapshot = self.control_deadline_ns = None
+        self.pipeline.service_deadline_ns = None
+        if not pipelined:
+            self.sequential_feedback_group = {
+                "send_start_ns": started,
+                "deadline_ns": deadline,
+                "completed_ns": receipt.send_end_ns if failure is None else None,
+                "last_write_completed_ns": exchanges[-1]["write_completed_ns"] if exchanges else None,
+                "actual_write_intervals_ns": [
+                    right["write_entered_ns"] - left["write_entered_ns"]
+                    for left, right in zip(exchanges, exchanges[1:], strict=False)
+                ],
+                "hardware_ack": "unknown",
+            }
         self.device.last_receipt = receipt
         if failure is not None:
             self.device._failure = self.device._failure or str(failure)
@@ -813,6 +868,7 @@ class FullArmValidationSession:
         """Attempt all seven disables before reading any response; never skip later motors."""
         self.guard = None
         self.cleaning = True
+        self.control_snapshot = self.control_deadline_ns = None
         self.device._failure = self.device._failure or reason
         receipt = {
             "action": "disable_all_operator_teleoperation" if self.operator else "disable_all_validation",
@@ -829,11 +885,24 @@ class FullArmValidationSession:
             "outstanding_query_before_disable": copy.deepcopy(self.device._outstanding_query),
             "pending_command_before_disable": copy.deepcopy(self.pending_response),
             "pending_parameter_write_before_disable": copy.deepcopy(self.pending_parameter_write),
+            "pending_feedback_group_before_disable": self.pipeline.retire(),
             "historical_responses": [],
             "unresolved_transactions": [],
             "transactions_retired_for_cleanup": False,
             "fresh_disabled_verification_complete": False,
         }
+        group = receipt["pending_feedback_group_before_disable"]
+        if group is not None:
+            for name, command in group["commands"].items():
+                if command["submission"] != "planned" and name not in group["feedback"]:
+                    receipt["unresolved_transactions"].append(
+                        {
+                            "kind": "pipelined_command_feedback",
+                            "evidence": copy.deepcopy(command),
+                            "outcome": "unresolved_retired_before_independent_disabled_probe",
+                            "hardware_ack": "unknown",
+                        }
+                    )
         deadline = receipt["send_start_ns"] + int(self.pinned_control.fault_budget_s * 1e9)
         receipt["disable_inter_packet_s"] = 0.001
         failures = []

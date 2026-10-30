@@ -15,6 +15,7 @@ from b601_profile_review import (
 )
 
 from lerobot.force_control.demonstration import TeacherRecordConfig
+from lerobot.force_control.source_binding import require_source_tree
 from lerobot.robots.rebot_b601_follower.calibration import B601GripperCalibration
 from lerobot.robots.rebot_b601_follower.control_protocol import force_pos_wire_codes
 from lerobot.scripts.lerobot_force_teacher import ForceTeacherRunConfig, run as run_runtime
@@ -40,6 +41,13 @@ def load_reviewed(path):
             ForceTeacherRunConfig,
             config_document(json.loads(Path(draft["full_arm_profile_file"]).read_text(encoding="utf-8"))),
         )
+        override = draft.get("command_feedback_override")
+        if override is not None:
+            if set(override) != {"command_feedback_mode", "command_tx_gap_us"}:
+                raise ValueError("Unexpected communication override fields")
+            selected = replace(
+                selected, b601=replace(selected.b601, control=replace(selected.b601.control, **override))
+            )
         if draccus.encode(replace(selected, trace_root=config.trace_root)) != draccus.encode(config):
             raise ValueError("全臂配置文件已变化；请重新预检并读取参考")
     if draft.get("recording") is not None:
@@ -68,6 +76,7 @@ def exception_messages(error):
 
 def run(output, *, execute=False, reviewed_config=None, live=None):
     """Offline review returns settings; execution has no alternate control loop."""
+    source_binding = require_source_tree(Path(__file__).resolve().parents[2])
     if reviewed_config is None:
         raise ValueError("An explicit reviewed configuration is required")
     draft, config = load_reviewed(reviewed_config)
@@ -78,6 +87,7 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
     if not execute:
         return {
             "transport_opened": False,
+            "source_binding": source_binding,
             "config": draft["config"],
             "velocity_wire_code": velocity,
             "drive_wire_code": drive,
@@ -105,6 +115,7 @@ def run(output, *, execute=False, reviewed_config=None, live=None):
     errors = list(result.get("errors") or []) + errors
     result.update(
         errors=errors,
+        source_binding=source_binding,
         config=draft["config"],
         calibration=draft["calibration"],
         operator_values=draft.get("operator_values", {}),

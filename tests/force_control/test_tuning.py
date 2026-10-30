@@ -24,6 +24,7 @@ def test_shared_settings_import_without_tk_or_example_modules():
 def test_v6_settings_load_without_overwriting_file_or_selecting_arm_limits(settings, calibration, tmp_path):
     document = tuning.settings_document(*settings, calibration.path)
     document["schema_version"] = 6
+    document["values"]["manual_step_deg"] = ""
     document.pop("arm_settings")
     path = tmp_path / "legacy-v6.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -49,6 +50,30 @@ def test_panel_uses_the_shared_functions_and_schema(panel):
         assert getattr(panel, name) is getattr(tuning, name)
 
 
+def test_v9_settings_retire_only_the_legacy_field_without_rewriting(calibration, settings, tmp_path):
+    document = tuning.settings_document(*settings, calibration.path)
+    document["schema_version"] = 9
+    document["values"]["manual_step_deg"] = "-0.25"
+    path = tmp_path / "legacy-v9.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    values, enabled, source = tuning.read_settings(path)
+    assert (values, enabled) == settings and "manual_step_deg" not in values
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    saved = tuning.save_settings(tmp_path / "new.json", values, enabled, source)
+    current = json.loads(saved.read_text(encoding="utf-8"))
+    assert current["schema_version"] == 10 and "manual_step_deg" not in current["values"]
+    document["values"]["unexpected"] = "0"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="参数字段"):
+        tuning.read_settings(path)
+    document["values"].pop("unexpected")
+    document["values"]["manual_step_deg"] = 1
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(ValueError, match="类型无效"):
+        tuning.read_settings(path)
+
+
 @pytest.mark.parametrize("version", [3, 4])
 def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
     calibration, settings, tmp_path, version
@@ -57,6 +82,7 @@ def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
     values.update(gripper_follow_speed_deg_s="0.17", contact_force_threshold_N="0.43")
     document = tuning.settings_document(values, enabled, calibration.path)
     document["schema_version"] = version
+    document["values"]["manual_step_deg"] = "0.1"
     for old, new in LEGACY_TEACHER_FIELDS.items():
         document["values"][old] = document["values"].pop(new)
     if version == 3:
@@ -70,7 +96,7 @@ def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
     assert (path.read_bytes(), path.stat().st_mtime_ns) == (original, mtime)
     saved = tuning.save_settings(tmp_path / "canonical.json", restored, switches, source)
     encoded = json.loads(saved.read_text(encoding="utf-8"))
-    assert encoded["schema_version"] == 9
+    assert encoded["schema_version"] == 10
     assert encoded["values"] == values
     assert not LEGACY_TEACHER_FIELDS.keys() & encoded["values"].keys()
     config = tuning.build_config(restored, switches, calibration, tmp_path / "trace")
@@ -83,6 +109,7 @@ def test_old_motion_field_names_migrate_readonly_and_save_only_canonical_names(
 def test_legacy_json_rejects_duplicate_aliases(calibration, settings, tmp_path, old, new):
     document = tuning.settings_document(*settings, calibration.path)
     document["schema_version"] = 4
+    document["values"]["manual_step_deg"] = ""
     document["values"][old] = document["values"][new]
     path = tmp_path / "conflict.json"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -103,6 +130,7 @@ def test_profile_before_leader_fields_migrates_without_selecting_a_device(calibr
     values, enabled = settings
     document = tuning.settings_document(values, enabled, calibration.path)
     document["schema_version"] = 5
+    document["values"]["manual_step_deg"] = ""
     for key in tuning.LEADER_FIELDS:
         document["values"].pop(key)
     path = tmp_path / "before-leader.json"

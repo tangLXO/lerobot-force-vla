@@ -79,12 +79,10 @@ def test_gain_bundle_validation_is_atomic_and_first_updated_p_is_zero():
     assert proposal.delta_p_deg == 0 and proposal.delta_i_deg == pytest.approx(0.006)
 
 
-def test_freeze_manual_goal_does_not_accumulate_force_error_and_resume_realigns():
+def test_position_goal_does_not_accumulate_force_error_and_resume_realigns():
     teacher = tracking_teacher()
     submit(teacher, teacher.propose(inputs(0.5)))
-    teacher.freeze(1_000_000_000, 0.3)
-    assert teacher.hold_target_deg == 0.3
-    teacher.step(0.5)
+    teacher.move_to(1_000_000_000, 0.3, 0.8)
     assert teacher.hold_target_deg == 0.8
     first = teacher.propose(inputs(0, q=0.3))
     assert first.q_candidate_deg == pytest.approx(0.8)
@@ -99,14 +97,14 @@ def test_freeze_manual_goal_does_not_accumulate_force_error_and_resume_realigns(
 
 
 @pytest.mark.parametrize("sign", [-1, 1])
-def test_manual_step_is_in_closing_coordinates(sign):
+def test_absolute_position_target_is_independent_of_closing_direction(sign):
     teacher = tracking_teacher(sign)
-    teacher.freeze(0, 1)
-    teacher.step(0.2)
-    assert teacher.hold_target_deg == pytest.approx(1 + sign * 0.2)
+    teacher.move_to(0, 1, 0.8)
+    assert teacher.hold_target_deg == pytest.approx(0.8)
     teacher.resume(0, 1)
-    with pytest.raises(RuntimeError, match="POSITION_HOLD"):
-        teacher.step(0.1)
+    teacher.disable()
+    with pytest.raises(RuntimeError, match="position requires"):
+        teacher.move_to(0, 1, 0.8)
 
 
 @pytest.mark.parametrize("success,override", [(False, False), (True, True)])
@@ -169,7 +167,7 @@ def test_first_force_submission_masks_p_even_when_force_changes_after_reference(
     teacher.start(0, 0, force_N=0.2)
     if event == "resume":
         submit(teacher, teacher.propose(inputs(0.5)))
-        teacher.freeze(1_000_000_000, 0)
+        teacher.move_to(1_000_000_000, 0, 0)
         teacher.resume(1_010_000_000, 0, force_N=0.2)
     first = teacher.propose(inputs(0.8))
     assert first.delta_p_deg == 0

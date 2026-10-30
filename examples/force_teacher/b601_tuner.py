@@ -561,20 +561,6 @@ def timing_description(row):
     )
 
 
-def tuning_estimate(q0, q1, f0, f1, t0, t90, alpha_i, alpha_p):
-    """Operator-fed calculator; never write gains or command motion."""
-    for value in (q0, q1, f0, f1, t0, t90, alpha_i, alpha_p):
-        finite_number("调参测量值 / 系数", value)
-    if q1 == q0:
-        raise ValueError("测量角度变化不能为 0")
-    kappa, response = (f1 - f0) / (q1 - q0), t90 - t0
-    positive("κ (N/°)", kappa)
-    positive("t90 - t0 (s)", response)
-    positive("积分系数 αI", alpha_i)
-    finite_number("比例系数 αP", alpha_p, minimum=0)
-    return kappa, response, alpha_i / (kappa * response), alpha_p / kappa
-
-
 def startup_description(receipt):
     """Show software settings and the fresh readback, without claiming hardware execution."""
     if receipt.get("kind") == "operator_teleoperation":
@@ -712,7 +698,7 @@ class Tuner:
         self.pending_cleanup = None
         self.preview_cleanup = None
         self.pending_start_error = None
-        self.config = self.estimate = self.last_anchor = None
+        self.config = self.last_anchor = None
         self.last_applied = None
         self.last_startup = None
         self.last_recording = None
@@ -887,34 +873,6 @@ class Tuner:
         )
         self.fields["motor_velocity_code"].trace_add("write", lambda *_: self.update_speed_label())
         self.update_speed_label()
-        self.calculator = {}
-        frame = ttk.LabelFrame(sections["control"], text="κ / t90 计算器 · 不自动运动或写参数", padding=8)
-        frame.grid(row=rows["control"], column=0, columnspan=2, sticky="ew", pady=14)
-        for index, (key, label) in enumerate(
-            (
-                ("q0", "闭合坐标 θ0 (°)"),
-                ("q1", "闭合坐标 θ1 (°)"),
-                ("f0", "稳态原始平均力 F0 (N)"),
-                ("f1", "稳态原始平均力 F1 (N)"),
-                ("t0", "动作起点时间 (s)"),
-                ("t90", "首次到达 90% 的时间 (s)"),
-                ("alpha_i", "αI：Ki = αI / (κ·t90)"),
-                ("alpha_p", "αP：Kp = αP / κ"),
-            )
-        ):
-            ttk.Label(frame, text=label).grid(row=index, column=0, sticky="w", pady=3)
-            var = self.calculator[key] = tk.StringVar()
-            ttk.Entry(frame, textvariable=var, width=13).grid(row=index, column=1, sticky="e")
-        ttk.Button(frame, text="计算（仅显示）", command=self.calculate).grid(
-            row=8, column=0, sticky="ew", pady=6
-        )
-        ttk.Button(frame, text="手动填入 Kp / Ki", command=self.fill_estimate).grid(
-            row=8, column=1, sticky="ew"
-        )
-        self.calculation_label = tk.StringVar(value="κ=(F1−F0)/(θ1−θ0)，响应时间=t90−t0")
-        ttk.Label(frame, textvariable=self.calculation_label, wraplength=420).grid(
-            row=9, column=0, columnspan=2
-        )
         for page, inner in pages.items():
             children = [inner]
             while children:
@@ -951,16 +909,12 @@ class Tuner:
         self.start_button.grid(row=4, column=0, sticky="ew", padx=(0, 4))
         self.stop_button = ttk.Button(actions, text="停止 / 夹爪失能 [Esc]", command=self.stop)
         self.stop_button.grid(row=4, column=1, sticky="ew")
-        self.freeze_button = ttk.Button(actions, text="冻结固定位置", command=lambda: self.command("freeze"))
-        self.freeze_button.grid(row=5, column=0, sticky="ew", pady=6, padx=(0, 4))
         self.resume_button = ttk.Button(actions, text="恢复 I-P", command=lambda: self.command("resume"))
-        self.resume_button.grid(row=5, column=1, sticky="ew")
-        self.step_button = ttk.Button(actions, text="执行手动小步（仅固定位置到位后）", command=self.step)
-        self.step_button.grid(row=6, column=0, columnspan=2, sticky="ew")
+        self.resume_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=6)
         self.approach_button = ttk.Button(actions, text="恒速闭合 → I-P", command=self.approach)
-        self.approach_button.grid(row=7, column=0, sticky="ew", pady=6, padx=(0, 4))
+        self.approach_button.grid(row=6, column=0, sticky="ew", pady=6, padx=(0, 4))
         self.position_button = ttk.Button(actions, text="运动到指定位置", command=self.move_to_position)
-        self.position_button.grid(row=7, column=1, sticky="ew")
+        self.position_button.grid(row=6, column=1, sticky="ew")
         self.hybrid_button = ttk.Button(
             actions, text="启动主从夹爪遥操（使能）", command=lambda: self.start("hybrid")
         )
@@ -972,14 +926,14 @@ class Tuner:
         self.release_button = ttk.Button(
             actions, text="释放并结束采集", command=self.release_and_finish, state="disabled"
         )
-        self.release_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.release_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.full_arm_recovery_button = ttk.Button(
             actions,
             text="全臂只读复核（不使能）",
             command=self.recover_full_arm_readonly,
             state="disabled",
         )
-        self.full_arm_recovery_button.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.full_arm_recovery_button.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         stopped = ttk.LabelFrame(right, text="最近一次停止原因（重连后保留）", padding=8)
@@ -1179,14 +1133,13 @@ class Tuner:
         self.calibration_path, self.calibration = calibration_path, calibration
         self.loaded_arm_settings = arm_settings[0]
         self.settings_path = Path(path).resolve()
-        self.config = self.estimate = self.preview_latest = self.last_anchor = None
+        self.config = self.preview_latest = self.last_anchor = None
         self.live = self.last_applied = self.last_startup = None
         self.points.clear()
         self.confirmed.set(False)
         self.other_unlocked.set(False)
         self.values_label.set("未连接；参数已加载，需重新取得新鲜只读反馈")
         self.settings_label.set("参数文件已加载，尚未下发；开始前重新验证配置与设备映射")
-        self.calculation_label.set("κ=(F1−F0)/(θ1−θ0)，响应时间=t90−t0")
         self.show_calibration()
         self.update_editability()
         self.update_timing_settings()
@@ -1979,15 +1932,6 @@ class Tuner:
         except (ValueError, TypeError, OSError, RuntimeError, queue.Full, KeyError) as exc:
             self.status.set(str(exc) or "上一录制操作尚未接收")
 
-    def step(self):
-        try:
-            value = finite_number("手动小步", float(self.fields["manual_step_deg"].get()))
-            if value == 0:
-                raise ValueError("手动小步不能为 0")
-            self.command("step", value)
-        except ValueError as exc:
-            self.status.set(str(exc))
-
     def approach(self):
         """Submit one closure request with the speed and threshold currently displayed."""
         if not self.running:
@@ -2018,23 +1962,6 @@ class Tuner:
                 self.start("position", target, speed)
         except (ValueError, OSError) as exc:
             self.status.set(str(exc))
-
-    def calculate(self):
-        try:
-            self.estimate = tuning_estimate(*(float(var.get()) for var in self.calculator.values()))
-            kappa, response, ki, kp = self.estimate
-            self.calculation_label.set(
-                f"κ={kappa:g} N/°；t90={response:g} s\nKi={ki:g} °/(N·s)；Kp={kp:g} °/N"
-            )
-        except ValueError as exc:
-            self.estimate = None
-            self.calculation_label.set(str(exc))
-
-    def fill_estimate(self):
-        if self.estimate is not None:
-            self.fields["ki_deg_per_N_s"].set(f"{self.estimate[2]:.10g}")
-            self.fields["kp_deg_per_N"].set(f"{self.estimate[3]:.10g}")
-            self.status.set("已手动填入计算结果；需点击应用或开始才使用")
 
     def stop(self):
         self.connection_recovery = None
@@ -2312,11 +2239,6 @@ class Tuner:
             in ("FORCE_TRACK", "APPROACH", "POSITION_HOLD", "FOLLOW", "FOLLOW_WAIT_CLEAR")
             else "disabled"
         )
-        self.freeze_button.configure(
-            state="normal"
-            if active and row.get("phase") in ("FORCE_TRACK", "APPROACH", "FOLLOW", "FOLLOW_WAIT_CLEAR")
-            else "disabled"
-        )
         can_move = not self.running or (
             active
             and row.get("phase")
@@ -2326,17 +2248,6 @@ class Tuner:
         self.position_button.configure(state="normal" if can_move else "disabled")
         hold = active and row.get("phase") == "POSITION_HOLD"
         self.resume_button.configure(state="normal" if hold else "disabled")
-        settled = (
-            hold
-            and row.get("hold_target_deg") is not None
-            and row.get("q_measured_deg") is not None
-            and row.get("q_sent_deg") is not None
-            and abs(row["hold_target_deg"] - row["q_measured_deg"])
-            <= self.config.safety.stall_position_tolerance_deg
-            and abs(row["hold_target_deg"] - row["q_sent_deg"])
-            <= self.config.safety.stall_position_tolerance_deg
-        )
-        self.step_button.configure(state="normal" if settled else "disabled")
         self.draw()
 
     @staticmethod

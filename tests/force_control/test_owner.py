@@ -106,6 +106,55 @@ def activate(rig):
     return tick(rig)
 
 
+def test_intertick_rx_failure_is_published_before_next_control_deadline(rig, monkeypatch):
+    runtime, device, _, trace, clock = rig
+    activate(rig)
+    prior_start = runtime.last_tick_start
+    calls = []
+
+    def receive():
+        calls.append(threading.get_ident())
+        raise TimeoutError("missing pipelined feedback")
+
+    monkeypatch.setattr(device, "service_pending_io", receive, raising=False)
+    row = runtime.wait_for_next_tick(clock() + 20_000_000)
+    assert row["phase"] == "FAULT" and row["communication_only"]
+    assert "missing pipelined feedback" in row["failure_reason"]
+    assert runtime.last_tick_start == prior_start
+    assert trace.rows[-1] == row
+    assert calls == [threading.get_ident()]
+
+
+def test_direct_runtime_wait_services_rx_without_issuing_commands(rig, monkeypatch):
+    runtime, device, _, _, clock = rig
+    activate(rig)
+    before = list(device.calls)
+    serviced = []
+    monkeypatch.setattr(device, "service_pending_io", lambda: serviced.append(clock()), raising=False)
+    monkeypatch.setattr(device, "command_feedback_pending", True, raising=False)
+    monkeypatch.setattr(
+        time, "sleep", lambda seconds: setattr(clock, "now", clock.now + round(seconds * 1e9))
+    )
+    assert runtime.wait_for_next_tick(clock() + 1_000_000) is None
+    assert len(serviced) >= 5 and device.calls == before
+
+
+def test_recording_freeze_waits_for_feedback_and_publishes_a_tail(rig, monkeypatch):
+    runtime, device, _, _, _ = rig
+    activate(rig)
+    owner = OwnerService(runtime)
+    subscription = owner.subscribe()
+    owner._freeze_requests.append(subscription)
+    monkeypatch.setattr(device, "command_feedback_pending", True, raising=False)
+    owner._settle_subscriptions()
+    assert not subscription.closed and subscription.queue.empty()
+    monkeypatch.setattr(device, "command_feedback_pending", False)
+    owner._settle_subscriptions()
+    tail = subscription.get()
+    assert subscription.closed and tail.row["communication_only"]
+    assert tail.row["send_status"] == "none" and not tail.row["submitted_action"]
+
+
 def test_owner_filters_leader_gripper_and_submits_explicit_seven_joints(rig):
     row = activate(rig)
     assert row["arm_intent"]["gripper.pos"] == 99.0

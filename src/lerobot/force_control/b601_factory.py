@@ -99,7 +99,10 @@ class B601HardwareConfig:
             )
         if self.control.feedback_max_age_s * 1000 > safety.joint_feedback_max_age_ms:
             raise ValueError("B601 feedback age must not exceed the runtime safety envelope")
-        if (runtime.feedback_budget_ms + self.control.send_budget_s * 1000) >= runtime.tick_deadline_ms:
+        if (
+            self.control.command_feedback_mode != "cached"
+            and (runtime.feedback_budget_ms + self.control.send_budget_s * 1000) >= runtime.tick_deadline_ms
+        ):
             raise ValueError(
                 "B601 read and send budgets must leave computation time inside the tick deadline"
             )

@@ -59,7 +59,6 @@ FIELDS = (
     ("control", "max_close_speed_deg_s", "最大闭合位置变化率 (°/s)", "0.2", float, True, None),
     ("control", "max_open_speed_deg_s", "最大张开位置变化率 (°/s)", "0.2", float, True, None),
     ("control", "acceleration_limit_deg_s2", "位置变化率加速度 (°/s²)", "0.5", float, True, "acceleration"),
-    ("control", "manual_step_deg", "手动小步 (°)，正闭合 / 负张开", "", float, True, None),
     ("control", "release_speed_deg_s", "退出放松速度 (°/s)", "0.2", float, False, None),
     ("control", "release_travel_deg", "退出放松行程 (°)", "0.5", float, False, None),
     ("control", "max_release_time_s", "退出放松最长时间 (s)", "3", float, False, None),
@@ -69,7 +68,7 @@ FIELDS = (
     ("limits", "hard_force_right_kg", "右侧原始力停止阈值 (kg)", "1.5", float, False, None),
     ("limits", "max_relative_target_deg", "目标领先反馈上限 (°) · 必填", "", float, False, None),
     ("limits", "max_command_tracking_error_deg", "跟随误差停止阈值 (°) · 必填", "", float, False, None),
-    ("limits", "stall_position_tolerance_deg", "停滞 / 小步到位容差 (°) · 必填", "", float, False, None),
+    ("limits", "stall_position_tolerance_deg", "停滞位置容差 (°) · 必填", "", float, False, None),
     ("limits", "stall_timeout_s", "持续停滞冻结积分时间 (s) · 必填", "", float, False, None),
     ("limits", "soft_q_min_deg", "工作目标下限 (°)，到达后保持", "", float, False, "soft_limits"),
     ("limits", "soft_q_max_deg", "工作目标上限 (°)，到达后保持", "", float, False, "soft_limits"),
@@ -181,7 +180,7 @@ FIELD_PAGES = {
     for section, key, *_ in FIELDS
 }
 SETTINGS_FORMAT = "b601_ip_tuner_settings"
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 10
 LEADER_FIELDS = frozenset(key for _, key, *_ in FIELDS if key.startswith("leader_"))
 MOTION_FIELDS = {
     "gripper_follow_speed_deg_s",
@@ -253,7 +252,7 @@ def read_settings(path, *, on_unit_conversion=None, on_arm_settings=None):
         or set(document) not in (keys, keys | {"arm_settings"})
         or document["format"] != SETTINGS_FORMAT
         or type(document["schema_version"]) is not int
-        or document["schema_version"] not in (1, 2, 3, 4, 5, 6, 7, 8, SETTINGS_SCHEMA_VERSION)
+        or document["schema_version"] not in (1, 2, 3, 4, 5, 6, 7, 8, 9, SETTINGS_SCHEMA_VERSION)
         or document["controller_type"] != "ip"
         or not isinstance(document["calibration_file"], str)
         or not document["calibration_file"].strip()
@@ -262,6 +261,11 @@ def read_settings(path, *, on_unit_conversion=None, on_arm_settings=None):
     ):
         raise ValueError("不是当前 I-P 参数文件，不能导入运行日志或旧控制配置")
     values = dict(document["values"])
+    if document["schema_version"] < 10:
+        # Older settings contain a retired operator field. Never interpret it as a motion command.
+        if type(values.get("manual_step_deg")) is not str:
+            raise ValueError("旧参数缺少小步字段或类型无效")
+        values.pop("manual_step_deg")
     if document["schema_version"] < 8:
         values.setdefault("scheduler_sleep_slice_ms", default_values()["scheduler_sleep_slice_ms"])
     if document["schema_version"] < 5:
@@ -316,7 +320,7 @@ def parse_values(values, enabled):
         if group and not enabled[group]:
             parsed[key] = None
             continue
-        if key in ("manual_step_deg", "position_target_deg", "position_speed_deg_s"):
+        if key in ("position_target_deg", "position_speed_deg_s"):
             continue
         if key in MOTION_FIELDS and not values[key].strip():
             parsed[key] = None

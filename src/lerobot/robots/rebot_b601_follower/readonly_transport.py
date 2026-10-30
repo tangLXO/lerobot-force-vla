@@ -17,6 +17,7 @@ import os
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING
 from lerobot.utils.import_utils import _serial_available, require_package
 
 from .control_io import B601BusLease
-from .serial_timeouts import set_serial_timeout
+from .serial_timeouts import native_first_byte_read_ready, nonblocking_serial_read, set_serial_timeout
 
 if TYPE_CHECKING or _serial_available:
     import serial
@@ -334,7 +335,15 @@ class ReadonlyB601Transport:
             "last_audit_sequence": None,
         }
 
-    def _read_rx_chunk(self, context: dict, deadline_ns: int, receive) -> None:
+    def _read_rx_chunk(
+        self,
+        context: dict,
+        deadline_ns: int,
+        receive,
+        *,
+        available_only: bool = False,
+        available_bytes: int | None = None,
+    ) -> None:
         """Stage at most one frame before audit/deadline failures can discard bytes."""
         self._check_owner()
         if self._rx_poison is not None:
@@ -342,9 +351,49 @@ class ReadonlyB601Transport:
         room = 16 - len(self._rx_pending)
         if room <= 0:
             raise RuntimeError("B601 retained RX frame must be validated before another read")
-        self._bounded_serial_timeout("timeout", 0.002, deadline_ns)
-        data = self._serial.read(max(1, min(room, self._serial.in_waiting)))
-        received_ns = time.perf_counter_ns()
+        if available_only:
+            self._remaining(deadline_ns)
+            if available_bytes is None:
+                available_bytes = self._serial.in_waiting
+            if type(available_bytes) is not int or available_bytes < 0:
+                raise ValueError("Available RX byte count must be a nonnegative integer")
+            if not available_bytes:
+                return
+            # Only this Owner reads the port: bytes observed before its live
+            # guard remain a safe lower bound. More arriving bytes wait for the
+            # next bounded frame; never repeat queue queries to increase size.
+            read_mode = (
+                nullcontext()
+                if native_first_byte_read_ready(self._serial)
+                else nonblocking_serial_read(self._serial)
+            )
+        else:
+            if available_bytes is not None:
+                raise ValueError("Available byte count is only valid for async queued reads")
+            self._bounded_serial_timeout("timeout", 0.002, deadline_ns)
+            read_mode = nullcontext()
+        with read_mode:
+            # Native timeout updates consume time too. Never start even an
+            # immediate read after the caller's unchanged deadline has expired.
+            self._remaining(deadline_ns)
+            size = min(room, available_bytes if available_only else self._serial.in_waiting)
+            if available_only and not size:
+                return
+            data = self._serial.read(size if available_only else max(1, size))
+            received_ns = time.perf_counter_ns()
+            self._stage_rx_chunk(context, data, received_ns, room, receive)
+        if received_ns > deadline_ns:
+            if data:
+                raise TimeoutError("B601 response arrived after deadline")
+            if not self._rx_pending:
+                raise TimeoutError("B601 no response before deadline")
+            raise TimeoutError(
+                f"B601 response incomplete at deadline ({len(self._rx_pending)}/16 bytes received)"
+            )
+        self._remaining(deadline_ns)
+
+    def _stage_rx_chunk(self, context, data, received_ns, room, receive):
+        """Retain real bytes before audit or read-timeout restoration can fail."""
         if data:
             if len(data) > room:
                 # A driver violating read(size) destroys our known frame boundary.
@@ -364,15 +413,6 @@ class ReadonlyB601Transport:
                 if self._rx_context["first_audit_sequence"] is None:
                     self._rx_context["first_audit_sequence"] = audit_sequence
                 self._rx_context["last_audit_sequence"] = audit_sequence
-        if received_ns > deadline_ns:
-            if data:
-                raise TimeoutError("B601 response arrived after deadline")
-            if not self._rx_pending:
-                raise TimeoutError("B601 no response before deadline")
-            raise TimeoutError(
-                f"B601 response incomplete at deadline ({len(self._rx_pending)}/16 bytes received)"
-            )
-        self._remaining(deadline_ns)
 
     def _peek_rx_frame(self, context: dict, deadline_ns: int, *, allow_inherited: bool = False) -> tuple:
         """Return a complete frame without clearing it until its consumer validates it."""

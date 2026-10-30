@@ -261,7 +261,7 @@ def test_broken_ipc_operations_request_stop_and_raise_visible_runtime_error(pane
         action = live._publish
     else:
         live.events.error = error
-        action = (lambda: live.submit("freeze")) if operation == "submit" else live.take
+        action = (lambda: live.submit("resume")) if operation == "submit" else live.take
     with pytest.raises(RuntimeError, match="控制进程通信失败"):
         action()
     assert live.stop.is_set()
@@ -277,7 +277,7 @@ def test_full_empty_and_user_validation_errors_keep_existing_mailbox_semantics(p
     assert not live.stop.is_set()
     live.events.error = queue.Full()
     with pytest.raises(queue.Full):
-        live.submit("freeze")
+        live.submit("resume")
     assert not live.stop.is_set()
     with pytest.raises(ValueError, match="目标力"):
         live.submit("target", -1)

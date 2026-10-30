@@ -185,3 +185,133 @@ def test_helper_rejects_non_timeout_fields_without_mutation(native):
     with pytest.raises(ValueError, match="Only serial"):
         serial_timeouts.set_serial_timeout(native.serial, "baudrate", 123)
     assert native.serial.public_updates == [] and native.calls == []
+
+
+def test_nonblocking_read_changes_only_read_timeouts_without_modem_reconfiguration(native):
+    with serial_timeouts.nonblocking_serial_read(native.serial):
+        assert native.serial.timeout == 0
+        assert native.values == {
+            **native.original,
+            "ReadIntervalTimeout": 0xFFFFFFFF,
+            "ReadTotalTimeoutMultiplier": 0,
+            "ReadTotalTimeoutConstant": 0,
+        }
+        native.values["WriteTotalTimeoutConstant"] = 7
+    assert native.serial.timeout == 0.002
+    assert native.values == {**native.original, "WriteTotalTimeoutConstant": 7}
+    assert native.serial.public_updates == []
+    assert native.serial.whole_port_reconfigurations == 0
+
+
+def test_nonblocking_read_restores_original_mode_after_read_error(native):
+    with (
+        pytest.raises(OSError, match="injected read failure"),
+        serial_timeouts.nonblocking_serial_read(native.serial),
+    ):
+        raise OSError("injected read failure")
+    assert native.values == native.original and native.serial.timeout == 0.002
+
+
+@pytest.mark.parametrize("operation", ["get", "set"])
+def test_nonblocking_read_setup_failure_never_enters_body_or_changes_cache(native, operation):
+    setattr(native, f"{operation}_ok", False)
+    with (
+        pytest.raises(OSError, match="before nonblocking"),
+        serial_timeouts.nonblocking_serial_read(native.serial),
+    ):
+        pytest.fail("read must not start after timeout setup failure")
+    assert native.serial.timeout == 0.002
+    assert native.serial.public_updates == []
+
+
+def test_nonblocking_restore_failure_does_not_claim_original_mode_was_restored(native):
+    with (
+        pytest.raises(OSError, match="restoring serial read"),
+        serial_timeouts.nonblocking_serial_read(native.serial),
+    ):
+        native.set_ok = False
+    assert native.serial.timeout == 0
+    assert native.values["ReadIntervalTimeout"] == 0xFFFFFFFF
+
+
+def test_nonblocking_read_and_restore_errors_are_both_preserved(native):
+    with pytest.raises(BaseExceptionGroup) as failure, serial_timeouts.nonblocking_serial_read(native.serial):
+        native.set_ok = False
+        raise OSError("read failed too")
+    assert len(failure.value.exceptions) == 2
+    assert "read failed too" in str(failure.value.exceptions[0])
+    assert "restoring serial read" in str(failure.value.exceptions[1])
+
+
+def test_non_native_nonblocking_read_restores_public_timeout():
+    port = SimpleNamespace(timeout=0.002, write_timeout=0.02)
+    with serial_timeouts.nonblocking_serial_read(port):
+        assert port.timeout == 0 and port.write_timeout == 0.02
+    assert port.timeout == 0.002
+
+
+def test_first_byte_mode_matches_official_windows_read_fields_and_preserves_write_limits(native):
+    serial_timeouts.configure_native_first_byte_read(native.serial)
+    assert native.values == {
+        **native.original,
+        "ReadIntervalTimeout": 0xFFFFFFFF,
+        "ReadTotalTimeoutMultiplier": 0xFFFFFFFF,
+        "ReadTotalTimeoutConstant": 2,
+    }
+    assert serial_timeouts.native_first_byte_read_ready(native.serial)
+    assert native.calls == ["GetCommTimeouts", "SetCommTimeouts"]
+    assert native.serial.timeout == 0.002 and native.serial.write_timeout == 0.02
+    assert native.serial.public_updates == [] and native.serial.whole_port_reconfigurations == 0
+    # Checking the owner-managed token itself adds no native administration call.
+    assert serial_timeouts.native_first_byte_read_ready(native.serial)
+    assert len(native.calls) == 2
+
+
+@pytest.mark.parametrize("operation", ["get", "set"])
+def test_first_byte_setup_failure_does_not_claim_mode_is_ready(native, operation):
+    setattr(native, f"{operation}_ok", False)
+    with pytest.raises(OSError, match="configuring first-byte"):
+        serial_timeouts.configure_native_first_byte_read(native.serial)
+    assert not serial_timeouts.native_first_byte_read_ready(native.serial)
+    assert native.serial.public_updates == [] and native.serial.timeout == 0.002
+
+
+def test_first_byte_mode_survives_bounded_positive_read_and_write_updates(native):
+    serial_timeouts.configure_native_first_byte_read(native.serial)
+    serial_timeouts.set_serial_timeout(native.serial, "write_timeout", 0.003)
+    serial_timeouts.set_serial_timeout(native.serial, "timeout", 0.001)
+    assert native.values["ReadIntervalTimeout"] == native.values["ReadTotalTimeoutMultiplier"] == 0xFFFFFFFF
+    assert native.values["ReadTotalTimeoutConstant"] == 1
+    assert native.values["WriteTotalTimeoutConstant"] == 3
+    assert serial_timeouts.native_first_byte_read_ready(native.serial)
+
+
+@pytest.mark.parametrize("name", ["timeout", "write_timeout"])
+def test_whole_port_timeout_transition_invalidates_first_byte_token(native, name):
+    serial_timeouts.configure_native_first_byte_read(native.serial)
+    serial_timeouts.set_serial_timeout(native.serial, name, 0)
+    assert not serial_timeouts.native_first_byte_read_ready(native.serial)
+
+
+def test_first_byte_token_cannot_be_reused_for_another_handle_or_closed_port(native):
+    serial_timeouts.configure_native_first_byte_read(native.serial)
+    native.serial._port_handle = 124
+    assert not serial_timeouts.native_first_byte_read_ready(native.serial)
+    native.serial._port_handle = 123
+    native.serial.is_open = False
+    assert not serial_timeouts.native_first_byte_read_ready(native.serial)
+
+
+def test_first_byte_mode_does_not_change_non_native_serial_semantics():
+    port = SimpleNamespace(timeout=0.002)
+    serial_timeouts.configure_native_first_byte_read(port)
+    assert not serial_timeouts.native_first_byte_read_ready(port)
+    assert vars(port) == {"timeout": 0.002}
+
+
+@pytest.mark.parametrize("timeout", [None, 0, -1, True, float("inf"), float("nan")])
+def test_first_byte_mode_requires_a_positive_bounded_native_read_timeout(native, timeout):
+    native.serial._timeout = timeout
+    with pytest.raises(ValueError, match="positive bounded"):
+        serial_timeouts.configure_native_first_byte_read(native.serial)
+    assert native.calls == []

@@ -165,11 +165,14 @@ def test_failed_submission_never_accepts_contact_or_human_release_reference():
     assert controller.phase == ControlPhase.FAULT and not controller.hybrid_active
 
 
-@pytest.mark.parametrize("event", ["freeze", "approach", "release"])
+@pytest.mark.parametrize("event", ["position", "approach", "release"])
 def test_manual_motion_exits_hybrid_and_invalidates_contact_reference(event):
     controller = hybrid()
     contact(controller)
-    getattr(controller, event)(2_000_000_000, 0.1)
+    if event == "position":
+        controller.move_to(2_000_000_000, 0.1, 0.1)
+    else:
+        getattr(controller, event)(2_000_000_000, 0.1)
     assert not controller.hybrid_active and controller.contact_reference is None
 
 
@@ -297,10 +300,10 @@ def test_runtime_rejects_missing_leader_before_hardware_start(rig, metadata):
     assert row["phase"] == "FAULT" and row["submitted_action"] == {}
 
 
-def test_runtime_requires_fresh_leader_after_explicit_freeze(rig):
+def test_runtime_requires_fresh_leader_after_explicit_position(rig):
     runtime = rig[0]
     activate(rig)
-    runtime.post("freeze", version=2, epoch=runtime.epoch)
+    runtime.post("position", version=2, epoch=runtime.epoch, value=0.1)
     row = tick(rig, leader=0.8)
     assert row["phase"] == "POSITION_HOLD" and row["hybrid_state"] is None
     for _ in range(11):

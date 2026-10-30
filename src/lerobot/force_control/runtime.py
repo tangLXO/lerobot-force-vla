@@ -87,6 +87,25 @@ class RuntimeConfig:
             positive("handover_tolerance_deg", self.handover_tolerance_deg)
 
 
+_MODE_COMMANDS = frozenset(
+    (
+        "arm",
+        "start",
+        "release",
+        "reset",
+        "disable",
+        "end_episode",
+        "discard",
+        "teleop",
+        "takeover",
+        "resume",
+        "approach",
+        "position",
+    )
+)
+_OWNER_COMMANDS = _MODE_COMMANDS | {"parameters", "target", "segment"}
+
+
 @dataclass(frozen=True)
 class OwnerCommand:
     """Latest intent with a lease in time and in the current ownership epoch."""
@@ -122,22 +141,7 @@ class LatestMailbox:
         with self._lock:
             if command.epoch != self._epoch or command.version <= self._version:
                 return False
-            if command.kind in (
-                "arm",
-                "start",
-                "release",
-                "reset",
-                "disable",
-                "end_episode",
-                "discard",
-                "teleop",
-                "takeover",
-                "freeze",
-                "resume",
-                "step",
-                "approach",
-                "position",
-            ):
+            if command.kind in _MODE_COMMANDS:
                 self._mode = command
                 self._value = None
             else:
@@ -239,6 +243,14 @@ class ForceRuntime:
         )
         self.config = config or RuntimeConfig()
         self.config.validate()
+        self._cached_feedback = (
+            getattr(getattr(device, "config", None), "command_feedback_mode", None) == "cached"
+        )
+        self._period_ns = round(1e9 / self.config.control_hz)
+        self._late_tick_streak = 0
+        self._active_decision_deadline_ns = None
+        if self._cached_feedback:
+            self.safety.config = replace(self.safety.config, decision_max_age_ms=2 * self._period_ns / 1e6)
         if hasattr(trace, "metadata"):
             trace.metadata["capture_annotation_schema"] = ANNOTATION_SCHEMA
         validate_profile(controller.config, safety.config, controller.close_sign)
@@ -357,6 +369,8 @@ class ForceRuntime:
 
     def post(self, kind, *, version, epoch, value=None):
         """Submit explicit arm/start/release/target/reset/segment intent from another context."""
+        if not isinstance(kind, str) or kind not in _OWNER_COMMANDS:
+            raise ValueError("Unsupported owner event")
         return self.mailbox.put(
             OwnerCommand(kind, version, epoch, self.clock(), int(self.config.command_ttl_ms * 1e6), value)
         )
@@ -377,6 +391,8 @@ class ForceRuntime:
         self.last_success_tick = self.last_send_start = None
         self._last_feedback_sequence = self._last_feedback_receive_ns = None
         self._joint_evidence.clear()
+        self._feedback_reuse_counts = {}
+        self._late_tick_streak = 0
 
     def _fault(self, reason):
         if self._fault_disposition is None:
@@ -396,6 +412,11 @@ class ForceRuntime:
 
     def _startup_guard(self):
         """Recheck force/stop throughout startup and active guarded transport I/O."""
+        if (
+            self._active_decision_deadline_ns is not None
+            and self.clock() >= self._active_decision_deadline_ns
+        ):
+            raise RuntimeError("frozen_decision_expired")
         if self._stop.is_set():
             raise RuntimeError(
                 "user_stop_during_startup" if self.controller.phase == ControlPhase.ARMED else "user_stop"
@@ -440,6 +461,11 @@ class ForceRuntime:
             self._stop.clear()
             self._fault_disposition = None
             self._invalidate_reference()
+            if self._cached_feedback:
+                self.device._latest_snapshot = None
+                session = getattr(self.device, "_full_validation_session", None)
+                if session is not None:
+                    session.pipeline.retire()
             self.mode = "TEACHER"
         elif command.kind == "teleop":
             if self.config.handover_tolerance_deg is None:
@@ -519,30 +545,12 @@ class ForceRuntime:
             self.last_sent = measured
             self.last_success_tick = self.last_send_start = None
             self.last_tick_start = self.clock()
-        elif command.kind == "freeze":
-            self.controller.freeze(now, measured)
-            self.safety.reset_motion_reference(preserve_budget=True)
-            self.last_success_tick = None
-            self.last_tick_start = self.clock()
         elif command.kind == "resume":
             self.controller.resume(now, measured, force_N=force.mean_N)
             self.safety.reset_motion_reference(preserve_budget=True)
             self.last_sent = measured
             self.last_success_tick = None
             self.last_tick_start = self.clock()
-        elif command.kind == "step":
-            tolerance = self.safety.config.stall_position_tolerance_deg
-            goal = self.controller.hold_target_deg
-            if (
-                goal is None
-                or tolerance is None
-                or self.last_sent is None
-                or abs(measured - goal) > tolerance
-                or abs(self.last_sent - goal) > tolerance
-            ):
-                raise RuntimeError("manual_step_requires_settled_hold")
-            self.controller.step(finite_number("step_deg", command.value))
-            self.last_success_tick = None
         elif command.kind in ("approach", "position"):
             if command.kind == "approach":
                 request = canonicalize_teacher_fields(command.value)
@@ -703,7 +711,7 @@ class ForceRuntime:
         self._leader_input_cache = (intent, intent.metadata_json, self.config.joint_names, dict(values))
         return values
 
-    def tick(self):
+    def tick(self, *, communication_only=False, io_error=None):
         """Read fresh joints, select force once, propose, limit, submit, then publish evidence."""
         self._assert_owner()
         self.event = None
@@ -714,7 +722,8 @@ class ForceRuntime:
             if self.last_tick_start is None
             else (start - self.last_tick_start) / 1e9
         )
-        self.last_tick_start = start
+        if not communication_only:
+            self.last_tick_start = start
         row = {
             "tick_id": self.tick_id,
             "run_uid": getattr(self.trace, "run_uid", "test"),
@@ -780,8 +789,22 @@ class ForceRuntime:
             "arm_filtered_keys": [],
             "arm_command_timestamp_ns": None,
             "arm_command_ttl_ns": None,
+            "communication_only": communication_only,
+            "intertick_receive_work_ns": getattr(self, "_intertick_receive_work_ns", 0),
+            "command_feedback_mode": "cached" if self._cached_feedback else "legacy",
+            "soft_deadline_ns": start + self._period_ns if self._cached_feedback else None,
+            "hard_deadline_ns": start + 2 * self._period_ns if self._cached_feedback else None,
+            "feedback_reused": {},
+            "feedback_reuse_counts": {},
+            "soft_deadline_miss": False,
+            "soft_deadline_streak": self._late_tick_streak,
         }
+        self._intertick_receive_work_ns = 0
         try:
+            if io_error is not None:
+                raise RuntimeError(io_error)
+            if communication_only:
+                return self._finish_tick(row, start, 1 / self.config.control_hz)
             reset_applied = False
             if self._stop.is_set():
                 self._fault("user_stop")
@@ -809,7 +832,11 @@ class ForceRuntime:
                 # no old reference, long operator pause or second mailbox event can command here.
                 pass
             else:
-                request_deadline = start + int(self.config.feedback_budget_ms * 1e6)
+                request_deadline = start + (
+                    2 * self._period_ns
+                    if self._cached_feedback
+                    else int(self.config.feedback_budget_ms * 1e6)
+                )
                 snapshot = self.device.read_joint_snapshot(
                     tuple(self.config.joint_names), deadline_ns=request_deadline
                 )
@@ -848,10 +875,14 @@ class ForceRuntime:
                 ):
                     raise RuntimeError("joint_feedback_deadline")
                 # A reused receive sequence is not new evidence even if a cache accessor reports now.
-                if self._last_feedback_sequence is not None and (
-                    feedback.receive_sequence is None
-                    or feedback.receive_sequence <= self._last_feedback_sequence
-                    or feedback.receive_timestamp_ns < self._last_feedback_receive_ns
+                if (
+                    not self._cached_feedback
+                    and self._last_feedback_sequence is not None
+                    and (
+                        feedback.receive_sequence is None
+                        or feedback.receive_sequence <= self._last_feedback_sequence
+                        or feedback.receive_timestamp_ns < self._last_feedback_receive_ns
+                    )
                 ):
                     raise RuntimeError("joint_feedback_not_updated")
                 self._last_feedback_sequence = feedback.receive_sequence
@@ -868,11 +899,30 @@ class ForceRuntime:
                     ):
                         raise RuntimeError(f"invalid_joint_receive_evidence:{joint.name}")
                     previous = self._joint_evidence.get(joint.name)
+                    identity = (
+                        joint.receive_timestamp_ns,
+                        joint.position_deg,
+                        joint.is_valid,
+                        joint.time_source,
+                        joint.error,
+                    )
                     if previous and (
-                        joint.receive_sequence <= previous[0] or joint.receive_timestamp_ns < previous[1]
+                        joint.receive_sequence < previous[0]
+                        or joint.receive_timestamp_ns < previous[1]
+                        or (joint.receive_sequence == previous[0] and identity != previous[1:])
+                        or (not self._cached_feedback and joint.receive_sequence == previous[0])
                     ):
                         raise RuntimeError(f"joint_feedback_not_updated:{joint.name}")
-                    self._joint_evidence[joint.name] = (joint.receive_sequence, joint.receive_timestamp_ns)
+                    row["feedback_reused"][joint.name] = bool(
+                        previous and joint.receive_sequence == previous[0]
+                    )
+                    counts = getattr(self, "_feedback_reuse_counts", {})
+                    counts[joint.name] = (
+                        counts.get(joint.name, 0) + 1 if row["feedback_reused"][joint.name] else 0
+                    )
+                    self._feedback_reuse_counts = counts
+                    row["feedback_reuse_counts"][joint.name] = counts[joint.name]
+                    self._joint_evidence[joint.name] = (joint.receive_sequence, *identity)
                 sample = self.sensor.read_latest_before(
                     anchor,
                     max_age_ms=self.safety.config.force_max_age_ms,
@@ -1010,7 +1060,11 @@ class ForceRuntime:
                 elif proposal.command_enabled:
                     if self._stop.is_set():
                         self._fault("user_stop_before_send")
-                    elif self.clock() - start >= self.config.tick_deadline_ms * 1e6:
+                    elif self.clock() >= (
+                        start + 2 * self._period_ns
+                        if self._cached_feedback
+                        else start + self.config.tick_deadline_ms * 1e6
+                    ):
                         self._fault("tick_deadline_before_send")
                     else:
                         self.trace.check_health()
@@ -1019,8 +1073,10 @@ class ForceRuntime:
                         age_check = self.safety.check_inputs(inputs, now_ns=self.clock())
                         if age_check is not None:
                             self._fault(age_check.fault_reason)
-                        elif (
-                            self._stop.is_set() or self.clock() - start >= self.config.tick_deadline_ms * 1e6
+                        elif self._stop.is_set() or self.clock() >= (
+                            start + 2 * self._period_ns
+                            if self._cached_feedback
+                            else start + self.config.tick_deadline_ms * 1e6
                         ):
                             self._fault("stop_or_tick_deadline_at_submission")
                         else:
@@ -1064,13 +1120,32 @@ class ForceRuntime:
                             ):
                                 raise RuntimeError("joint_feedback_expired_before_send")
                             row.update(send_status="unknown", send_start_ns=self.clock())
+                            send_deadline_ns = (
+                                min(
+                                    start + 2 * self._period_ns,
+                                    inputs.now_ns + int(self.safety.config.decision_max_age_ms * 1e6),
+                                    inputs.force.timestamp_ns
+                                    + int(self.safety.config.force_max_age_ms * 1e6),
+                                    min(j.receive_timestamp_ns for j in snapshot.joints)
+                                    + int(self.safety.config.joint_feedback_max_age_ms * 1e6),
+                                    intent.captured_ns + intent.ttl_ns
+                                    if intent is not None
+                                    else start + 2 * self._period_ns,
+                                )
+                                if self._cached_feedback
+                                else None
+                            )
+                            row["effective_send_deadline_ns"] = send_deadline_ns
+                            self._active_decision_deadline_ns = send_deadline_ns
                             if tuple(self.config.joint_names) == ("gripper",):
                                 receipt = self.device.send_gripper_position(
                                     decision.q_after_safety_deg, feedback_snapshot=snapshot
                                 )
                             else:
                                 receipt = self.device.send_joint_positions_partial(
-                                    goals, feedback_snapshot=snapshot
+                                    goals,
+                                    feedback_snapshot=snapshot,
+                                    **({"deadline_ns": send_deadline_ns} if self._cached_feedback else {}),
                                 )
                             row.update(
                                 send_start_ns=receipt.send_start_ns,
@@ -1094,6 +1169,16 @@ class ForceRuntime:
                                         row["clip_flags"].append(f"driver_clip:{item.name}")
                             result = receipt.get("gripper")
                             success = receipt.all_submitted and result.submitted_deg is not None
+                            control_success = success and getattr(self.device, "failure", None) is None
+                            if self._cached_feedback:
+                                control_success = control_success and self.clock() < send_deadline_ns
+                            control_success = control_success and dt <= self.safety.config.max_dt_s
+                            late_stop = (
+                                self._cached_feedback
+                                and success
+                                and self._late_tick_streak >= 2
+                                and self.clock() > start + self._period_ns
+                            )
                             if success:
                                 finite_number("submitted_deg", result.submitted_deg)
                             row.update(
@@ -1113,7 +1198,7 @@ class ForceRuntime:
                                 if self.last_send_start is None
                                 else (receipt.send_start_ns - self.last_send_start) / 1e9,
                             )
-                            if success:
+                            if control_success and not late_stop:
                                 row["u_label_deg_s"] = (
                                     self.controller.close_sign * (result.submitted_deg - q_prev) / dt
                                 )
@@ -1130,7 +1215,7 @@ class ForceRuntime:
                                     row["clip_flags"].append("driver_clip")
                                 self.last_sent, self.last_success_tick = result.submitted_deg, self.tick_id
                                 self.last_send_start = receipt.send_start_ns
-                            if self.mode != "TELEOP" and success:
+                            if self.mode != "TELEOP" and control_success and not late_stop:
                                 self.controller.commit(
                                     proposal,
                                     q_sent_deg=result.submitted_deg,
@@ -1147,11 +1232,26 @@ class ForceRuntime:
                                     row["mode_transition"] = True
                                     row["label_valid"] = False
                                     row["hybrid_transition"] = proposal.transition
-                            self.safety.commit(q_prev, result.submitted_deg, dt, software_success=success)
+                            self.safety.commit(
+                                q_prev,
+                                result.submitted_deg,
+                                dt,
+                                software_success=control_success and not late_stop,
+                            )
+                            if late_stop:
+                                row["soft_deadline_miss"] = True
+                                row["soft_deadline_streak"] = self._late_tick_streak + 1
+                                self._fault("consecutive_soft_deadline_misses")
+                            if getattr(self.device, "failure", None) is not None:
+                                self._fault(self.device.failure)
                             if not success:
                                 reason = getattr(self.device, "failure", None) or "send_failed_or_unknown"
                                 row["failure_reason"] = reason
                                 self._fault(reason)
+                            elif not control_success:
+                                self._fault(
+                                    getattr(self.device, "failure", None) or "tick_deadline_after_send"
+                                )
                 else:
                     self.controller.commit(proposal, software_success=False)
         except Exception as exc:
@@ -1159,14 +1259,33 @@ class ForceRuntime:
                 row["send_end_ns"] = self.clock()
             row["failure_reason"] = repr(exc)
             self._fault(str(exc))
+        finally:
+            self._active_decision_deadline_ns = None
         return self._finish_tick(row, start, dt)
 
     def _finish_tick(self, row, start, dt, *, startup=False):
         """Publish every transition and retain failed/disabled evidence."""
         elapsed = (self.clock() - start) / 1e9
+        if (
+            self._cached_feedback
+            and not startup
+            and not row.get("communication_only")
+            and row.get("send_status") == "submitted"
+            and self.controller.phase != ControlPhase.FAULT
+        ):
+            row["soft_deadline_miss"] = self.clock() > start + self._period_ns
+            self._late_tick_streak = self._late_tick_streak + 1 if row["soft_deadline_miss"] else 0
+            row["soft_deadline_streak"] = self._late_tick_streak
+            if self._late_tick_streak >= 3 and row.get("send_status") == "submitted":
+                self._fault("consecutive_soft_deadline_misses")
         row["loop_elapsed_s"] = elapsed
         row["deadline_miss"] = not startup and (
-            elapsed * 1000 > self.config.tick_deadline_ms or dt > self.safety.config.max_dt_s
+            (
+                elapsed * 1e9 > 2 * self._period_ns
+                if self._cached_feedback
+                else elapsed * 1000 > self.config.tick_deadline_ms
+            )
+            or dt > self.safety.config.max_dt_s
         )
         if row["deadline_miss"] and (
             self.controller.phase not in (ControlPhase.DISABLED, ControlPhase.FAULT) or self.mode == "TELEOP"
@@ -1193,7 +1312,7 @@ class ForceRuntime:
             gripper_follow_speed_deg_s=self.controller.config.gripper_follow_speed_deg_s,
             contact_force_threshold_N=self.controller.config.contact_force_threshold_N,
             control_reference_reset_ns=self.last_tick_start
-            if self.event in ("start", "freeze", "resume", "approach", "position")
+            if self.event in ("start", "resume", "approach", "position")
             else None,
             event_timestamp_ns=row["decision_anchor_ns"] if self.event else None,
             event_kind="reference_change"
@@ -1232,6 +1351,40 @@ class ForceRuntime:
         self.tick_id += 1
         return row
 
+    def wait_for_next_tick(self, deadline_ns, *, shutdown=None, on_service=None):
+        """Service RX and safety on the same owner during the absolute-period wait."""
+        self._assert_owner()
+        while self.clock() < deadline_ns and not (shutdown is not None and shutdown.is_set()):
+            started = self.clock()
+            try:
+                if self.controller.phase != ControlPhase.FAULT:
+                    service = getattr(self.device, "service_pending_io", None)
+                    if service is not None:
+                        service()
+            except Exception as exc:
+                self._intertick_receive_work_ns = (
+                    getattr(self, "_intertick_receive_work_ns", 0) + self.clock() - started
+                )
+                return self.tick(
+                    communication_only=True, io_error=f"intertick_io: {type(exc).__name__}: {exc}"
+                )
+            self._intertick_receive_work_ns = (
+                getattr(self, "_intertick_receive_work_ns", 0) + self.clock() - started
+            )
+            if on_service is not None:
+                on_service()
+            if self._stop.is_set():
+                return self.tick(communication_only=True, io_error="user_stop")
+            remaining = (deadline_ns - self.clock()) / 1e9
+            if remaining > 0:
+                interval = (
+                    0.0002
+                    if getattr(self.device, "command_feedback_pending", False)
+                    else self.config.scheduler_sleep_slice_ms / 1000
+                )
+                time.sleep(min(interval, remaining))
+        return None
+
     def run_for(self, duration_s, *, stop_on_disabled=False):
         """Use absolute deadlines and skip missed slots; never replay catch-up commands."""
         self._assert_owner()
@@ -1249,7 +1402,8 @@ class ForceRuntime:
             now = self.clock()
             if now >= deadline:
                 deadline += ((now - deadline) // period_ns + 1) * period_ns
-            self._stop.wait(max(0.0, (deadline - self.clock()) / 1e9))
+            if self.wait_for_next_tick(deadline) is not None:
+                break
         return self.latest_row
 
     def close(self):

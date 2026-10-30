@@ -14,6 +14,31 @@ from lerobot.force_control.telemetry import control_row_summary, startup_summary
 from lerobot.scripts import lerobot_force_teacher as common_runner
 
 
+class _StopFlag:
+    """Cross-process stop flag; reads do not acquire a Windows semaphore."""
+
+    def __init__(self, context):
+        self._value = context.RawValue("b", 0)
+
+    def set(self):
+        self._value.value = 1
+
+    def clear(self):
+        self._value.value = 0
+
+    def is_set(self):
+        return bool(self._value.value)
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            time.sleep(0.001 if remaining is None else min(0.001, remaining))
+        return True
+
+
 class ProcessLive:
     """Only the child owns runtime state; the parent publishes explicit requests."""
 
@@ -22,7 +47,7 @@ class ProcessLive:
             raise ValueError("IPC poll interval must be positive")
         context = mp.get_context("spawn")
         self.poll_s = poll_s
-        self.stop = context.Event()
+        self.stop = _StopFlag(context)
         self.parameters = context.Queue(maxsize=1)
         self.events = context.Queue(maxsize=1)
         self.recording_events = context.Queue(maxsize=1)
@@ -44,9 +69,7 @@ class ProcessLive:
         if kind not in (
             "parameters",
             "target",
-            "freeze",
             "resume",
-            "step",
             "approach",
             "position",
             "release_and_finish",

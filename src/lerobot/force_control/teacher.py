@@ -158,34 +158,16 @@ class ForceTeacher:
         finite_number("position_deg", position_deg)
         if position_speed_deg_s is not None:
             positive("position_speed_deg_s", position_speed_deg_s)
-        self.freeze(now_ns, q_measured_deg)
-        self._hold_target_deg = float(position_deg)
-        self._hold_speed_deg_s = position_speed_deg_s
-
-    def freeze(self, now_ns: int, q_measured_deg: float) -> None:
-        """Hold one fresh measured position while the owner continues hard checks."""
         if self.phase not in _ACTIVE_PHASES:
-            raise RuntimeError("freeze requires an active non-faulted controller")
+            raise RuntimeError("position requires an active non-faulted controller")
         self._validate_reference(now_ns, q_measured_deg)
         self._reset()
         self.phase = ControlPhase.POSITION_HOLD
-        self._hold_target_deg = float(q_measured_deg)
-
-    def step(self, delta_deg: float) -> None:
-        """Change the single hold goal; positive closing-coordinate steps close the gripper.
-
-        The owner validates step scope and completion before accepting another
-        event. Safety approaches this fixed goal at the configured rate.
-        """
-        if self.phase != ControlPhase.POSITION_HOLD:
-            raise RuntimeError("step requires POSITION_HOLD")
-        delta = finite_number("delta_deg", delta_deg)
-        goal = finite_number("hold_target_deg", self._hold_target_deg + self.close_sign * delta)
-        self._hold_target_deg = goal
-        self._revision += 1
+        self._hold_target_deg = float(position_deg)
+        self._hold_speed_deg_s = position_speed_deg_s
 
     def resume(self, now_ns: int, q_measured_deg: float, *, force_N: float | None = None) -> None:
-        """Resume from fresh inputs, with no integration of time spent frozen."""
+        """Resume from fresh inputs, with no integration during the position hold."""
         if self.phase != ControlPhase.POSITION_HOLD:
             raise RuntimeError("resume requires POSITION_HOLD")
         self._validate_reference(now_ns, q_measured_deg, force_N)

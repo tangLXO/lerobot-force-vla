@@ -699,6 +699,8 @@ def _validate_b601_io(metadata: dict, control: list[dict], errors: list[str]) ->
                 "query_rx",
                 "command_attempt",
                 "command_rx",
+                "pipelined_control_rx",
+                "cached_control_rx",
                 "pre_query_unattributed_rx",
                 "parameter_write_unattributed_rx",
                 "full_validation_stop_rx",
@@ -773,7 +775,22 @@ def _validate_rows(
         if type(anchor) is not int or anchor <= last_anchor:
             errors.append(prefix + "nonincreasing decision anchor")
         last_anchor = anchor
-        if previous_row is not None and "tick_start_ns" in row and "tick_start_ns" in previous_row:
+        communication_only = row.get("communication_only", False)
+        if communication_only and (
+            row.get("send_status") != "none"
+            or row.get("submitted_action")
+            or row.get("per_joint_results")
+            or row.get("feedback_valid")
+            or row.get("label_valid")
+            or row.get("action_label_valid")
+        ):
+            errors.append(prefix + "communication-only evidence cannot submit actions or control labels")
+        if (
+            not communication_only
+            and previous_row is not None
+            and "tick_start_ns" in row
+            and "tick_start_ns" in previous_row
+        ):
             base = previous_row.get("control_reference_reset_ns") or previous_row["tick_start_ns"]
             actual_dt = (row["tick_start_ns"] - base) / 1e9
             if not _finite(row["dt_control_s"]) or not math.isclose(
@@ -938,7 +955,8 @@ def _validate_rows(
         if submitted:
             last_success[boundary] = row
         previous_boundary = boundary
-        previous_row = row
+        if not communication_only:
+            previous_row = row
         if row["phase"] == "FAULT" or row["send_status"] in {"unknown", "not_attempted"}:
             fault_epoch = row["epoch"]
 
@@ -950,9 +968,10 @@ def _statistics(
     band_n: float | None = None,
     recovery_dwell_s: float | None = None,
 ) -> dict[str, Any]:
-    anchors = [row["decision_anchor_ns"] for row in control if type(row.get("decision_anchor_ns")) is int]
+    scheduled = [row for row in control if not row.get("communication_only", False)]
+    anchors = [row["decision_anchor_ns"] for row in scheduled if type(row.get("decision_anchor_ns")) is int]
     intervals = [(right - left) / 1e9 for left, right in zip(anchors, anchors[1:], strict=False)]
-    dt = [row["dt_control_s"] for row in control if _finite(row.get("dt_control_s"))]
+    dt = [row["dt_control_s"] for row in scheduled if _finite(row.get("dt_control_s"))]
     sends = [
         (row["send_end_ns"] - row["send_start_ns"]) / 1e6
         for row in control
@@ -981,7 +1000,8 @@ def _statistics(
     )
     raw_times = sorted(row["timestamp_ns"] for row in raw if row.get("is_valid"))
     return {
-        "control_tick_count": len(control),
+        "control_tick_count": len(scheduled),
+        "communication_row_count": len(control) - len(scheduled),
         "raw_attempt_count": len(raw),
         "label_valid_count": sum(row.get("label_valid") is True for row in control),
         "measured_control_hz": (len(anchors) - 1) * 1e9 / (anchors[-1] - anchors[0])

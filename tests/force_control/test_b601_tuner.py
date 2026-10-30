@@ -50,7 +50,6 @@ def stopped_panel(panel, calibration, settings, monkeypatch):
     app.recovery_evidence = None
     app.calibration, app.calibration_path = calibration, Path(calibration.path)
     app.config = object()
-    app.estimate = (1, 2, 3, 4)
     app.live = app.last_applied = app.last_startup = object()
     app.preview_latest = {"q_measured_deg": 3}
     app.last_anchor = 123
@@ -61,7 +60,7 @@ def stopped_panel(panel, calibration, settings, monkeypatch):
     app.fixed_widgets, app.other_widgets, app.optional_widgets = [], [], []
     app.settings_path = None
     app.profile_label, app.status, app.calibration_label = (_Variable("") for _ in range(3))
-    app.values_label, app.settings_label, app.calculation_label = (_Variable("") for _ in range(3))
+    app.values_label, app.settings_label = (_Variable("") for _ in range(2))
     app.timing_settings_label = _Variable("")
     app.last_stop = _Variable("startup mode 3 rejected; exit unconfirmed")
     app.last_stop_details = '{"errors": ["startup_mode_unsupported"], "transport_closed": true}'
@@ -106,7 +105,7 @@ def test_release_finish_uses_saved_limits_once_and_stop_stays_immediate(panel, s
     assert app.finishing and not app.live.stop.is_set()
     assert "0.5°" in app.status.get() and "0.2°/s" in app.status.get() and "3s" in app.status.get()
     app.release_and_finish()
-    app.command("freeze")
+    app.command("resume")
     panel.Tuner.apply(app)
     assert submitted == [("release_and_finish",)]
     app.stop()
@@ -415,7 +414,7 @@ def test_readonly_recovery_receipt_write_failure_keeps_exit_unconfirmed(panel, r
 
 def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel, calibration, tmp_path):
     values = panel.default_values()
-    values.update(soft_q_min_deg="draft lower bound", manual_step_deg="-0.03")
+    values.update(soft_q_min_deg="draft lower bound")
     enabled = {key: state for key, (_, state) in panel.OPTIONAL_GROUPS.items()}
     saved = panel.save_settings(tmp_path / "parameters.json", values, enabled, calibration.path)
     restored = panel.read_settings(saved)
@@ -423,7 +422,7 @@ def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel
     assert restored == (values, enabled, Path(calibration.path).resolve())
     document = json.loads(saved.read_text(encoding="utf-8"))
     assert document["format"] == "b601_ip_tuner_settings"
-    assert document["controller_type"] == "ip" and document["schema_version"] == 9
+    assert document["controller_type"] == "ip" and document["schema_version"] == 10
     assert document["values"]["kp_deg_per_N"] == ""
     assert (
         not {"reference", "executable", "confirmed", "exit_confirmed", "shutdown_evidence"} & document.keys()
@@ -433,6 +432,7 @@ def test_parameter_draft_round_trip_preserves_unfilled_and_disabled_values(panel
 def test_schema_v2_loads_without_guessing_motion_parameters(panel, calibration, settings, tmp_path):
     document = panel.settings_document(*settings, calibration.path)
     document["schema_version"] = 2
+    document["values"]["manual_step_deg"] = ""
     for key in panel.MOTION_FIELDS:
         document["values"].pop(key)
     path = tmp_path / "v2.json"
@@ -460,13 +460,16 @@ def test_motion_parameters_map_to_profile_and_do_not_activate_on_load(panel, cal
 def test_schema_v3_preserves_settings_without_guessing_position_speed(panel, calibration, settings, tmp_path):
     document = panel.settings_document(*settings, calibration.path)
     document["schema_version"] = 3
+    document["values"]["manual_step_deg"] = ""
     document["values"].pop("position_speed_deg_s")
     document["values"]["position_target_deg"] = "-10"
     path = tmp_path / "v3.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     original = path.read_bytes()
     values, enabled, _ = panel.read_settings(path)
-    assert values == {**document["values"], "position_speed_deg_s": ""}
+    expected = {**document["values"], "position_speed_deg_s": ""}
+    expected.pop("manual_step_deg")
+    assert values == expected
     assert path.read_bytes() == original
     values["position_speed_deg_s"] = "0.7"
     saved = panel.save_settings(tmp_path / "v5.json", values, enabled, calibration.path)
@@ -575,6 +578,7 @@ def test_relative_calibration_path_is_resolved_from_parameter_file(panel, calibr
 def legacy_settings_file(panel, calibration, settings, tmp_path):
     document = panel.settings_document(*settings, calibration.path)
     document["schema_version"] = 1
+    document["values"]["manual_step_deg"] = ""
     values = document["values"]
     for key in panel.MOTION_FIELDS:
         values.pop(key)
@@ -607,7 +611,7 @@ def test_legacy_kg_parameters_preserve_force_and_show_conversion(
     saved = tmp_path / "newtons.json"
     stopped_panel.save_parameters_file(saved)
     document = json.loads(saved.read_text(encoding="utf-8"))
-    assert document["schema_version"] == 9
+    assert document["schema_version"] == 10
     assert not {"target_kg", "target_min_kg", "target_max_kg"} & document["values"].keys()
     assert panel.read_settings(saved)[0] == values
     assert path.read_bytes() == original
@@ -671,7 +675,7 @@ def test_gui_parameter_load_is_data_only_and_preserves_unconfirmed_exit(
     assert stopped_panel.calibration.sha256 == calibration.sha256
     assert stopped_panel.calibration.minimum_deg == -40
     assert not stopped_panel.exit_confirmed
-    assert stopped_panel.config is stopped_panel.estimate is stopped_panel.preview_latest is None
+    assert stopped_panel.config is stopped_panel.preview_latest is None
     assert stopped_panel.live is stopped_panel.last_applied is stopped_panel.last_startup is None
     assert stopped_panel.last_anchor is None and stopped_panel.points == []
     assert not stopped_panel.confirmed.get() and not stopped_panel.other_unlocked.get()
@@ -840,14 +844,6 @@ def test_calibration_replacement_requires_reload(panel, calibration, settings, t
     Path(calibration.path).write_text('{"gripper": {}}')
     with pytest.raises(ValueError):
         panel.build_config(*settings, calibration, tmp_path)
-
-
-def test_estimator_is_pure_and_uses_position_output_gain_dimensions(panel):
-    result = panel.tuning_estimate(0, 0.2, 1, 3, 10, 10.5, 0.2, 0.1)
-    assert result == pytest.approx((10, 0.5, 0.04, 0.01))
-    for args in ((0, 0, 1, 3, 0, 1, 0.2, 0.1), (0, 1, 3, 1, 0, 1, 0.2, 0.1), (0, 1, 1, 3, 1, 1, 0.2, 0.1)):
-        with pytest.raises(ValueError):
-            panel.tuning_estimate(*args)
 
 
 def test_exit_report_preserves_uncertain_disable_and_raw_errors(panel, tmp_path):

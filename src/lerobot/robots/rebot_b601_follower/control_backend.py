@@ -25,7 +25,7 @@ from .control_protocol import (
     force_pos_wire_codes,
 )
 from .readonly_transport import B601ReadonlyJointSpec, ReadonlyB601Transport
-from .serial_timeouts import set_serial_timeout
+from .serial_timeouts import configure_native_first_byte_read, set_serial_timeout
 
 
 def require_b601_control_acceptance() -> None:
@@ -52,6 +52,8 @@ class B601ControlConfig:
     calibration_file: str | None = None
     watchdog_ticks: int = 2000
     parameter_write_settle_s: float = 0.01
+    command_feedback_mode: str = "sequential"
+    command_tx_gap_us: float = 120.0
 
     def validate(self) -> None:
         """Validate all targets before opening a bus or submitting any joint."""
@@ -64,6 +66,15 @@ class B601ControlConfig:
         ):
             raise ValueError("calibration_file must name an existing B601 calibration")
         encode_timeout_write(7, self.watchdog_ticks)
+        if self.command_feedback_mode not in ("sequential", "pipelined", "cached"):
+            raise ValueError("command_feedback_mode must be sequential, pipelined or cached")
+        if (
+            isinstance(self.command_tx_gap_us, bool)
+            or not isinstance(self.command_tx_gap_us, (int, float))
+            or not math.isfinite(self.command_tx_gap_us)
+            or self.command_tx_gap_us < 0
+        ):
+            raise ValueError("command_tx_gap_us must be finite and nonnegative")
         if (
             isinstance(self.parameter_write_settle_s, bool)
             or not isinstance(self.parameter_write_settle_s, (int, float))
@@ -121,6 +132,8 @@ class B601ControlBackend(ReadonlyB601Transport):
     ):
         """Validate disconnected state and allocate no SDK or serial resources."""
         config.validate()
+        if config.command_feedback_mode in ("pipelined", "cached") and operator_teleoperation is None:
+            raise ValueError("Pipelined communication requires the seven-axis operator scope")
         if sum(scope is not None for scope in (acceptance, validation, operator_teleoperation)) > 1:
             raise ValueError("Acceptance, validation and operator teleoperation scopes are exclusive")
         self._operator_teleoperation = operator_teleoperation
@@ -294,7 +307,34 @@ class B601ControlBackend(ReadonlyB601Transport):
             "hardware_ack": "unknown",
             "outstanding_query": copy.deepcopy(self._outstanding_query),
             "query_write_inflight": self._query_write_inflight,
+            "command_feedback_mode": self.config.command_feedback_mode,
+            "command_tx_gap_us": self.config.command_tx_gap_us,
+            "command_feedback_group": self._full_validation_session.pipeline.evidence()
+            if self._full_validation_session is not None
+            and self.config.command_feedback_mode in ("pipelined", "cached")
+            else copy.deepcopy(self._full_validation_session.sequential_feedback_group)
+            if self._full_validation_session is not None
+            else None,
+            "consumed_command_feedback_group": self._full_validation_session.pipeline.take_consumed_evidence()
+            if self._full_validation_session is not None
+            else None,
+            "retained_rx_hex": self._rx_pending.hex(),
+            "rx_poison": self._rx_poison,
         }
+
+    @property
+    def command_feedback_pending(self) -> bool:
+        """Read-only owner state for recording boundaries; never performs serial I/O."""
+        return self._full_validation_session is not None and self._full_validation_session.pipeline.pending
+
+    def service_pending_io(self) -> None:
+        """Run on the sole owner between ticks, including live safety guards."""
+        self._check_owner()
+        session = self._full_validation_session
+        if session is not None and session.ready and not session.cleaning and self._failure is None:
+            session.wait_guard()
+            if self.config.command_feedback_mode in ("pipelined", "cached"):
+                session.pipeline.poll()
 
     def _query_attempt(self, payload: bytes) -> None:
         self._audit_io("query_attempt", payload, time.perf_counter_ns())
@@ -500,6 +540,17 @@ class B601ControlBackend(ReadonlyB601Transport):
             session.open_binding()
         try:
             super().open()
+            if self.config.command_feedback_mode in ("pipelined", "cached"):
+                try:
+                    configure_native_first_byte_read(self._serial)
+                except BaseException as mode_error:
+                    try:
+                        super().close()
+                    except BaseException as close_error:
+                        raise BaseExceptionGroup(
+                            "First-byte read setup and transport close failed", [mode_error, close_error]
+                        ) from None
+                    raise
         except BaseException as error:
             if session is not None:
                 try:
@@ -662,13 +713,23 @@ class B601ControlBackend(ReadonlyB601Transport):
             raise RuntimeError("No bounded acceptance observation is available")
         return copy.deepcopy(self._acceptance_last_observation)
 
-    def _read_rx_chunk(self, context: dict, deadline_ns: int, receive) -> None:
+    def _read_rx_chunk(
+        self,
+        context: dict,
+        deadline_ns: int,
+        receive,
+        *,
+        available_only: bool = False,
+        available_bytes: int | None = None,
+    ) -> None:
         """Keep acceptance stop/input guards live during bounded query receives too."""
         if self._acceptance is not None and self._acceptance_live_guard is not None:
             self._acceptance_wait_guard(self._acceptance_live_guard)
         if self._full_validation_session is not None:
             self._full_validation_session.wait_guard()
-        super()._read_rx_chunk(context, deadline_ns, receive)
+        super()._read_rx_chunk(
+            context, deadline_ns, receive, available_only=available_only, available_bytes=available_bytes
+        )
 
     def _acceptance_read_all(self, deadline_ns: int, *, selected_status: int, cleanup: bool = False):
         """Require the selected state and six other disabled drives on the same owner."""
@@ -1399,6 +1460,16 @@ class B601ControlBackend(ReadonlyB601Transport):
         self._check_owner()
         if self._full_validation_session is not None:
             self._full_validation_session.wait_guard()
+            pipeline = self._full_validation_session.pipeline
+            if (
+                self.config.command_feedback_mode == "cached"
+                and self._motion_session
+                and self._full_validation_session.ready
+                and (pipeline.cached_rows or self._latest_snapshot is not None)
+            ):
+                return pipeline.consume_cached(tuple(names), deadline_ns)
+            if self.config.command_feedback_mode == "pipelined" and pipeline.cycle is not None:
+                return pipeline.consume(tuple(names), deadline_ns)
             cached = self._full_validation_session.take_operator_feedback(tuple(names), deadline_ns)
             if cached is not None:
                 return cached
@@ -1444,6 +1515,13 @@ class B601ControlBackend(ReadonlyB601Transport):
         if self._full_validation_session is not None and result.is_valid:
             self._full_validation_session.check_batch(batch, self._full_validation_session.enabled)
         self._latest_snapshot = result
+        if (
+            self._full_validation_session is not None
+            and self.config.command_feedback_mode == "cached"
+            and self._motion_session
+            and result.is_valid
+        ):
+            self._full_validation_session.pipeline.cached_rows = {row.name: row for row in result.joints}
         if self._full_validation_session is not None:
             self._full_validation_session.note_returned_feedback(result)
         return result
@@ -1545,14 +1623,20 @@ class B601ControlBackend(ReadonlyB601Transport):
         self._remaining(deadline_ns)
 
     def send_joint_positions_partial(
-        self, goals_deg: Mapping[str, float], *, feedback_snapshot: JointSnapshot
+        self,
+        goals_deg: Mapping[str, float],
+        *,
+        feedback_snapshot: JointSnapshot,
+        deadline_ns: int | None = None,
     ) -> SendReceipt:
         """Prevalidate every target, then report sequential, non-atomic submissions."""
         if self._full_validation_session is not None:
             self._check_owner()
             try:
                 self._require_motion()
-                return self._full_validation_session.send(dict(goals_deg), feedback_snapshot)
+                return self._full_validation_session.send(
+                    dict(goals_deg), feedback_snapshot, deadline_ns=deadline_ns
+                )
             except BaseException as exc:
                 if self._full_validation_session.start_attempted:
                     self._failure = (

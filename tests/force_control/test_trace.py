@@ -373,6 +373,74 @@ def test_actual_control_dt_is_verified_independently_of_send_dt(tmp_path):
     assert any("actual tick-start interval" in error for error in validate_trace(trace.root)["errors"])
 
 
+@pytest.mark.parametrize("bad_tail", [False, True])
+def test_communication_tail_preserves_control_clock_and_cannot_hide_actions(tmp_path, bad_tail):
+    tail = control_row(
+        1,
+        decision_anchor_ns=1_011_000_000,
+        tick_start_ns=1_010_000_000,
+        dt_control_s=0.01,
+        communication_only=True,
+        feedback_valid=False,
+        force_sequence=None,
+        send_status="none",
+        q_sent_deg=None,
+        send_start_ns=None,
+        send_end_ns=None,
+        label_valid=False,
+    )
+    if bad_tail:
+        tail["submitted_action"] = {"gripper.pos": 0.1}
+    rows = [
+        control_row(tick_start_ns=1_000_000_000),
+        tail,
+        control_row(1, tick_id=2, tick_start_ns=1_020_000_000),
+    ]
+    trace, _, _ = write_run(tmp_path, rows)
+    report = validate_trace(trace.root)
+    assert report["valid"] is not bad_tail, report["errors"]
+    assert report["statistics"]["control_tick_count"] == 2
+    assert report["statistics"]["communication_row_count"] == 1
+    assert report["statistics"]["measured_control_hz"] == pytest.approx(50)
+
+
+def test_pipelined_rx_kind_is_audited_with_the_same_sequence_rules():
+    from lerobot.force_control.trace import _validate_b601_io
+
+    stream = {
+        "complete": True,
+        "correlation": "host_rx_only_no_request_token",
+        "hardware_ack": "unknown",
+        "events": [],
+    }
+    metadata = {
+        "backend": "b601",
+        "shutdown_evidence": {
+            "transport_closed": True,
+            "fault_disposition": {
+                "status": "submitted",
+                "hardware_ack": "unknown",
+                "hardware_stop_confirmed": False,
+            },
+            "device_io_evidence": stream,
+        },
+    }
+    row = {
+        "device_io_evidence": {
+            **stream,
+            "events": [
+                {"sequence": 1, "timestamp_ns": 100, "kind": "pipelined_control_rx", "data_hex": "aa"}
+            ],
+        }
+    }
+    errors = []
+    _validate_b601_io(metadata, [row], errors)
+    assert not errors
+    row["device_io_evidence"]["events"][0]["sequence"] = 2
+    _validate_b601_io(metadata, [row], errors)
+    assert any("sequence/time" in error for error in errors)
+
+
 def test_reusing_an_old_segment_does_not_restore_a_predecessor(tmp_path):
     rows = [
         control_row(),

@@ -67,6 +67,7 @@ class OwnerService:
         self._reset_version = None
         self._submission_lock = threading.Lock()
         self._subscriptions: list[OwnerSubscription] = []
+        self._freeze_requests: list[OwnerSubscription] = []
 
     def subscribe(self, capacity: int = 128) -> OwnerSubscription:
         """Subscribe to future complete ticks without reading any hardware."""
@@ -81,6 +82,43 @@ class OwnerService:
             if subscription in self._subscriptions:
                 self._subscriptions.remove(subscription)
             subscription.closed = True
+
+    def freeze_subscription(self, subscription: OwnerSubscription, timeout_s=2.0) -> None:
+        """Freeze on the owner after its last submitted feedback group settles."""
+        deadline = time.monotonic() + timeout_s
+        with self._condition:
+            if subscription.closed:
+                return
+            if (
+                not self.is_running
+                and not self.has_resources
+                and self._error is None
+                and self._latest is not None
+                and self._latest.row.get("phase") == str(ControlPhase.DISABLED)
+                and not getattr(self.runtime.device, "command_feedback_pending", False)
+            ):
+                # Normal release has already settled RX and closed the owner.
+                self.unsubscribe(subscription)
+                return
+            self._freeze_requests.append(subscription)
+            while not subscription.closed:
+                if self._error is not None or not self.is_running:
+                    raise RuntimeError("Owner stopped before recording communication tail settled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Recording communication tail did not settle")
+                self._condition.wait(remaining)
+
+    def _settle_subscriptions(self):
+        with self._condition:
+            if not self._freeze_requests or getattr(self.runtime.device, "command_feedback_pending", False):
+                return
+            # Persist final between-tick RX even though it does not generate a main frame.
+            self._publish(self.runtime.tick(communication_only=True))
+            for subscription in self._freeze_requests:
+                self.unsubscribe(subscription)
+            self._freeze_requests.clear()
+            self._condition.notify_all()
 
     @property
     def is_running(self):
@@ -147,18 +185,18 @@ class OwnerService:
             period = round(1e9 / self.runtime.config.control_hz)
             deadline = time.perf_counter_ns()
             while not self._shutdown.is_set():
+                self._settle_subscriptions()
                 self._publish(self.runtime.tick())
                 deadline += period
                 now = time.perf_counter_ns()
                 if now >= deadline:
                     deadline += ((now - deadline) // period + 1) * period
-                # Windows Event.wait can round a 20 ms period to coarse timer ticks.
-                # time.sleep uses the high-resolution waitable timer; short pieces bound stop latency.
-                while not self._shutdown.is_set():
-                    remaining = (deadline - time.perf_counter_ns()) / 1e9
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(self.runtime.config.scheduler_sleep_slice_ms / 1000, remaining))
+                fault_row = self.runtime.wait_for_next_tick(
+                    deadline, shutdown=self._shutdown, on_service=self._settle_subscriptions
+                )
+                if fault_row is not None:
+                    self._publish(fault_row)
+                    self._settle_subscriptions()
             if (
                 self.runtime.controller.phase not in (ControlPhase.DISABLED, ControlPhase.FAULT)
                 or self.runtime.mode == "TELEOP"

@@ -202,7 +202,7 @@ def test_optional_soft_limits_do_not_expand_calibration_and_preserve_reverse_exi
     assert "soft_position" in decision.clip_flags
 
 
-def test_total_commanded_travel_clips_remainder_then_faults_and_preserves_budget_across_freeze():
+def test_total_commanded_travel_clips_remainder_then_faults_and_preserves_budget_across_mode_change():
     safety, inp, prop = make_case(max_total_travel_deg=0.15, acceleration_limit_deg_s2=None)
     first = safety.apply(inp, with_delta(prop, inp, 0.1))
     safety.commit(0, first.q_after_safety_deg, 0.02, True)
@@ -215,7 +215,7 @@ def test_total_commanded_travel_clips_remainder_then_faults_and_preserves_budget
     assert safety.apply(inp, with_delta(prop, inp, 0.1)).fault_reason == "travel_budget_exhausted"
 
 
-def test_runtime_budget_survives_freeze_and_resume_reference_resets():
+def test_runtime_budget_survives_position_and_resume_reference_resets():
     safety, inp, prop = make_case(max_run_time_s=0.2, acceleration_limit_deg_s2=None)
     decision = safety.apply(inp, prop)
     safety.commit(0, decision.q_after_safety_deg, 0.02, True)

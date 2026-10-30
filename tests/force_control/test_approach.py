@@ -218,7 +218,7 @@ def test_position_speed_uses_actual_dt_and_absolute_goal_without_overshoot(sign,
     assert final.q_candidate_deg == pytest.approx(target)
     submit(teacher, final)
     assert teacher.propose(inputs(0.2, q=target)).delta_raw_deg == 0
-    teacher.freeze(2_000_000_000, target)
+    teacher.move_to(2_000_000_000, target, target)
     assert teacher.hold_speed_deg_s is None
 
 

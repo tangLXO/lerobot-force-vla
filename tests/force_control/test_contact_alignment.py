@@ -103,7 +103,7 @@ def test_integral_blocking_retains_contact_correction_and_does_not_retire_it_ear
     assert decision.q_after_safety_deg == pytest.approx(0.7)
     teacher.commit(proposal, q_sent_deg=decision.q_after_safety_deg, software_success=True, i_blocked=True)
     assert teacher.contact_alignment_pending
-    teacher.freeze(2_000_000_000, 0.1)
+    teacher.move_to(2_000_000_000, 0.1, 0.1)
     assert not teacher.contact_alignment_pending
 
 
