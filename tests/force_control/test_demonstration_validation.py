@@ -4,10 +4,13 @@
 # ruff: noqa: E402
 
 import hashlib
+import importlib
 import json
 import os
+import time
 import uuid
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -242,6 +245,158 @@ def test_round_trip_is_readonly_and_manual_release_does_not_require_auto_release
     assert episode["capture_summary"]["normal_release_completed"] is False
 
 
+def test_fast_validation_keeps_other_checks_and_skips_video_decode(demonstration, monkeypatch):
+    root, uid, *_ = demonstration
+    before = _tree(root)
+
+    def unexpected_decode(*_args, **_kwargs):
+        pytest.fail("Fast validation must not decode video")
+
+    monkeypatch.setattr("lerobot.force_control.demonstration_validation._decode_video", unexpected_decode)
+    progress, timings = [], {}
+    report = validate_demonstration(root, uid, verify_video=False, progress=progress.append, timings=timings)
+    assert report["valid"], report["errors"]
+    assert report["episodes"][0]["video_decoded"] is False
+    assert progress == [{"event": "episode", "episode_uid": uid, "index": 1, "total": 1}]
+    assert timings.get("video_decode_seconds", 0) == 0
+    assert _tree(root) == before
+
+
+def test_full_validation_reports_video_progress_and_duration(demonstration):
+    root, uid, *_ = demonstration
+    progress, timings = [], {}
+    report = validate_demonstration(root, uid, progress=progress.append, timings=timings)
+    assert report["valid"], report["errors"]
+    assert [event["event"] for event in progress] == ["episode", "video"]
+    assert progress[1]["episode_uid"] == uid and "front" in progress[1]["video"]
+    assert timings["video_decode_seconds"] > 0
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_verification_child_checks_real_files_without_mutating_dataset(demonstration, monkeypatch, corrupt):
+    root, uid, *_ = demonstration
+    project = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(project / "examples/force_teacher"))
+    worker_type = importlib.import_module("b601_verification").VerificationWorker
+    if corrupt:
+        video = next((root / "videos").rglob("*.mp4"))
+        video.write_bytes(b"corrupt video")
+    before = _tree(root)
+    worker = worker_type(project, root)
+    events = []
+    try:
+        deadline = time.monotonic() + 30
+        while not worker.finished:
+            events.extend(worker.poll())
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        events.extend(worker.poll())
+        result = next(event["report"] for event in events if event["event"] == "result")
+        assert result["valid"] is not corrupt, result
+        assert worker.process.returncode == int(corrupt)
+        assert any(event["event"] == "episode" and event["episode_uid"] == uid for event in events)
+        assert _tree(root) == before
+    finally:
+        worker.close()
+
+
+def test_verification_child_cancel_reaps_process_without_dataset_writes(demonstration, monkeypatch):
+    root, *_ = demonstration
+    project = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(project / "examples/force_teacher"))
+    worker_type = importlib.import_module("b601_verification").VerificationWorker
+    before = _tree(root)
+    worker = worker_type(project, root)
+    worker.cancel()
+    assert worker.finished and worker.process.poll() is not None and not worker.thread.is_alive()
+    assert _tree(root) == before
+
+
+def test_cancel_after_windows_venv_child_starts_reaps_the_process_tree(monkeypatch, tmp_path):
+    psutil = pytest.importorskip("psutil")
+    project = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(project / "examples/force_teacher"))
+    worker_type = importlib.import_module("b601_verification").VerificationWorker
+    fake_project = tmp_path / "project"
+    script = fake_project / "examples/force_teacher/validate_demonstration.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(
+        'import time\nprint(\'{"event":"video","video":"front.mp4"}\', flush=True)\ntime.sleep(120)\n',
+        encoding="utf-8",
+    )
+    root = tmp_path / "dataset"
+    root.mkdir()
+    worker = worker_type(fake_project, root)
+    children = []
+    try:
+        deadline = time.monotonic() + 20
+        while not any(event.get("event") == "video" for event in worker.poll()):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        children = psutil.Process(worker.process.pid).children(recursive=True)
+        worker.cancel()
+        _, alive = psutil.wait_procs(children, timeout=3)
+        assert worker.finished and not alive
+    finally:
+        for process in children:
+            if process.is_running():
+                process.kill()
+        if worker.process.poll() is None:
+            worker.process.kill()
+            worker.process.wait(timeout=2)
+
+
+def test_desktop_session_runs_real_verification_child_and_persists_report(
+    demonstration, monkeypatch, tmp_path
+):
+    root, *_ = demonstration
+    project = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(project / "examples/force_teacher"))
+    session_type = importlib.import_module("b601_session").SessionController
+    controller = session_type(demo=True, output_root=tmp_path / "logs")
+    before = _tree(root)
+
+    def wait_for(predicate):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.01)
+        pytest.fail("Desktop verification did not finish")
+
+    def request(action, payload=None):
+        request_id = controller.request(action, payload)
+        return wait_for(
+            lambda: next(
+                (row for row in controller.snapshot().operation_results if row["request_id"] == request_id),
+                None,
+            )
+        )
+
+    controller.start()
+    try:
+        wait_for(lambda: controller.snapshot().state == "disconnected")
+        assert request("update_form", {"recording_values": {"root": str(root)}})["success"]
+        assert request("verify_dataset")["success"]
+        result = wait_for(
+            lambda: (
+                controller.snapshot().recording["full_verification"]
+                if controller.snapshot().recording["full_verification"]["state"] in {"passed", "failed"}
+                else None
+            )
+        )
+        assert result["state"] == "passed", dict(result)
+        report_path = Path(result["report_path"])
+        assert report_path.parent == root.parent / f"{root.name}_verification_reports"
+        assert json.loads(report_path.read_text(encoding="utf-8"))["result"]["valid"]
+        assert _tree(root) == before
+    finally:
+        controller.close()
+        controller._thread.join(5)
+        assert not controller._thread.is_alive()
+
+
 @pytest.mark.parametrize("task_result", ["success", "failure", "unknown"])
 def test_task_result_is_independent_of_file_validity(demonstration, task_result):
     root, uid, manifest, *_ = demonstration
@@ -346,6 +501,38 @@ def test_committed_main_cannot_hide_behind_an_incomplete_marker(demonstration, s
     _rewrite(demonstration)
     report = validate_demonstration(root)
     assert not report["valid"] and not report["excluded_episodes"]
+
+
+@pytest.mark.parametrize("registered", [None, "files", "main_artifacts", "main_evidence", "missing_field"])
+def test_quarantined_attempt_excluded_only_without_registered_save_evidence(demonstration, registered):
+    root, _uid, manifest, *_ = demonstration
+    failed_uid = str(uuid.uuid4())
+    failed = dict(manifest, episode_uid=failed_uid, complete=False, status="error")
+    _write_json(root / f"meta/teacher_episodes/{failed_uid}.json", failed)
+    journal = {
+        "journal_version": 1,
+        "episode_uid": failed_uid,
+        "state": "QUARANTINED",
+        "files": [],
+        "main_artifacts": [],
+        "main_evidence": None,
+    }
+    if registered in ("files", "main_artifacts"):
+        journal[registered] = [{"path": "registered-artifact"}]
+    elif registered == "main_evidence":
+        journal[registered] = {"registered": True}
+    elif registered == "missing_field":
+        del journal["files"]
+    _write_json(root / f"meta/sensor_transactions/{failed_uid}.json", journal)
+    before = _tree(root)
+    report = validate_demonstration(root)
+    if registered is None:
+        assert report["valid"], report["errors"]
+        assert report["excluded_episodes"][0]["transaction_state"] == "QUARANTINED"
+    else:
+        assert not report["valid"] and not report["excluded_episodes"]
+    assert not validate_demonstration(root, failed_uid)["valid"]
+    assert _tree(root) == before
 
 
 def test_whole_root_rejects_orphan_main_episode(demonstration):

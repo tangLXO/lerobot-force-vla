@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import queue
 import threading
@@ -50,6 +51,7 @@ JOINT_NAMES = (
 )
 EPISODE_SCHEMA = "teacher_capture_episode_v1"
 RESULTS = ("unknown", "success", "failure")
+logger = logging.getLogger(__name__)
 
 
 def _json_default(value: Any) -> Any:
@@ -99,6 +101,7 @@ class TeacherRecordConfig:
     resume: bool = False
     target_episode_count: int = 10
     h264_encoder: str = "nvenc"
+    verify_video_on_save: bool = False
 
     def video_encoder(self) -> RGBEncoderConfig:
         """Select one explicit encoder; unavailable NVENC never silently falls back."""
@@ -127,6 +130,8 @@ class TeacherRecordConfig:
             raise ValueError("camera_max_age_ms must be finite and positive")
         if not isinstance(self.resume, bool):
             raise ValueError("recording.resume must be boolean")
+        if not isinstance(self.verify_video_on_save, bool):
+            raise ValueError("recording.verify_video_on_save must be boolean")
         self.camera_objects()
 
     def camera_objects(self) -> dict[str, OpenCVCameraConfig]:
@@ -203,7 +208,18 @@ class CausalCameraBuffer:
                     and anchor_ns - frame.timestamp_ns <= max_age_ms * 1e6
                 ):
                     return frame
-        raise TimeoutError("No fresh causal camera frame for the completed owner tick")
+            latest = self._frames[-1] if self._frames else None
+            diagnostics = {
+                "anchor_ns": anchor_ns,
+                "max_age_ms": max_age_ms,
+                "buffered_frames": len(self._frames),
+                "total_published": self.count,
+                "oldest_timestamp_ns": self._frames[0].timestamp_ns if self._frames else None,
+                "latest_timestamp_ns": latest.timestamp_ns if latest else None,
+                "latest_arrival_ns": latest.arrival_timestamp_ns if latest else None,
+                "latest_age_ms": (anchor_ns - latest.timestamp_ns) / 1e6 if latest else None,
+            }
+        raise TimeoutError("No fresh causal camera frame for the completed owner tick; " + _json(diagnostics))
 
     def latest(self) -> CameraFrame | None:
         """Return the latest frame for preview, separate from causal selection."""
@@ -327,7 +343,7 @@ def completed_tick_frame(
         or len(row.get("per_joint_results", [])) != 7
     ):
         raise ValueError("Complete seven-joint observed state and submission receipts are required")
-    state, action = [], []
+    state, action, action_pre_safety = [], [], []
     for name in JOINT_NAMES:
         joint = observed[name]
         receipt = receipts[name]
@@ -340,6 +356,15 @@ def completed_tick_frame(
             raise ValueError(f"Incomplete or stale joint evidence: {name}")
         state.append(float(joint.position_deg))
         action.append(float(receipt["submitted_deg"]))
+        candidate = row.get("q_candidate_deg") if name == "gripper" else receipt.get("candidate_deg")
+        if (
+            isinstance(candidate, bool)
+            or not isinstance(candidate, (int, float))
+            or not math.isfinite(candidate)
+            or abs(candidate) > float(np.finfo(np.float32).max)
+        ):
+            raise ValueError(f"Missing or nonfinite pre-safety target: {name}")
+        action_pre_safety.append(float(candidate))
     if not all(
         math.isfinite(value) for value in [*state, *action, row["force_left_N"], row["force_right_N"]]
     ):
@@ -352,12 +377,19 @@ def completed_tick_frame(
         "observation.state": np.asarray(state, dtype=np.float32),
         "observation.tactile": np.asarray(tactile, dtype=np.float32),
         "action": np.asarray(action, dtype=np.float32),
+        "teacher.action_pre_safety": np.asarray(action_pre_safety, dtype=np.float32),
         "observation.force_target": np.asarray([target], dtype=np.float32),
         "task": config.task,
     }
     camera_metadata = {}
     for name, buffer in cameras.items():
-        selected = buffer.select(anchor, config.camera_max_age_ms)
+        try:
+            selected = buffer.select(anchor, config.camera_max_age_ms)
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"Camera {name!r}, tick_id={row['tick_id']}, frame_index={frame_index}, "
+                f"consume_lag_ms={(time.perf_counter_ns() - anchor) / 1e6:.3f}: {exc}"
+            ) from exc
         frame[f"observation.images.{name}"] = selected.image
         camera_metadata[name] = {
             "timestamp_ns": selected.timestamp_ns,
@@ -385,6 +417,7 @@ def completed_tick_frame(
         "epoch": snapshot.epoch,
         "state_deg": state,
         "action_deg": action,
+        "action_pre_safety_deg": action_pre_safety,
         "tactile_N": tactile,
         "force_target_N": target,
         "teacher_phase": row["phase"],
@@ -395,6 +428,12 @@ def completed_tick_frame(
         "cameras": camera_metadata,
         "send_start_ns": row["send_start_ns"],
         "send_end_ns": row["send_end_ns"],
+        "feedback_reused": row.get("feedback_reused", {}),
+        "feedback_reuse_counts": row.get("feedback_reuse_counts", {}),
+        "joint_feedback": [asdict(joint) for joint in snapshot.joint_snapshot.joints],
+        "soft_deadline_miss": row.get("soft_deadline_miss", False),
+        "soft_deadline_streak": row.get("soft_deadline_streak", 0),
+        "effective_send_deadline_ns": row.get("effective_send_deadline_ns"),
     }
     return frame, capture, evidence
 
@@ -416,9 +455,12 @@ class DemonstrationController:
         """Start an idle worker without touching robot, Sensor or camera transports."""
         self.owner, self.sensor, self.force_instance = owner, sensor, force_instance
         self.provenance = copy.deepcopy(provenance or {})
-        from .capture_contract import capture_source
+        from .capture_contract import capture_source, communication_policy
 
         self.provenance["source"] = capture_source()
+        policy = communication_policy(owner.runtime)
+        if policy is not None:
+            self.provenance["communication_policy"] = policy
         self._camera_factory = camera_factory
         self._dataset_factory = dataset_factory
         self._recorder_factory = recorder_factory
@@ -459,6 +501,7 @@ class DemonstrationController:
         self._maximum_interval_ns = 0
         self._started_utc: str | None = None
         self._save_evidence: dict = {}
+        self._video_verification = "not_run"
         self._thread = threading.Thread(target=self._run, name="teacher-demonstrations", daemon=False)
         self._thread.start()
 
@@ -571,6 +614,9 @@ class DemonstrationController:
                                 break
                             self._consume(snapshot)
                 except Exception as exc:
+                    logger.exception("Teacher recording failed before cleanup")
+                    # Publish before cleanup can abort Raw and race the IPC reader.
+                    self._update(state="error", active=False, error=f"{type(exc).__name__}: {exc}")
                     if self._uid is not None:
                         try:
                             self._abort(str(exc), status="error")
@@ -641,6 +687,11 @@ class DemonstrationController:
                 "names": [f"{n}.pos" for n in JOINT_NAMES],
             },
             "action": {"dtype": "float32", "shape": (7,), "names": [f"{n}.pos" for n in JOINT_NAMES]},
+            "teacher.action_pre_safety": {
+                "dtype": "float32",
+                "shape": (7,),
+                "names": [f"{n}.pos" for n in JOINT_NAMES],
+            },
             "observation.force_target": {"dtype": "float32", "shape": (1,), "names": ["mean_normal_force"]},
             "observation.tactile": {
                 "dtype": "float32",
@@ -737,7 +788,10 @@ class DemonstrationController:
                 )
                 from .capture_contract import capture_contract
 
-                _atomic_json(root / "meta/teacher_capture.json", capture_contract())
+                _atomic_json(
+                    root / "meta/teacher_capture.json",
+                    capture_contract(self.provenance.get("communication_policy")),
+                )
             recorder_factory = self._recorder_factory or SensorStreamRecorder
             recorder = recorder_factory(root, {self.force_instance: self.sensor})
             self._dataset = dataset
@@ -791,10 +845,23 @@ class DemonstrationController:
         from .capture_contract import capture_contract
 
         contract_path = root / "meta/teacher_capture.json"
-        if (
-            not contract_path.is_file()
-            or json.loads(contract_path.read_text(encoding="utf-8")) != capture_contract()
-        ):
+        stored = json.loads(contract_path.read_text(encoding="utf-8")) if contract_path.is_file() else None
+        policy = self.provenance.get("communication_policy")
+        expected = capture_contract(policy)
+        # Unmarked historical roots retain their original semantics. They can
+        # never be appended using the new cache/reuse/two-period rules.
+        legacy = stored == capture_contract() and policy is not None and policy["mode"] == "sequential"
+        if stored != expected and not legacy:
+            stored_policy = stored.get("communication_policy", {}) if isinstance(stored, dict) else {}
+            old_gap = stored_policy.get("command_tx_gap_us")
+            new_gap = (policy or {}).get("command_tx_gap_us")
+            if old_gap is not None and new_gap is not None and old_gap != new_gap:
+                raise ValueError(
+                    f"Resume requires this capture version: command_tx_gap_us differs "
+                    f"(existing {old_gap:g} us, requested {new_gap:g} us). "
+                    f"Choose a new root, or explicitly use --command-tx-gap-us {old_gap:g} "
+                    "to resume with the original interval; all other policy checks still apply."
+                )
             raise ValueError("Resume requires this capture version; choose a new root for historical data")
         manifests = list((root / "meta/teacher_episodes").glob("*.json"))
         complete_indices = set()
@@ -813,7 +880,7 @@ class DemonstrationController:
 
         for path in manifests:
             if json.loads(path.read_text(encoding="utf-8")).get("complete"):
-                report = validate_demonstration(root, path.stem)
+                report = validate_demonstration(root, path.stem, verify_video=False)
                 if not report["valid"]:
                     raise ValueError(
                         "Existing Teacher episode failed read-only verification: "
@@ -852,6 +919,7 @@ class DemonstrationController:
         self._started_utc = datetime.now(UTC).isoformat()
         self._timing_misses = self._maximum_interval_ns = 0
         self._save_evidence = {}
+        self._video_verification = "not_run"
         self._camera_start_counts = {name: buffer.count for name, buffer in self._cameras.buffers.items()}
         directory = Path(config.root).resolve() / "teacher" / self._uid
         directory.mkdir(parents=True, exist_ok=False)
@@ -870,6 +938,8 @@ class DemonstrationController:
             active=True,
             episode_uid=self._uid,
             frame_count=0,
+            video_verification="not_run",
+            save_timings=None,
             error=None,
             file_complete=False,
             task_result="unknown",
@@ -879,20 +949,21 @@ class DemonstrationController:
 
     def _consume(self, snapshot: OwnerSnapshot) -> None:
         row = snapshot.row
+        # Keep the fault itself even when it changes the ownership epoch.
+        self._control_file.write(_json(row) + "\n")
+        self._control_count += 1
         if self._last_tick_id is not None and row["tick_id"] != self._last_tick_id + 1:
             raise RuntimeError("Control tick gap in Teacher demonstration")
         if self._epoch is not None and snapshot.epoch != self._epoch:
             raise RuntimeError("Owner epoch changed during demonstration")
         self._epoch = snapshot.epoch
         self._last_tick_id = row["tick_id"]
-        self._control_file.write(_json(row) + "\n")
-        self._control_count += 1
         self._stages[row.get("capture_stage", "unknown")] += 1
         self._force_labels += row.get("label_valid") is True
         self._action_labels += row.get("action_label_valid") is True
         self._normal_release |= row.get("phase_at_tick_start") == "RELEASE" and row.get("phase") == "DISABLED"
         anchor = row.get("decision_anchor_ns")
-        if isinstance(anchor, int):
+        if isinstance(anchor, int) and not row.get("communication_only", False):
             self._first_control = anchor if self._first_control is None else self._first_control
             if self._last_control is not None:
                 interval = anchor - self._last_control
@@ -927,7 +998,8 @@ class DemonstrationController:
         if self._subscription is None:
             raise RuntimeError("No active demonstration")
         subscription, self._subscription = self._subscription, None
-        self.owner.unsubscribe(subscription)
+        freeze = getattr(self.owner, "freeze_subscription", self.owner.unsubscribe)
+        freeze(subscription)
         subscription.check_health()
         while True:
             try:
@@ -955,7 +1027,10 @@ class DemonstrationController:
             raise RuntimeError("No demonstration is recording")
         self._update(state="saving")
         self._save_evidence = {"started_ns": time.perf_counter_ns(), "start_owner": self._owner_save_state()}
+        stage_start = time.perf_counter_ns()
         self._freeze_and_drain()
+        drain_seconds = (time.perf_counter_ns() - stage_start) / 1e9
+        logger.info("Teacher save drain: %.3f s", drain_seconds)
         if self._frame_count == 0:
             raise RuntimeError("Cannot save an empty demonstration")
         self._task_result = task_result
@@ -963,34 +1038,68 @@ class DemonstrationController:
         self._write_manifest(complete=False, status="saving")
         if self._save_cancelled():
             raise RuntimeError("Session stopped before episode commit")
+        stage_start = time.perf_counter_ns()
         self._recorder.prepare_episode(task_info=[self._config.task])
         self._recorder.commit_prepared(self._dataset)
+        transaction_seconds = (time.perf_counter_ns() - stage_start) / 1e9
+        logger.info("Teacher save transaction: %.3f s", transaction_seconds)
         if self._save_cancelled():
             raise RuntimeError("Session stopped during episode commit; Teacher completion withheld")
         self._write_manifest(complete=False, status="verifying")
-        # The independent reader performs full video/Raw/Sync/action checks. Release
+        # The independent reader checks Raw/Sync/action and optionally decodes video. Release
         # the live writer lock only while no Sensor episode is active, then reopen it.
         self._recorder.close()
         self._recorder = None
         from .demonstration_validation import validate_demonstration
 
         # Validate a candidate complete marker, but never expose it until it passes.
-        report = validate_demonstration(Path(self._config.root), self._uid, require_complete=False)
+        timings: dict[str, float] = {}
+        stage_start = time.perf_counter_ns()
+        report = validate_demonstration(
+            Path(self._config.root),
+            self._uid,
+            require_complete=False,
+            verify_video=self._config.verify_video_on_save,
+            timings=timings,
+        )
+        validation_seconds = (time.perf_counter_ns() - stage_start) / 1e9
+        video_seconds = timings.get("video_decode_seconds", 0.0)
+        non_video_seconds = max(0.0, validation_seconds - video_seconds)
+        logger.info(
+            "Teacher save verification: non-video=%.3f s, video-decode=%.3f s",
+            non_video_seconds,
+            video_seconds,
+        )
         if not report["valid"]:
             self._write_manifest(complete=False, status="error", error="; ".join(report["errors"]))
             raise RuntimeError("Saved demonstration verification failed: " + "; ".join(report["errors"]))
         if self._save_cancelled():
             raise RuntimeError("Session stopped during verification; Teacher completion withheld")
+        self._video_verification = "passed" if self._config.verify_video_on_save else "not_run"
         self._save_evidence.update(completed_ns=time.perf_counter_ns(), end_owner=self._owner_save_state())
+        logger.info(
+            "Teacher save total: %.3f s",
+            (self._save_evidence["completed_ns"] - self._save_evidence["started_ns"]) / 1e9,
+        )
         self._write_manifest(complete=True, status="complete")
         self._recorder = (self._recorder_factory or SensorStreamRecorder)(
             self._dataset.root, {self.force_instance: self.sensor}
         )
+        self._prepare_next_capture()
+        save_timings = {
+            "drain_seconds": drain_seconds,
+            "transaction_seconds": transaction_seconds,
+            "non_video_seconds": non_video_seconds,
+            "video_decode_seconds": video_seconds,
+            "total_seconds": (time.perf_counter_ns() - self._save_evidence["started_ns"]) / 1e9,
+        }
         status = self.status()
         self._update(
             state="saved",
             active=False,
             file_complete=True,
+            video_verification=self._video_verification,
+            save_timings=save_timings,
             episode_count=self._dataset.meta.total_episodes,
             successful_episode_count=status["successful_episode_count"] + (task_result == "success"),
             task_result=task_result,
@@ -999,6 +1108,9 @@ class DemonstrationController:
             error=None,
         )
         self._uid = None
+
+    def _prepare_next_capture(self) -> None:
+        """Optional isolated-writer preparation before publishing the saved state."""
 
     def _save_cancelled(self) -> bool:
         """The producer can withhold completion while the recorder drains its inputs."""
@@ -1059,6 +1171,7 @@ class DemonstrationController:
             "episode_index": self._episode_index,
             "frame_count": self._frame_count,
             "complete": complete,
+            "video_verification": self._video_verification,
             "status": status,
             "task_result": self._task_result,
             "joint_names": list(JOINT_NAMES),
@@ -1102,6 +1215,12 @@ class DemonstrationController:
     def _abort(self, reason: str, *, status: str) -> None:
         if self._uid is None:
             raise RuntimeError("No demonstration is active")
+        if self._cleanup_pending:
+            previous = self.status()
+            if previous.get("error"):
+                # Retried shutdown must not replace the initiating recording error.
+                reason = previous["error"]
+                status = previous["state"]
         failures = []
         if self._subscription is not None:
             subscription, self._subscription = self._subscription, None

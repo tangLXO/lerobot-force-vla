@@ -15,7 +15,7 @@ from lerobot.datasets.sensor_hub import METADATA_DOWNLOAD_PATTERNS, ensure_senso
 from lerobot.datasets.sensor_transaction import SensorTransactionError, sha256_file
 
 
-@pytest.fixture
+@pytest.fixture(params=[1, 2])
 def teacher_dataset(request):
     dataset = request.getfixturevalue("recorded_dataset")
     root = dataset.root
@@ -24,7 +24,12 @@ def teacher_dataset(request):
     info["robot_type"] = "rebot_b601_teacher"
     info_path.write_text(json.dumps(info), encoding="utf-8")
     (root / "meta/teacher_capture.json").write_text(
-        json.dumps({"schema": "teacher_capture_contract_v1", "episode_schema": "teacher_capture_episode_v1"}),
+        json.dumps(
+            {
+                "schema": f"teacher_capture_contract_v{request.param}",
+                "episode_schema": "teacher_capture_episode_v1",
+            }
+        ),
         encoding="utf-8",
     )
     for index in range(3):

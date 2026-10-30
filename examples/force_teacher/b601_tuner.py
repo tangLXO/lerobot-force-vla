@@ -62,6 +62,15 @@ DEFAULT_SETTINGS = Path(__file__).resolve().parents[2] / "b601_capture_parameter
 _UNSTOPPED_PREVIEWS = []
 
 
+def command_feedback_override(config, requested_mode, command_tx_gap_us):
+    """Keep standalone gripper starts on their supported sequential transport."""
+    if requested_mode is None:
+        return None
+    if tuple(config.runtime.joint_names) == ("gripper",) and requested_mode in ("cached", "pipelined"):
+        requested_mode = "sequential"
+    return {"command_feedback_mode": requested_mode, "command_tx_gap_us": command_tx_gap_us}
+
+
 def full_arm_result(result):
     config = result.get("config")
     runtime = config.get("runtime") if isinstance(config, dict) else None
@@ -467,8 +476,24 @@ def communication_budget_notice(values):
     return ""
 
 
-def timing_settings_description(values, config=None, *, startup_complete=False, running=False):
+def timing_settings_description(
+    values, config=None, *, startup_complete=False, running=False, command_feedback_mode=None
+):
     """Keep editable requests distinct from the reviewed owner configuration."""
+    mode = getattr(
+        getattr(getattr(config, "b601", None), "control", None),
+        "command_feedback_mode",
+        command_feedback_mode,
+    )
+    if mode == "cached":
+        hz = config.runtime.control_hz if config is not None else float(values["control_hz"])
+        period_ms = round(1e9 / hz) / 1e6
+        state = "本次 owner 运行生效" if startup_complete and running else "待启动或已结束，当前未生效"
+        return (
+            f"缓存模式：正常目标 {period_ms:g} ms / 整拍硬截止 {2 * period_ms:g} ms；"
+            f"连续 3 拍超期停止，决策最多存活 {2 * period_ms:g} ms\n"
+            f"{state}；反馈、力和主臂沿用各自时效上限"
+        )
     requested = (
         f"请求查询 / 周期工作 / 发送预算：{parameter_number_text(values.get('feedback_budget_ms'))} / "
         f"{parameter_number_text(values.get('tick_deadline_ms'))} / "
@@ -669,7 +694,18 @@ def monitor(stop, publish, v, calibration, cleanup_publish=None):
 class Tuner:
     """Tk renders snapshots; a spawned common runtime executes every motion."""
 
-    def __init__(self, root, *, calibration_path=None, settings_path=None, default_full_arm_mit=False):
+    def __init__(
+        self,
+        root,
+        *,
+        calibration_path=None,
+        settings_path=None,
+        default_full_arm_mit=False,
+        command_feedback_mode=None,
+        command_tx_gap_us=120.0,
+    ):
+        self.command_feedback_mode = command_feedback_mode
+        self.command_tx_gap_us = command_tx_gap_us
         self.default_full_arm_mit = default_full_arm_mit
         self.default_mit_profile_file = None
         self.root, self.worker = root, None
@@ -708,7 +744,9 @@ class Tuner:
         self.points, self.fixed_widgets, self.optional_widgets = deque(), [], []
         self.other_widgets = []
         self.fields, self.toggles = {}, {}
-        root.title("B601 · 50 Hz 采集版 · MIT 六臂 + FORCE_POS / I-P 夹爪")
+        root.title(
+            f"B601 · 50 Hz 采集版 · MIT 六臂 + FORCE_POS / I-P 夹爪 · {command_feedback_mode or '配置模式'}"
+        )
         root.geometry("1320x920")
         root.minsize(1000, 740)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -1114,6 +1152,7 @@ class Tuner:
                 startup_complete=isinstance(self.last_startup, dict)
                 and self.last_startup.get("complete") is True,
                 running=self.running,
+                command_feedback_mode=getattr(self, "command_feedback_mode", None),
             )
         )
 
@@ -1750,6 +1789,22 @@ class Tuner:
                     initial_position_deg=position_deg,
                     initial_position_speed_deg_s=position_speed_deg_s,
                 )
+            feedback_override = command_feedback_override(
+                config,
+                getattr(self, "command_feedback_mode", None),
+                getattr(self, "command_tx_gap_us", 0),
+            )
+            if feedback_override is not None:
+                config = replace(
+                    config,
+                    b601=replace(
+                        config.b601,
+                        control=replace(
+                            config.b601.control,
+                            **feedback_override,
+                        ),
+                    ),
+                )
             config.validate()
             validation_notice = full_arm_profile_text(config)
             folder.mkdir(parents=True, exist_ok=False)
@@ -1766,6 +1821,7 @@ class Tuner:
                 "exit_recovery": self.recovery_evidence,
                 "executable": True,
                 "consumed": False,
+                "command_feedback_override": feedback_override,
                 **session_options,
             }
             path.write_text(json.dumps(draft, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2340,6 +2396,17 @@ def main(argv=None):
         "--recording-config", type=Path, help="Prefill the recording form only; does not connect or enable"
     )
     parser.add_argument("--gripper-only", action="store_true", help="Use the standalone gripper entry")
+    parser.add_argument(
+        "--command-feedback-mode",
+        choices=("sequential", "pipelined", "cached"),
+        help="Startup-only seven-axis communication mode; default remains sequential",
+    )
+    parser.add_argument(
+        "--command-tx-gap-us",
+        type=float,
+        default=120.0,
+        help="Minimum pipelined write-start interval in microseconds",
+    )
     args = parser.parse_args(argv)
     window = tk.Tk()
     app = Tuner(
@@ -2347,6 +2414,8 @@ def main(argv=None):
         calibration_path=args.calibration_file,
         settings_path=args.settings_file,
         default_full_arm_mit=not args.gripper_only,
+        command_feedback_mode=args.command_feedback_mode,
+        command_tx_gap_us=args.command_tx_gap_us,
     )
     if args.recording_config is not None:
         document = json.loads(args.recording_config.read_text(encoding="utf-8"))
@@ -2361,6 +2430,7 @@ def main(argv=None):
             "1.0", json.dumps(document["camera_configs"], ensure_ascii=False, indent=2)
         )
         app.recording_page.resume.set(document.get("resume", False))
+        app.recording_page.verify_video_on_save.set(document.get("verify_video_on_save", False))
         app.recording_page.enabled.set(True)
     if args.smoke_test:
         window.after(250, app.close)

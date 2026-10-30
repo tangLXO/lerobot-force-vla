@@ -3,6 +3,7 @@
 import copy
 import json
 import queue
+import threading
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -81,6 +82,7 @@ def snapshot(tick=0, *, anchor=1_000_000_000, sequence=1):
         "send_end_ns": anchor + 20,
         "per_joint_results": receipts,
         "joint_snapshot": asdict(joints),
+        "q_candidate_deg": 206.0,
         "arm_intent": {f"{name}.pos": 100 + index for index, name in enumerate(demo.JOINT_NAMES)},
         "submitted_action": {f"{item['name']}.pos": item["submitted_deg"] for item in receipts},
         "label_valid": False,
@@ -99,6 +101,21 @@ def camera_buffer(anchor=1_000_000_000):
     return buffer
 
 
+def test_stale_camera_error_identifies_role_tick_and_original_capture_age(tmp_path):
+    completed = snapshot()
+    anchor = completed.row["decision_anchor_ns"]
+    buffer = demo.CausalCameraBuffer(4)
+    buffer.publish(np.zeros((16, 16, 3), dtype=np.uint8), anchor - 101_000_000, anchor - 100_000_000)
+    with pytest.raises(TimeoutError) as error:
+        demo.completed_tick_frame(completed, {"front": buffer}, record_config(tmp_path), frame_index=6)
+    detail = str(error.value)
+    assert "Camera 'front'" in detail and f"tick_id={completed.tick_id}" in detail
+    assert "frame_index=6" in detail and "consume_lag_ms=" in detail
+    diagnostics = json.loads(detail[detail.index("{") :])
+    assert diagnostics["latest_age_ms"] == 101 and diagnostics["max_age_ms"] == 100
+    assert diagnostics["total_published"] == 1
+
+
 def test_frame_uses_submitted_clipped_action_and_same_tick_force(tmp_path):
     completed = snapshot()
     completed.row.update(force_hardware_sequence=47, force_status="driver_calibrated")
@@ -114,6 +131,94 @@ def test_frame_uses_submitted_clipped_action_and_same_tick_force(tmp_path):
     assert capture["sensors"]["gripper_force"]["hardware_sequence"] == 47
     assert capture["sensors"]["gripper_force"]["status"] == "driver_calibrated"
     assert evidence["action_deg"] != list(completed.row["arm_intent"].values())
+
+
+def test_cached_reuse_and_soft_overrun_preserve_frozen_frame_and_evidence(tmp_path):
+    completed = snapshot()
+    completed.row.update(
+        command_feedback_mode="cached",
+        soft_deadline_miss=True,
+        soft_deadline_streak=1,
+        feedback_reused=dict.fromkeys(demo.JOINT_NAMES, True),
+        feedback_reuse_counts=dict.fromkeys(demo.JOINT_NAMES, 2),
+    )
+    frame, _, evidence = demo.completed_tick_frame(
+        completed, {"front": camera_buffer()}, record_config(tmp_path)
+    )
+    assert evidence["soft_deadline_miss"] and evidence["soft_deadline_streak"] == 1
+    assert all(evidence["feedback_reused"].values())
+    assert evidence["joint_feedback"] == [asdict(j) for j in completed.joint_snapshot.joints]
+    np.testing.assert_array_equal(frame["observation.state"], np.arange(7) + 0.25)
+
+
+@pytest.mark.parametrize(
+    "old_mode,new_mode,compatible",
+    [
+        (None, "cached", False),
+        ("cached", "cached", True),
+        ("cached", "sequential", False),
+        ("sequential", "cached", False),
+        (None, "sequential", True),
+    ],
+)
+def test_resume_requires_matching_communication_policy(
+    stub_recording, tmp_path, old_mode, new_mode, compatible
+):
+    from lerobot.force_control.capture_contract import capture_contract
+
+    controller = stub_recording[0]
+    root = tmp_path / "policy_root"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta/info.json").write_text(json.dumps({"total_episodes": 0}), encoding="utf-8")
+    old = {"mode": old_mode, "period_ns": 20_000_000} if old_mode else None
+    (root / "meta/teacher_capture.json").write_text(json.dumps(capture_contract(old)), encoding="utf-8")
+    controller.provenance["communication_policy"] = {"mode": new_mode, "period_ns": 20_000_000}
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+    if compatible:
+        controller._check_resume(root)
+    else:
+        with pytest.raises(ValueError, match="capture version"):
+            controller._check_resume(root)
+    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "period_ns",
+        "hard_deadline_ns",
+        "consecutive_soft_deadline_limit",
+        "command_tx_gap_us",
+        "force_max_age_ms",
+    ],
+)
+def test_cached_resume_rejects_changed_timing_policy_without_modifying_root(stub_recording, tmp_path, field):
+    from lerobot.force_control.capture_contract import capture_contract
+
+    controller = stub_recording[0]
+    root = tmp_path / "timing_policy_root"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta/info.json").write_text(json.dumps({"total_episodes": 0}), encoding="utf-8")
+    policy = {
+        "mode": "cached",
+        "period_ns": 20_000_000,
+        "hard_deadline_ns": 40_000_000,
+        "consecutive_soft_deadline_limit": 3,
+        "command_tx_gap_us": 1000,
+        "force_max_age_ms": 50,
+    }
+    (root / "meta/teacher_capture.json").write_text(json.dumps(capture_contract(policy)), encoding="utf-8")
+    controller.provenance["communication_policy"] = {
+        **policy,
+        field: 120 if field == "command_tx_gap_us" else policy[field] + 1,
+    }
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="capture version") as error:
+        controller._check_resume(root)
+    if field == "command_tx_gap_us":
+        assert "existing 1000 us, requested 120 us" in str(error.value)
+        assert "--command-tx-gap-us 1000" in str(error.value)
+    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
 
 
 @pytest.mark.parametrize(
@@ -325,6 +430,17 @@ def wait_status(controller, predicate, timeout=5):
     pytest.fail(f"Recorder did not reach expected state: {controller.status()}")
 
 
+def wait_error_cleanup(controller, timeout=5):
+    """Error publication precedes asynchronous abort and final evidence writes."""
+    wait_status(controller, lambda status: status["state"] == "error", timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while controller._uid is not None and not controller._cleanup_pending:
+        if time.monotonic() >= deadline:
+            pytest.fail("Recorder error cleanup did not finish or retain its dependencies")
+        time.sleep(0.005)
+    return controller.status()
+
+
 def publish_frame(controller, owner, tick=0, *, anchor=1_000_000_000, sample=None):
     completed = snapshot(tick, anchor=anchor, sequence=tick + 1)
     if sample is not None:
@@ -369,6 +485,20 @@ def begin(stub):
     return wait_status(controller, lambda status: status["state"] == "recording")
 
 
+def test_cleanup_retry_preserves_initiating_recording_failure():
+    controller = object.__new__(demo.DemonstrationController)
+    controller._uid = "failed-episode"
+    controller._cleanup_pending = True
+    controller._subscription = controller._recorder = controller._dataset = None
+    controller.status = lambda: {"state": "error", "error": "Original camera freshness failure"}
+    controller._close_files = lambda: None
+    persisted = []
+    controller._write_manifest = lambda **fields: persisted.append(fields)
+    controller._update = lambda **fields: None
+    controller._abort("Session stopped or interrupted", status="interrupted")
+    assert persisted == [{"complete": False, "status": "error", "error": "Original camera freshness failure"}]
+
+
 def test_preparation_creates_no_episode_and_reuses_resources_when_recording_starts(stub_recording):
     controller, owner, config = stub_recording
     owner.is_running = owner.has_resources = False
@@ -409,6 +539,108 @@ def test_manual_finish_saves_without_release_or_other_motor_commands(stub_record
         next((Path(config.root) / "meta/teacher_episodes").glob("*.json")).read_text(encoding="utf-8")
     )
     assert metadata["complete"] and metadata["task_result"] == "success"
+
+
+def test_saved_state_waits_for_next_capture_preparation(stub_recording, monkeypatch):
+    controller, owner, _ = stub_recording
+    preparing, ready = threading.Event(), threading.Event()
+
+    def prewarm():
+        assert controller._dataset.meta.total_episodes == 1
+        preparing.set()
+        assert ready.wait(3)
+
+    monkeypatch.setattr(controller, "_prepare_next_capture", prewarm)
+    begin(stub_recording)
+    publish_frame(controller, owner)
+    wait_status(controller, lambda status: status["frame_count"] == 1)
+    controller.submit("record_finish", {"task_result": "success"})
+    try:
+        assert preparing.wait(3)
+        assert controller.status()["state"] == "saving"
+        assert not controller.status()["file_complete"]
+    finally:
+        ready.set()
+    assert wait_status(controller, lambda status: status["state"] == "saved")["file_complete"]
+    owner.post.assert_not_called()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_save_video_mode_keeps_completion_and_records_actual_check(stub_recording, monkeypatch, full):
+    from lerobot.force_control import demonstration_validation
+
+    validate = Mock(return_value={"valid": True, "errors": []})
+    monkeypatch.setattr(demonstration_validation, "validate_demonstration", validate)
+    controller, owner, config = stub_recording
+    config = replace(config, verify_video_on_save=full)
+    begin((controller, owner, config))
+    publish_frame(controller, owner)
+    wait_status(controller, lambda status: status["frame_count"] == 1)
+    controller.submit("record_finish", {"task_result": "success"})
+    status = wait_status(controller, lambda status: status["state"] == "saved")
+    metadata = json.loads(
+        next((Path(config.root) / "meta/teacher_episodes").glob("*.json")).read_text(encoding="utf-8")
+    )
+    expected = "passed" if full else "not_run"
+    assert validate.call_args.kwargs["verify_video"] is full
+    assert validate.call_args.kwargs["require_complete"] is False
+    assert metadata["complete"] and metadata["video_verification"] == expected
+    assert status["file_complete"] and status["video_verification"] == expected
+    assert set(status["save_timings"]) == {
+        "drain_seconds",
+        "transaction_seconds",
+        "non_video_seconds",
+        "video_decode_seconds",
+        "total_seconds",
+    }
+    assert all(value >= 0 for value in status["save_timings"].values())
+    assert status["successful_episode_count"] == 1
+
+
+def test_resume_validates_existing_episodes_without_video_decode(stub_recording, tmp_path, monkeypatch):
+    from lerobot.force_control import demonstration_validation
+    from lerobot.force_control.capture_contract import capture_contract
+
+    controller = stub_recording[0]
+    root = tmp_path / "resume"
+    episode_dir = root / "meta/teacher_episodes"
+    episode_dir.mkdir(parents=True)
+    (root / "meta/info.json").write_text(json.dumps({"total_episodes": 1}))
+    (root / "meta/teacher_capture.json").write_text(json.dumps(capture_contract()))
+    (episode_dir / "episode.json").write_text(
+        json.dumps({"complete": True, "episode_index": 0, "task_result": "success"})
+    )
+    validate = Mock(return_value={"valid": True, "errors": []})
+    monkeypatch.setattr(demonstration_validation, "validate_demonstration", validate)
+    controller._check_resume(root)
+    assert validate.call_args.kwargs["verify_video"] is False
+    assert controller.status()["successful_episode_count"] == 1
+
+
+def test_save_video_config_requires_boolean(tmp_path):
+    assert record_config(tmp_path).verify_video_on_save is False
+    with pytest.raises(ValueError, match="verify_video_on_save"):
+        record_config(tmp_path, verify_video_on_save="false").validate()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_failed_save_validation_withholds_completion(stub_recording, monkeypatch, full):
+    from lerobot.force_control import demonstration_validation
+
+    validate = Mock(return_value={"valid": False, "errors": ["injected verification failure"]})
+    monkeypatch.setattr(demonstration_validation, "validate_demonstration", validate)
+    controller, owner, config = stub_recording
+    config = replace(config, verify_video_on_save=full)
+    uid = begin((controller, owner, config))["episode_uid"]
+    publish_frame(controller, owner)
+    wait_status(controller, lambda status: status["frame_count"] == 1)
+    controller.submit("record_finish", {"task_result": "success"})
+    status = wait_error_cleanup(controller)
+    metadata = json.loads(
+        (Path(config.root) / "meta/teacher_episodes" / f"{uid}.json").read_text(encoding="utf-8")
+    )
+    assert not status["file_complete"] and not metadata["complete"]
+    assert "injected verification failure" in status["error"]
 
 
 def test_every_submitted_tick_is_kept_despite_early_or_late_intervals(stub_recording):
@@ -469,7 +701,7 @@ def test_writer_failure_preserves_incomplete_evidence(stub_recording, monkeypatc
     uid = begin(stub_recording)["episode_uid"]
     monkeypatch.setattr(controller._dataset, "add_frame", Mock(side_effect=OSError("disk full")))
     publish_frame(controller, owner)
-    status = wait_status(controller, lambda status: status["state"] == "error")
+    status = wait_error_cleanup(controller)
     assert "disk full" in status["error"] and not status["file_complete"]
     metadata = json.loads(
         (Path(config.root) / "meta/teacher_episodes" / f"{uid}.json").read_text(encoding="utf-8")
@@ -491,15 +723,29 @@ def test_resume_refuses_main_episodes_without_teacher_attachments(stub_recording
         controller._check_resume(root)
 
 
-def test_owner_fault_row_is_retained_and_recording_cannot_be_complete(stub_recording):
+def test_owner_fault_row_is_retained_and_recording_cannot_be_complete(stub_recording, monkeypatch):
     controller, owner, config = stub_recording
     uid = begin(stub_recording)["episode_uid"]
     publish_frame(controller, owner)
     wait_status(controller, lambda status: status["frame_count"] == 1)
     failed = snapshot(1, anchor=1_010_000_000)
     failed.row.update(phase="FAULT", send_status="unknown", failure_reason="stale_force")
+    release_cleanup = threading.Event()
+    abort = controller._abort
+
+    def delayed_abort(*args, **kwargs):
+        assert release_cleanup.wait(5), "Test did not release cleanup"
+        return abort(*args, **kwargs)
+
+    monkeypatch.setattr(controller, "_abort", delayed_abort)
     owner.emit(failed)
-    wait_status(controller, lambda status: status["state"] == "error")
+    try:
+        early = wait_status(controller, lambda status: status["state"] == "error")
+        assert "stale_force" in early["error"] and not early["file_complete"]
+        assert controller._uid == uid
+    finally:
+        release_cleanup.set()
+    wait_error_cleanup(controller)
     root = Path(config.root)
     rows = [
         json.loads(line)
@@ -510,13 +756,44 @@ def test_owner_fault_row_is_retained_and_recording_cannot_be_complete(stub_recor
     assert not metadata["complete"] and metadata["frame_count"] == 1
 
 
+def test_save_waits_for_communication_tail_and_retains_epoch_changing_fault(stub_recording):
+    controller, owner, config = stub_recording
+    uid = begin(stub_recording)["episode_uid"]
+    publish_frame(controller, owner)
+    wait_status(controller, lambda status: status["frame_count"] == 1)
+
+    def freeze(subscription):
+        failed = replace(snapshot(1, anchor=1_010_000_000), epoch=1)
+        failed.row.update(
+            phase="FAULT",
+            communication_only=True,
+            send_status="none",
+            failure_reason="intertick_io: missing seven-axis feedback",
+        )
+        subscription.queue.put_nowait(failed)
+        owner.unsubscribe(subscription)
+
+    owner.freeze_subscription = freeze
+    with pytest.raises(RuntimeError, match="epoch changed"):
+        controller._freeze_and_drain()
+    controller._control_file.flush()
+    rows = [
+        json.loads(line)
+        for line in (Path(config.root) / "teacher" / uid / "control.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows[-1]["communication_only"] and "missing seven-axis" in rows[-1]["failure_reason"]
+    assert not controller.status()["file_complete"]
+
+
 def test_capture_queue_fault_invalidates_episode_and_keeps_queued_rows(stub_recording):
     controller, owner, config = stub_recording
     uid = begin(stub_recording)["episode_uid"]
     subscription = owner.subscriptions[0]
     subscription.queue.put_nowait(snapshot())
     subscription.error = "Completed control-tick queue overflow; demonstration is incomplete"
-    status = wait_status(controller, lambda status: status["state"] == "error")
+    status = wait_error_cleanup(controller)
     assert "overflow" in status["error"] and not status["file_complete"]
     metadata = json.loads(
         (Path(config.root) / "meta/teacher_episodes" / f"{uid}.json").read_text(encoding="utf-8")
@@ -557,7 +834,7 @@ def test_abort_timeout_retains_active_dataset_and_sensor_dependencies(tmp_path, 
         wait_status(controller, lambda status: status["frame_count"] == 1)
         dataset, recorder, uid = controller._dataset, controller._recorder, controller._uid
         controller.submit("record_discard", {"rerecord": False})
-        wait_status(controller, lambda status: status["state"] == "error")
+        wait_error_cleanup(controller)
         assert len(dataset.frames) == 1 and not dataset.finalized
         assert controller._uid == uid and controller._cleanup_pending
         with pytest.raises(RuntimeError, match="resources remain retained"):
@@ -673,15 +950,25 @@ def test_prepare_failure_retains_each_resource_with_unconfirmed_cleanup(tmp_path
 
 
 @requires_recording
-def test_real_dataset_video_and_sidecar_roundtrip(tmp_path):
+@pytest.mark.parametrize("verify_video_on_save", [False, True])
+def test_real_dataset_video_and_sidecar_roundtrip(tmp_path, monkeypatch, verify_video_on_save):
     from lerobot.datasets.sensor_window import SensorStreamReader
-    from lerobot.force_control.demonstration_validation import validate_demonstration
+    from lerobot.force_control import demonstration_validation
+
+    decode = demonstration_validation._decode_video
+    decoded = []
+
+    def count_decode(*args):
+        decoded.append(args[0])
+        return decode(*args)
+
+    monkeypatch.setattr(demonstration_validation, "_decode_video", count_decode)
 
     owner = StubOwner()
     sensor = ManualSensor(FakePlant())
 
     controller = demo.DemonstrationController(owner, sensor, camera_factory=StubCameras)
-    config = record_config(tmp_path)
+    config = record_config(tmp_path, verify_video_on_save=verify_video_on_save)
     try:
         controller.submit("record_start", {"config": asdict(config)})
         # Required Sensor startup waits for its first post-subscription sample.
@@ -702,9 +989,11 @@ def test_real_dataset_video_and_sidecar_roundtrip(tmp_path):
         controller.submit("record_finish", {"task_result": "success"})
         status = wait_status(controller, lambda status: status["state"] == "saved", timeout=20)
         assert status["file_complete"] and status["episode_count"] == 1
+        assert len(decoded) == int(verify_video_on_save)
+        assert (status["save_timings"]["video_decode_seconds"] > 0) is verify_video_on_save
     finally:
         controller.close()
-    report = validate_demonstration(config.root, uid)
+    report = demonstration_validation.validate_demonstration(config.root, uid)
     assert report["valid"], report["errors"]
     assert report["episodes"][0]["video_decoded"]
     reader = SensorStreamReader(config.root, instance="gripper_force", episode_uid=uid, verify="full")
@@ -713,3 +1002,58 @@ def test_real_dataset_video_and_sidecar_roundtrip(tmp_path):
     sequences = {row["sequence"] for row in raw}
     assert all(row["sensors"]["gripper_force"]["sequence"] in sequences for row in sync)
     assert not (Path(config.root) / ".sensor-writer.lock").exists()
+
+
+@pytest.mark.parametrize("clipped", ["none", "arm", "gripper"])
+def test_dual_action_preserves_controller_candidate_and_policy_output(tmp_path, clipped):
+    from lerobot.configs.types import FeatureType
+    from lerobot.utils.feature_utils import dataset_to_policy_features
+
+    completed = snapshot()
+    completed.row["phase"] = "FORCE_TRACK"
+    if clipped != "arm":
+        for receipt in completed.row["per_joint_results"]:
+            receipt["candidate_deg"] = receipt["submitted_deg"]
+    if clipped != "gripper":
+        completed.row["q_candidate_deg"] = completed.row["per_joint_results"][-1]["submitted_deg"]
+    frame, _, evidence = demo.completed_tick_frame(
+        completed, {"front": camera_buffer()}, record_config(tmp_path)
+    )
+    expected = [r["candidate_deg"] for r in completed.row["per_joint_results"][:-1]]
+    expected.append(completed.row["q_candidate_deg"])
+    np.testing.assert_array_equal(frame["teacher.action_pre_safety"], expected)
+    assert evidence["action_pre_safety_deg"] == expected
+    features = {
+        key: {"dtype": "float32", "shape": value.shape}
+        for key, value in frame.items()
+        if isinstance(value, np.ndarray) and value.ndim == 1
+    }
+    outputs = {k: v for k, v in dataset_to_policy_features(features).items() if v.type == FeatureType.ACTION}
+    assert list(outputs) == ["action"]
+    assert outputs["action"].shape == (7,)
+
+
+@pytest.mark.parametrize("joint", ["arm", "gripper"])
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True, 1e100])
+def test_dual_action_rejects_missing_or_nonfinite_candidate(tmp_path, joint, value):
+    completed = snapshot()
+    if joint == "gripper":
+        completed.row["q_candidate_deg"] = value
+    else:
+        completed.row["per_joint_results"][0]["candidate_deg"] = value
+    with pytest.raises(ValueError, match="pre-safety"):
+        demo.completed_tick_frame(completed, {"front": camera_buffer()}, record_config(tmp_path))
+
+
+def test_dual_action_refuses_v1_resume_without_changes(stub_recording, tmp_path):
+    from lerobot.force_control.capture_contract import capture_contract
+
+    root = tmp_path / "legacy"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta/info.json").write_text(json.dumps({"total_episodes": 0}), encoding="utf-8")
+    contract = root / "meta/teacher_capture.json"
+    contract.write_text(json.dumps(capture_contract(version=1)), encoding="utf-8")
+    before = contract.read_bytes(), contract.stat().st_mtime_ns
+    with pytest.raises(ValueError, match="capture version"):
+        stub_recording[0]._check_resume(root)
+    assert before == (contract.read_bytes(), contract.stat().st_mtime_ns)

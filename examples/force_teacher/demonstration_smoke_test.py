@@ -240,6 +240,7 @@ def main() -> int:
     parser.add_argument("--duration-s", type=float, default=0.5)
     parser.add_argument("--resume", action="store_true", help="Append to an existing synthetic smoke Dataset")
     parser.add_argument("--encoder", choices=("software", "nvenc"), default="software")
+    parser.add_argument("--verify-video-on-save", action="store_true")
     args = parser.parse_args()
     if args.root.exists() and not args.resume:
         parser.error("--root must be a new directory")
@@ -271,6 +272,7 @@ def main() -> int:
                 for index, name in enumerate(("front", "wrist"))
             },
             "h264_encoder": args.encoder,
+            "verify_video_on_save": args.verify_video_on_save,
             "target_episode_count": args.episodes,
             "resume": args.resume,
         }

@@ -158,7 +158,7 @@ def _teacher_closure(root, episodes, download, *, refresh):
     if any(not (root / name).is_file() for name in metadata_paths):
         raise SensorTransactionError("Teacher audit metadata is incomplete after download.")
     contract = json.loads((root / "meta/teacher_capture.json").read_text(encoding="utf-8"))
-    if contract.get("schema") != "teacher_capture_contract_v1":
+    if contract.get("schema") not in ("teacher_capture_contract_v1", "teacher_capture_contract_v2"):
         raise SensorTransactionError("Unsupported Teacher capture contract.")
     digests = {}
     for uid, expected in episodes.items():

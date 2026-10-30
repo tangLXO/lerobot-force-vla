@@ -8,6 +8,7 @@ The child reuses DemonstrationController, LeRobotDataset and Sidecar v2.
 from __future__ import annotations
 
 import copy
+import logging
 import multiprocessing
 import os
 import queue
@@ -15,6 +16,7 @@ import threading
 import time
 import uuid
 from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -50,16 +52,39 @@ class _CompletedTicks:
         self.has_resources = False
         self._latest = None
         self._subscriptions = []
+        self._prepared = None
         self._lock = threading.Lock()
 
     def snapshot(self):
         return self._latest
 
     def subscribe(self, capacity):
-        subscription = OwnerSubscription(capacity)
         with self._lock:
+            if self._prepared is not None:
+                subscription = self._prepared
+                if subscription.queue.maxsize != capacity:
+                    raise RuntimeError("Recorder completed-tick capacity changed during startup")
+                self._prepared = None
+                return subscription
+            subscription = OwnerSubscription(capacity)
             self._subscriptions.append(subscription)
         return subscription
+
+    def prepare_episode(self, capacity):
+        """Receive ticks before asynchronous recorder startup claims its queue."""
+        with self._lock:
+            if self._subscriptions:
+                raise RuntimeError("Previous recorder completed-tick queue is still owned")
+            self._prepared = OwnerSubscription(capacity)
+            self._subscriptions.append(self._prepared)
+
+    def clear_episode(self):
+        """Retire unclaimed startup queues after failure as well as normal queues."""
+        with self._lock:
+            for subscription in self._subscriptions:
+                subscription.closed = True
+            self._subscriptions.clear()
+            self._prepared = None
 
     def unsubscribe(self, subscription):
         with self._lock:
@@ -89,6 +114,16 @@ class _ChildController(DemonstrationController):
         finally:
             self.start_processed = True
 
+    def _prepare_next_capture(self):
+        # Codec startup can pause this interpreter's camera readers. Do it
+        # between episodes, before the producer can subscribe the next tick.
+        # The previously committed episode must remain saved if prewarm fails;
+        # the next explicit start will surface the encoder failure normally.
+        try:
+            self._dataset.prepare_episode_recording(collect_garbage=False)
+        except Exception:
+            logging.getLogger(__name__).exception("Next-episode codec prewarm failed")
+
 
 def _latest_put(channel, value):
     try:
@@ -103,7 +138,20 @@ def _latest_put(channel, value):
             channel.put_nowait(value)
 
 
-def _capture_worker(config, descriptor, names, hz, instance, provenance, incoming, outgoing, cancel, cameras):
+def _capture_worker(
+    config,
+    descriptor,
+    names,
+    hz,
+    instance,
+    provenance,
+    incoming,
+    outgoing,
+    cancel,
+    close_failed,
+    cameras,
+    source_file,
+):
     # This channel contains replaceable status/previews, never samples or commit
     # receipts. A full preview pipe must not keep an otherwise closed child alive.
     outgoing.cancel_join_thread()
@@ -115,6 +163,7 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
     previous_tick = None
     next_status = next_preview = 0.0
     preview = {}
+    failure = None
     parent = multiprocessing.parent_process()
 
     def recorder_factory(root, _sensors):
@@ -122,9 +171,13 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
 
     def emit(**extra):
         status = controller.status() if controller else {"state": "error", "active": False}
+        if failure is not None:
+            extra["error"] = failure
         _latest_put(outgoing, {"status": status, "preview": preview, "released": released, **extra})
 
     try:
+        if Path(__file__).resolve() != Path(source_file).resolve():
+            raise RuntimeError("Capture child imported a different source checkout")
         provenance = {
             **provenance,
             "capture_process": {
@@ -152,7 +205,10 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
                 kind, payload = incoming.get(timeout=0.01)
             except queue.Empty:
                 kind, payload = None, None
-            if cancel.is_set() and kind is None:
+            # Cancellation withholds completion immediately. Orderly shutdown
+            # must still receive the producer's Raw/control tail before close.
+            # Only a failed close delivery may abort at an empty input queue.
+            if close_failed.is_set() and kind is None:
                 break
             if kind == "close":
                 break
@@ -162,6 +218,9 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
                 if token is not None:
                     raise RuntimeError("Capture producer started before prior episode release")
                 token, descriptor, first_sequence, value = payload
+                episode_config = TeacherRecordConfig(**value["config"])
+                episode_config.validate()
+                owner.prepare_episode(episode_config.queue_capacity)
                 source = RawStreamInput(descriptor, first_sequence)
                 controller.sensor = descriptor
                 controller._recorder.close()
@@ -189,9 +248,13 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
                 controller.submit(command, value)
             elif kind == "outcome":
                 controller.submit("record_outcome", payload)
+            recorder_status = controller.status()
+            if recorder_status.get("state") == "error":
+                raise RuntimeError(recorder_status.get("error") or "Capture recorder failed")
             if token is not None and controller.start_processed and controller._uid is None:
                 if controller._cleanup_pending:
                     raise RuntimeError("Capture child retained failed episode resources")
+                owner.clear_episode()
                 released, token = token, None
             now = time.monotonic()
             if now >= next_status:
@@ -202,13 +265,18 @@ def _capture_worker(config, descriptor, names, hz, instance, provenance, incomin
                 next_status = now + 0.05
     except BaseException as exc:
         cancel.set()
-        emit(error=f"{type(exc).__name__}: {exc}")
+        recorder_error = controller.status().get("error") if controller is not None else None
+        failure = recorder_error or f"{type(exc).__name__}: {exc}"
+        emit()
     finally:
         try:
             if controller is not None:
                 controller.close()
         except BaseException as exc:
-            emit(error=f"Capture cleanup failed: {type(exc).__name__}: {exc}")
+            cleanup = f"Capture cleanup failed: {type(exc).__name__}: {exc}"
+            failure = f"{failure}; {cleanup}" if failure else cleanup
+            emit()
+        owner.clear_episode()
         emit(closed=True)
 
 
@@ -221,9 +289,15 @@ class ProcessDemonstrationController:
         """Allocate bounded channels without connecting hardware or starting a child."""
         self.owner, self.sensor = owner, sensor
         self.force_instance, self.provenance = force_instance, provenance or {}
+        from .capture_contract import communication_policy
+
+        policy = communication_policy(owner.runtime)
+        if policy is not None:
+            self.provenance = {**self.provenance, "communication_policy": policy}
         self._camera_factory = camera_factory
         self._context = multiprocessing.get_context("spawn")
         self._cancel = _StopFlag(self._context)
+        self._close_failed = _StopFlag(self._context)
         self._incoming = self._context.Queue(maxsize=256)
         self._outgoing = self._context.Queue(maxsize=4)
         self._commands = queue.Queue(maxsize=8)
@@ -275,7 +349,9 @@ class ProcessDemonstrationController:
                 self._incoming,
                 self._outgoing,
                 self._cancel,
+                self._close_failed,
                 self._camera_factory,
+                str(Path(__file__).resolve()),
             ),
             name="teacher-capture-writer",
             daemon=False,
@@ -371,7 +447,8 @@ class ProcessDemonstrationController:
         if kind == "record_discard" and value.get("rerecord"):
             self._restart = copy.deepcopy(self._record_value)
             value = {**value, "rerecord": False}
-        self.owner.unsubscribe(self._ticks)
+        freeze = getattr(self.owner, "freeze_subscription", self.owner.unsubscribe)
+        freeze(self._ticks)
         self.sensor.unsubscribe(self._raw)
         while self._drain():
             pass
@@ -431,11 +508,15 @@ class ProcessDemonstrationController:
                 try:
                     if self._token is not None and not self._ended:
                         self._end("record_discard", {})
-                    self._send("close", None)
                 except Exception:
                     # Shared cancellation already withholds completion. Keep ownership
                     # until confirmed process exit; never claim a missing tail arrived.
                     self._cancel.set()
+                try:
+                    self._send("close", None)
+                except Exception:
+                    self._cancel.set()
+                    self._close_failed.set()
 
     def close(self, timeout_s=30):
         """Withhold completion, drain inputs and confirm writer exit before releasing leases."""

@@ -29,6 +29,13 @@ class _Widget:
         pass
 
 
+@pytest.mark.parametrize("hz,expected", [(50, "20 ms / 整拍硬截止 40 ms"), (100, "10 ms / 整拍硬截止 20 ms")])
+def test_cached_panel_displays_resolved_cycle_rules(panel, hz, expected):
+    text = panel.timing_settings_description({"control_hz": str(hz)}, command_feedback_mode="cached")
+    assert expected in text and "连续 3 拍" in text
+    assert "查询 / 周期工作 / 发送预算" not in text
+
+
 @pytest.fixture
 def stopped_panel(panel, calibration, settings, monkeypatch):
     """Exercise parameter actions without a window, transport or runtime."""
@@ -505,6 +512,54 @@ def test_position_button_can_start_without_starting_ip(panel, stopped_panel, mon
     stopped_panel.move_to_position()
     stopped_panel.approach()
     assert started == [("position", -10, 0.7), ("approach",)]
+
+
+@pytest.mark.parametrize("requested_mode", ["cached", "pipelined", "sequential", None])
+def test_stopped_position_start_reviews_supported_transport_without_ip_or_hardware(
+    panel, stopped_panel, monkeypatch, tmp_path, requested_mode
+):
+    app = stopped_panel
+    app.exit_confirmed = app.monitoring = True
+    app.preview_latest = {**_readonly_row(), "joint_received_ns": time.perf_counter_ns()}
+    app.command_feedback_mode = requested_mode
+    app.command_tx_gap_us = 1000
+    app.recording_page = SimpleNamespace(session_options=lambda: {})
+    app.fields["position_target_deg"].set("-10")
+    app.fields["position_speed_deg_s"].set("0.7")
+    monkeypatch.setattr(panel, "OUTPUTS", tmp_path / "runs")
+    monkeypatch.setattr(app, "start", lambda *args: panel.Tuner.start(app, *args))
+
+    def stop_before_execution(**kwargs):
+        raise RuntimeError("offline test: no control process created")
+
+    monkeypatch.setattr(panel, "ProcessLive", stop_before_execution)
+    app.move_to_position()
+    assert "offline test: no control process created" in app.status.get()
+    reviewed = json.loads(next((tmp_path / "runs").glob("*/reviewed.json")).read_text(encoding="utf-8"))
+    config = reviewed["config"]
+    assert config["initial_mode"] == "position"
+    assert config["initial_position_deg"] == -10
+    assert config["initial_position_speed_deg_s"] == 0.7
+    assert config["runtime"]["joint_names"] == ["gripper"]
+    assert config["b601"]["control"]["command_feedback_mode"] == "sequential"
+    if requested_mode is not None:
+        assert reviewed["command_feedback_override"] == {
+            "command_feedback_mode": "sequential",
+            "command_tx_gap_us": 1000,
+        }
+    else:
+        assert reviewed["command_feedback_override"] is None
+    assert not reviewed["executable"] and reviewed["consumed"]
+    assert not app.running
+
+
+@pytest.mark.parametrize("requested_mode", ["cached", "pipelined", "sequential"])
+def test_full_arm_communication_selection_is_preserved(panel, requested_mode):
+    config = SimpleNamespace(runtime=SimpleNamespace(joint_names=("shoulder_pan", "gripper")))
+    assert panel.command_feedback_override(config, requested_mode, 1000) == {
+        "command_feedback_mode": requested_mode,
+        "command_tx_gap_us": 1000,
+    }
 
 
 @pytest.mark.parametrize("speed", ["", "0", "-1", "nan", "inf"])

@@ -43,6 +43,7 @@ def recording_config(values, cameras_text):
             raise ValueError(f"{name} 须为正整数")
         config[name] = value
     config["resume"] = values.get("resume") is True
+    config["verify_video_on_save"] = values.get("verify_video_on_save") is True
     config["h264_encoder"] = str(values.get("h264_encoder", "nvenc"))
     cameras = json.loads(cameras_text)
     if not isinstance(cameras, dict) or not cameras or len(cameras) > 4:
@@ -81,6 +82,9 @@ def recording_description(snapshot):
     completed = snapshot.get("completed_episode_count", snapshot.get("episode_count", 0))
     target = snapshot.get("target_episode_count", 10)
     successful = snapshot.get("successful_episode_count", 0)
+    video_check = {"passed": "已通过", "not_run": "待完整核验"}.get(
+        snapshot.get("video_verification"), "未记录"
+    )
     counts = snapshot.get("stage_counts") or {}
     coverage = " / ".join(
         f"{label} {counts.get(key, 0)}"
@@ -95,6 +99,7 @@ def recording_description(snapshot):
         f"录制状态：{snapshot.get('state', snapshot.get('status', 'unknown'))} | 已保存 {completed} 条 | "
         f"人工成功 {successful} / {target}\n"
         f"文件完整：{snapshot.get('file_complete', '待核验')} | 阶段拍数：{coverage}\n"
+        f"保存时视频完整核验：{video_check}\n"
         f"人工任务结果：{snapshot.get('task_result', 'unknown')}\n"
         f"采集错误：{snapshot.get('error') or '; '.join(snapshot.get('errors') or []) or '无'}\n"
         f"操作请求错误：{snapshot.get('request_error') or '无'}"
@@ -149,6 +154,10 @@ class RecordingPage:
         resume = ttk.Checkbutton(parent, text="续录已有数据集（须通过已有内容核验）", variable=self.resume)
         resume.pack(anchor="w", pady=6)
         self.configuration_widgets.append(resume)
+        self.verify_video_on_save = tk.BooleanVar(value=False)
+        verify_video = ttk.Checkbutton(parent, text="保存时完整核验视频", variable=self.verify_video_on_save)
+        verify_video.pack(anchor="w")
+        self.configuration_widgets.append(verify_video)
         ttk.Label(parent, text="相机配置 JSON（设备仅在后端准备时打开）").pack(anchor="w")
         self.cameras = tk.Text(parent, height=5, width=48, wrap="word")
         bindings = Path(__file__).resolve().parents[2] / "b601_camera_bindings.json"
@@ -213,6 +222,7 @@ class RecordingPage:
     def config(self):
         values = {key: var.get() for key, var in self.fields.items()}
         values["resume"] = self.resume.get()
+        values["verify_video_on_save"] = self.verify_video_on_save.get()
         return recording_config(values, self.cameras.get("1.0", "end"))
 
     def session_options(self, *, include_full_arm_profile=True):

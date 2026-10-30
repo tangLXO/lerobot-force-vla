@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -101,7 +103,13 @@ def _decode_video(path: Path, start: float, end: float, frame_count: int, fps: f
 
 
 def _verify_episode(
-    root: Path, manifest_path: Path, *, verify_video: bool, require_complete: bool
+    root: Path,
+    manifest_path: Path,
+    *,
+    verify_video: bool,
+    require_complete: bool,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     manifest_stamp = _stamp(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -112,6 +120,12 @@ def _verify_episode(
     if manifest.get("schema") not in ("teacher_demo_episode_v1", "teacher_capture_episode_v1"):
         raise ValueError("Unsupported Teacher demonstration schema")
     capture_version = manifest["schema"] == "teacher_capture_episode_v1"
+    stored_contract = (
+        json.loads((root / "meta/teacher_capture.json").read_text(encoding="utf-8"))
+        if capture_version
+        else {}
+    )
+    dual_action = stored_contract.get("schema") == "teacher_capture_contract_v2"
     index, frame_count = manifest["episode_index"], manifest["frame_count"]
     if type(index) is not int or index < 0 or type(frame_count) is not int or frame_count <= 0:
         raise ValueError("Teacher episode index/frame count is invalid")
@@ -189,6 +203,15 @@ def _verify_episode(
         submitted = [by_name[name].get("submitted_deg") for name in joint_names]
         if not _vector(frame["action_deg"], submitted, 7):
             raise ValueError("Teacher action differs from submitted per-joint receipt")
+        if dual_action:
+            candidates = [
+                row.get("q_candidate_deg") if name == "gripper" else by_name[name].get("candidate_deg")
+                for name in joint_names
+            ]
+            if any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) for value in candidates
+            ) or not _vector(frame.get("action_pre_safety_deg"), candidates, 7):
+                raise ValueError("Teacher pre-safety action differs from completed control tick")
         snapshot = row.get("joint_snapshot", {})
         joints = snapshot.get("joints", [])
         by_name = {item["name"]: item for item in joints}
@@ -198,6 +221,18 @@ def _verify_episode(
             frame["state_deg"], [by_name[name].get("position_deg") for name in joint_names], 7
         ):
             raise ValueError("Teacher state differs from valid observed joint positions")
+        if row.get("command_feedback_mode") == "cached":
+            for key, default in (
+                ("feedback_reused", {}),
+                ("feedback_reuse_counts", {}),
+                ("soft_deadline_miss", False),
+                ("soft_deadline_streak", 0),
+                ("effective_send_deadline_ns", None),
+            ):
+                if frame.get(key, default) != row.get(key, default):
+                    raise ValueError(f"Teacher cached frame/control {key} mismatch")
+            if frame.get("joint_feedback") != joints:
+                raise ValueError("Teacher cached receive evidence differs from frozen control snapshot")
         for name in (
             "force_sequence",
             "force_timestamp_ns",
@@ -277,14 +312,30 @@ def _verify_episode(
     if capture_version:
         from .capture_contract import capture_contract
 
-        if json.loads((root / "meta/teacher_capture.json").read_text(encoding="utf-8")) != capture_contract():
+        stored_contract = json.loads((root / "meta/teacher_capture.json").read_text(encoding="utf-8"))
+        policy = manifest.get("provenance", {}).get("communication_policy")
+        # Historical roots are unmarked; new roots bind each episode's transport
+        # semantics to their root contract without mutating either on read.
+        expected_policy = policy if "communication_policy" in stored_contract else None
+        contract_version = 2 if dual_action else 1
+        if stored_contract != capture_contract(expected_policy, version=contract_version):
             raise ValueError("Capture field contract is missing or incompatible")
+        if expected_policy is None and policy is not None and policy.get("mode") == "cached":
+            raise ValueError("Cached episodes require a marked capture communication contract")
         if info["fps"] != 50 or manifest["config"]["fps"] != 50:
             raise ValueError("Capture main data must declare 50 Hz")
     for key, vector in (("observation.state", joint_names), ("action", joint_names)):
         spec = info["features"][key]
         if spec.get("names") != [f"{name}.pos" for name in vector] or tuple(spec["shape"]) != (7,):
             raise ValueError(f"Main {key} joint order differs from Teacher metadata")
+    if dual_action:
+        spec = info["features"].get("teacher.action_pre_safety", {})
+        if (
+            spec.get("dtype") != "float32"
+            or tuple(spec.get("shape", ())) != (7,)
+            or spec.get("names") != [f"{name}.pos" for name in joint_names]
+        ):
+            raise ValueError("Main pre-safety action schema differs from Teacher metadata")
     tactile_spec = info["features"]["observation.tactile"]
     if (
         tactile_spec.get("dtype") != "float32"
@@ -305,6 +356,10 @@ def _verify_episode(
             main = next(main_rows, None)
             if main is None or main.get("frame_index") != frame["frame_index"]:
                 raise ValueError("Main frame indices differ from Teacher metadata")
+            if dual_action and not _vector(
+                main.get("teacher.action_pre_safety"), frame.get("action_pre_safety_deg"), 7
+            ):
+                raise ValueError("Main pre-safety action differs from Teacher frame")
             if capture_version and not _vector(
                 [main.get("observation.force_target")], [frame["force_target_N"]], 1
             ):
@@ -350,13 +405,22 @@ def _verify_episode(
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("Main Dataset FPS is invalid")
         for video in transaction.journal["main_evidence"]["videos"]:
-            _decode_video(
-                resolve_artifact(root, video["path"]),
-                video["from_timestamp"],
-                video["to_timestamp"],
-                frame_count,
-                fps,
-            )
+            if progress is not None:
+                progress({"event": "video", "episode_uid": uid, "video": video["path"]})
+            started = time.perf_counter()
+            try:
+                _decode_video(
+                    resolve_artifact(root, video["path"]),
+                    video["from_timestamp"],
+                    video["to_timestamp"],
+                    frame_count,
+                    fps,
+                )
+            finally:
+                if timings is not None:
+                    timings["video_decode_seconds"] = timings.get("video_decode_seconds", 0.0) + (
+                        time.perf_counter() - started
+                    )
     if any(_stamp(path) != before for path, before in stamps.items()):
         raise ValueError("Teacher evidence changed during verification")
     # Public Reader entry rechecks all selected immutable and shared-artifact
@@ -384,6 +448,8 @@ def validate_demonstration(
     *,
     verify_video: bool = True,
     require_complete: bool = True,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Validate saved evidence without creating files, locks or caches.
 
@@ -406,7 +472,11 @@ def validate_demonstration(
             paths = sorted((root / "meta/teacher_episodes").glob("*.json"))
         if not paths:
             raise ValueError("No Teacher demonstration episode metadata found")
-        for path in paths:
+        for position, path in enumerate(paths, start=1):
+            if progress is not None:
+                progress(
+                    {"event": "episode", "episode_uid": path.stem, "index": position, "total": len(paths)}
+                )
             try:
                 if episode_uid is None:
                     metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -421,17 +491,35 @@ def validate_demonstration(
                     ):
                         journal_path = root / "meta/sensor_transactions" / f"{uid}.json"
                         transaction = SensorTransaction.load(journal_path) if journal_path.exists() else None
-                        if transaction is None or transaction.state == "ABORTED":
+                        quarantined_before_prepare = (
+                            transaction is not None
+                            and transaction.state == "QUARANTINED"
+                            and transaction.journal.get("files") == []
+                            and transaction.journal.get("main_artifacts") == []
+                            and "main_evidence" in transaction.journal
+                            and transaction.journal["main_evidence"] is None
+                        )
+                        if (
+                            transaction is None
+                            or transaction.state == "ABORTED"
+                            or quarantined_before_prepare
+                        ):
                             result["excluded_episodes"].append(
                                 {
                                     "episode_uid": uid,
                                     "status": metadata["status"],
                                     "reason": "unsaved episode retained for audit",
+                                    "transaction_state": str(transaction.state) if transaction else None,
                                 }
                             )
                             continue
                 episode = _verify_episode(
-                    root, path, verify_video=verify_video, require_complete=require_complete
+                    root,
+                    path,
+                    verify_video=verify_video,
+                    require_complete=require_complete,
+                    progress=progress,
+                    timings=timings,
                 )
             except Exception as exc:
                 error = f"{path.stem}: {type(exc).__name__}: {exc}"
