@@ -13,9 +13,9 @@ uv run --no-sync python examples/force_teacher/b601_tuner.py --smoke-test
 
 Windows 原生串口调整正读写超时时，只更新 `COMMTIMEOUTS`，避免在每轴查询或命令前重复重配整端口。原来的绝对截止时间、毫秒取整、读取/发送预算与过期拒绝均保留，不通过增大预算或改变夹爪参数规避超时。非原生串口及阻塞/非阻塞模式切换继续沿用 pyserial 行为。
 
-`b601_ip_parameters.template.json` 是待填写的配置模板。根目录的 `b601_ip_parameters.json` 与 `b601_ip_parameters_communication.json` 是本机文件，不纳入版本控制。旧设置可读取迁移，原文件不会自动改写。
+`b601_ip_parameters.template.json` 是待填写的配置模板。根目录的 `b601_capture_parameters.json`、`b601_ip_parameters.json` 与 `b601_ip_parameters_communication.json` 是本机文件，不纳入版本控制。旧设置可读取迁移，原文件不会自动改写。
 
-参数解析、保存与运行配置构建统一由 `lerobot.force_control.tuning` 提供，界面只负责编辑和提交。新保存格式为 v6：夹爪跟随 / 接近速度上限使用 `gripper_follow_speed_deg_s`，接触平均力阈值使用 `contact_force_threshold_N`，并保存 102 连接参数。v1–v5 JSON 和旧 Teacher YAML 仍可读取；旧 `approach_speed_deg_s` / `approach_force_threshold_N` 分别映射到这两个字段，旧新同名含义字段同时出现会被拒绝，不猜测优先级。旧 kg 目标继续按 9.80665 N/kg 转换；增益、速度、限位及底层协议值均不随迁移改动。旧文件的主臂端口默认为空，加载文件不会自动选择或启动 Teacher。
+参数解析、保存与运行配置构建统一由 `lerobot.force_control.tuning` 提供，界面只负责编辑和提交。新保存格式为 v10：夹爪跟随 / 接近速度上限使用 `gripper_follow_speed_deg_s`，接触平均力阈值使用 `contact_force_threshold_N`，并保存 102 连接参数。v1–v9 JSON 和旧 Teacher YAML 仍可读取；旧 `manual_step_deg` 字段只读加载时移除，不参与控制。旧 `approach_speed_deg_s` / `approach_force_threshold_N` 分别映射到这两个字段，旧新同名含义字段同时出现会被拒绝，不猜测优先级。旧 kg 目标继续按 9.80665 N/kg 转换；增益、速度、限位及底层协议值均不随迁移改动。早期不含主臂连接字段的文件将主臂端口留空，加载文件不会自动选择或启动 Teacher。
 
 ## Teacher 主从夹爪
 
@@ -34,11 +34,11 @@ Windows 原生串口调整正读写超时时，只更新 `COMMTIMEOUTS`，避免
 
 接触位置和状态转换仅在成功提交命令后确认。传感器、主爪或从爪反馈过期时停止；重复读缓存不会刷新指令时效。停止按钮和 Esc 保持可用，主臂只读线程及 B601 owner 完成清理前禁止重开。
 
-冻结、指定位置或恒速接近等手工操作会退出本次自动跟随；恢复 I-P 按独立力控语义运行，主臂新鲜度检查持续到会话停止。重新进入混合 Teacher 需要停止后再次显式启动。默认仍为单夹爪。
+指定位置或恒速接近等手工操作会退出本次自动跟随；恢复 I-P 按独立力控语义运行，主臂新鲜度检查持续到会话停止。重新进入混合 Teacher 需要停止后再次显式启动。单夹爪模式通过 `--gripper-only` 显式进入。
 
 ## 正常全臂遥操准备
 
-现有 `run_force_pos_teacher.bat` 和 `uv run --no-sync python examples/force_teacher/b601_tuner.py` 默认加载项目根目录的 `b601_ip_parameters.json`，自动显示六臂官方 MIT 配置。无需选择、保存或预检草稿文件；打开面板不会连接设备或使能。`--settings-file <路径>` 可指定已有夹爪参数文件，`--gripper-only` 保留单独夹爪主从入口。
+统一入口 `run_force_pos_teacher.bat`（本机桌面“Force-VLA 数据采集”快捷方式）默认加载项目根目录的 `b601_capture_parameters.json`，自动显示六臂官方 MIT 配置；需要原 Tk 面板时添加 `--legacy-ui`。无需选择、保存或预检草稿文件；打开面板不会连接设备或使能。`--settings-file <路径>` 可指定已有夹爪参数文件，`--gripper-only` 保留单独夹爪主从入口。
 
 六臂直接使用原生 `RebotB601FollowerConfig`：Kp `[45,45,45,8,9,8]`、Kd `[12,12,12,1,1,1]`、`send_mit(q, 0, Kp, Kd, 0)`，绝对范围为官方限位与已加载校准的交集。SDK 将前三轴 Kd=12 编码为 5，摘要显示请求值与编码值。官方 `max_relative_target=None` 表示不另设逐帧幅度；官方没有的对齐、预载容差及命令间隔门槛同样显示为“默认关闭”，不是缺失必填参数。原已确认的 q0±100° 包络保留在六个机械臂关节上。夹爪沿用当前工作目标范围、校准硬范围和逐帧限制，不再按启动位置额外裁剪 ±100°；正常张开或闭合跨越该距离不会触发机械臂参考包络故障。诊断验收模式仍保留原七轴包络。
 
