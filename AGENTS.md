@@ -1,5 +1,7 @@
 This file provides guidance to AI agents when working with code in this repository.
 
+**First read for every chat in this repository.** Read [RESEARCH_CHARTER.md](./RESEARCH_CHARTER.md) in full at the start of every new chat, before proceeding with the task. It is the shared source for the paper's current research question, control boundaries, evidence and priorities. Reuse it within a chat while it is unchanged. The dated research plan and experiment reports provide the supporting detail.
+
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
 ## Project Overview
@@ -78,3 +80,8 @@ DEVICE=cuda make test-end-to-end
   diagnostics out of stable manifests. Validate bounded Raw and Sync memory, subprocess recovery, read-only
   tree/mtime invariants, window oracle, Hub subset closure and Windows spawn/batch behavior. Use structural
   I/O assertions in CI; benchmark speedup is not a hard gate.
+
+## Research context
+
+After the charter, read [RESEARCH_PLAN.md](./RESEARCH_PLAN.md) before work on the Force-VLA paper, architecture, or experiments. Recheck dated evidence against the current working tree and latest reports. Preserve concurrent edits and distinguish proposed work from verified results.
+Use the user's latest decisions and the charter for current priorities. Treat dated Dot plans as proposals. Carry a hardware check or data request forward only when it answers a specific open question that the available recordings cannot answer.

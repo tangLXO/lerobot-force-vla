@@ -15,6 +15,10 @@
 
 </div>
 
+## Force-VLA · reBot B601
+
+本分支在 LeRobot 上开发 B601 双指力控制和语言抓放。研究问题与大小脑分工见[研究总纲](RESEARCH_CHARTER.md)，服务器数据同步和 π 模型开发见[当前计划](RESEARCH_PLAN.md)，遥操与采集见[B601 工作台](examples/force_teacher/README.md)。
+
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.

@@ -1,0 +1,629 @@
+{
+  "source_date": "2026-11-19",
+  "review_date": "2026-11-26",
+  "purpose": "Recorded Teacher demonstrations for offline model development; no formal test split assigned.",
+  "path_base": "Resolve episode roots from the directory containing outputs/. Resolve manifest and video paths from each episode root.",
+  "range_convention": "zero-based local frame_index, start inclusive and stop exclusive",
+  "checks": "Manifest hashes for frame/control streams, tick and anchor match, all seven submitted axes versus frame evidence and stored float32 actions, task text in tasks.parquet, source and target of each saved frame, dual-camera frame references and local video files. Videos were not re-decoded in this review.",
+  "counts": {
+    "complete_episodes": 10,
+    "distinct_run_uids": 10,
+    "frames": 14117,
+    "distinct_task_strings": 6,
+    "gripper_frame_counts": {
+      "teleop": 11372,
+      "transition": 10,
+      "teacher": 2735
+    },
+    "excluded_manifests_in_scanned_roots": 5
+  },
+  "episodes": [
+    {
+      "root": "outputs/teacher_bottle_transfer_20261119",
+      "episode_uid": "0ac3c9de-f15f-4f0c-8520-23629c73c002",
+      "run_uid": "59db3149-aa21-4f5c-bcf7-ed3586188990",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/0ac3c9de-f15f-4f0c-8520-23629c73c002.json",
+      "object_id": "bottle",
+      "task": "Grasp the bottle at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 1392,
+      "control_sha256": "ec40ba7ce7d156287cef88e3570c5352a248ca898de4187d545d7bc88858e202",
+      "frames_sha256": "349e0ee2cbb9822b71c3db733aee92ab14cb958d390232dfb97b404dc88b8205",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 926,
+        "transition": 1,
+        "teacher": 465
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 456,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 456,
+          "stop": 457,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 457,
+          "stop": 922,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 922,
+          "stop": 1045,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        },
+        {
+          "start": 1045,
+          "stop": 1392,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        922
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/confirm_plush_5N",
+      "episode_uid": "86dbcbf3-bc73-422a-90e2-e90f31b715cf",
+      "run_uid": "f9d458c7-f242-4f30-84ba-466da9a2d813",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/86dbcbf3-bc73-422a-90e2-e90f31b715cf.json",
+      "object_id": "small_plush_toy",
+      "task": "Grasp the small plush toy at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 2368,
+      "control_sha256": "ae30f27bb38676544df89171591823ff2f51fbee7fcfe3a8e4116235b4c35932",
+      "frames_sha256": "b1d5dd0b31dd3505fb48e48439c304911dfa8de5b1a391c88a4a3d083d44b757",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 2131,
+        "transition": 1,
+        "teacher": 236
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 1356,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 1356,
+          "stop": 1357,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 1357,
+          "stop": 1593,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 1593,
+          "stop": 1654,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        },
+        {
+          "start": 1654,
+          "stop": 2368,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        1593
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/pilot5_01_retry1",
+      "episode_uid": "b5cab658-8cf1-426c-8ccd-afb091f3e12e",
+      "run_uid": "7816e7b8-4bfe-4650-ac69-aa9c9383cb0c",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/b5cab658-8cf1-426c-8ccd-afb091f3e12e.json",
+      "object_id": "red_cap_bottle",
+      "task": "Grasp the red cap bottle at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 1328,
+      "control_sha256": "7ad7a1e0614bd107142ecf65d84dfbbb82e79049e00f58244796d18ae8093359",
+      "frames_sha256": "45409a336f92c16b893d8ed356efe078cabf30752b282580e329cf9250e5ba40",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 1059,
+        "transition": 1,
+        "teacher": 268
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 387,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 387,
+          "stop": 388,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 388,
+          "stop": 656,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 656,
+          "stop": 1328,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        656
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/pilot5_02_retry1",
+      "episode_uid": "b2c85449-9889-4ff7-bc95-aa05abd52577",
+      "run_uid": "9d6d8602-f8c4-4377-bbde-326fb7bc955a",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/b2c85449-9889-4ff7-bc95-aa05abd52577.json",
+      "object_id": "small_plush_toy",
+      "task": "Grasp the small plush toy at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 1339,
+      "control_sha256": "f265af08fc5d528f92bb399233bbc182ff4b7a6d9e83a5f6e40420be0bc3d44d",
+      "frames_sha256": "04856e505193443cc5ae1bf0916a4076af8828e22727a286fb301dd4ea85b9e5",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 1108,
+        "transition": 1,
+        "teacher": 230
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 451,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 451,
+          "stop": 452,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 452,
+          "stop": 682,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 682,
+          "stop": 723,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        },
+        {
+          "start": 723,
+          "stop": 1339,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        682
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/pilot5_03_retry1",
+      "episode_uid": "6af1523d-b8b4-415d-8f90-df9bb47ec18c",
+      "run_uid": "33e8a650-c9d9-45bf-93a7-eb2dd77f5aac",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/6af1523d-b8b4-415d-8f90-df9bb47ec18c.json",
+      "object_id": "red_cap_bottle",
+      "task": "Grasp the red cap bottle at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 1167,
+      "control_sha256": "deebdf9ce141057581c98897c5752738be73935512644295af768a5ad711a419",
+      "frames_sha256": "9e15a884cc804a25cb3eacfc41cf514592508282339d08faa695f5dd4f941bb2",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 957,
+        "transition": 1,
+        "teacher": 209
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 431,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 431,
+          "stop": 432,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 432,
+          "stop": 641,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 641,
+          "stop": 1167,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        641
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/pilot5_04",
+      "episode_uid": "5a36c5e7-6440-4911-b518-56b0304b0a1b",
+      "run_uid": "2c68f8bd-774e-49a1-8b0a-5554fa6107d5",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/5a36c5e7-6440-4911-b518-56b0304b0a1b.json",
+      "object_id": "small_plush_toy",
+      "task": "Grasp the small plush toy at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 997,
+      "control_sha256": "0928c4e84aec242052ecce19fcd6b1ccfc05230fbe4baabfb6fa2b03716ecf76",
+      "frames_sha256": "eded232506e433a269186fed810f62b39197dface47b362b497979be807e76c6",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 759,
+        "transition": 1,
+        "teacher": 237
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 385,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 385,
+          "stop": 386,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 386,
+          "stop": 623,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 623,
+          "stop": 645,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        },
+        {
+          "start": 645,
+          "stop": 997,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        623
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/T01",
+      "episode_uid": "791a1d3b-8ae6-4f88-b777-5ebf4cfc6886",
+      "run_uid": "0514c6f9-9e9b-41e0-840a-1658e8345eae",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/791a1d3b-8ae6-4f88-b777-5ebf4cfc6886.json",
+      "object_id": "red_cap_bottle",
+      "task": "Grasp the red cap bottle at 5 N, carry it, set it down stably and then release it.",
+      "target_N": 5.0,
+      "frames": 1260,
+      "control_sha256": "148fb452d1557b6932adffba81bc98e980c3f49df34eec3139754f56d643a635",
+      "frames_sha256": "0ca99c4df1dd0d27342f265a40e2df3964327af71d07a1d11beb6cebae3e21b9",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 1022,
+        "transition": 1,
+        "teacher": 237
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 524,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 524,
+          "stop": 525,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 525,
+          "stop": 762,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 762,
+          "stop": 1178,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        },
+        {
+          "start": 1178,
+          "stop": 1260,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        762
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/T02_retry1",
+      "episode_uid": "016281b3-cdf5-4cfc-b22a-dd5d05359e71",
+      "run_uid": "6226e9fe-c9a0-4e22-9fbe-0397f3c4f4e0",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/016281b3-cdf5-4cfc-b22a-dd5d05359e71.json",
+      "object_id": "small_plush_toy",
+      "task": "Grasp the small plush toy at 2 N, carry it, set it down stably and then release it.",
+      "target_N": 2.0,
+      "frames": 1447,
+      "control_sha256": "e45b626318b239fc586cd2e16f74ed3571cb00dc03065bc74887b668257fe78d",
+      "frames_sha256": "6afd9c8a95d111e2e59bb388aa7e76668fe2d950994fa9fcc969430daf9fc9f2",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 1224,
+        "transition": 1,
+        "teacher": 222
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 688,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 688,
+          "stop": 689,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 689,
+          "stop": 911,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 911,
+          "stop": 1447,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        911
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/T03",
+      "episode_uid": "f7279bd2-1008-45e5-a87d-f10450318ba0",
+      "run_uid": "bdf590db-e283-4448-b96f-9882aa5dcd1b",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/f7279bd2-1008-45e5-a87d-f10450318ba0.json",
+      "object_id": "red_cap_bottle",
+      "task": "Grasp the red cap bottle at 3 N, carry it, set it down stably and then release it.",
+      "target_N": 3.0,
+      "frames": 1280,
+      "control_sha256": "0ab9588363b5751f1f89319fe657f6e71a9026678868092ac5380cad9ba15dd2",
+      "frames_sha256": "75a1b51f77c5fa2a6c3700abf3d5a065a439bf442fe2150f5bf8a1560b4879a9",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 924,
+        "transition": 1,
+        "teacher": 355
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 399,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 399,
+          "stop": 400,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 400,
+          "stop": 755,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 755,
+          "stop": 1280,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        755
+      ]
+    },
+    {
+      "root": "outputs/ip_crossover_round1_20261119/T04_retry1",
+      "episode_uid": "a7244a0d-c226-4ffb-8ad4-21d7d2696411",
+      "run_uid": "deda5a3d-0f49-4b6b-8ab2-8614288a47b0",
+      "episode_index": 0,
+      "manifest": "meta/teacher_episodes/a7244a0d-c226-4ffb-8ad4-21d7d2696411.json",
+      "object_id": "small_plush_toy",
+      "task": "Grasp the small plush toy at 4 N, carry it, set it down stably and then release it.",
+      "target_N": 4.0,
+      "frames": 1539,
+      "control_sha256": "883835b65809f75a133d84ec7eaf2c96ec016189130c63189c8a183699af1cd5",
+      "frames_sha256": "f9684da90ead95fb17ff22415bb22ba359baace748a8221f5ed838a26722a035",
+      "videos": {
+        "front": [
+          "videos/observation.images.front/chunk-000/file-000.mp4"
+        ],
+        "wrist": [
+          "videos/observation.images.wrist/chunk-000/file-000.mp4"
+        ]
+      },
+      "gripper_frame_counts": {
+        "teleop": 1262,
+        "transition": 1,
+        "teacher": 276
+      },
+      "gripper_stage_ranges": [
+        {
+          "start": 0,
+          "stop": 450,
+          "gripper_source": "teleop",
+          "feedback_stage": "pre_contact"
+        },
+        {
+          "start": 450,
+          "stop": 451,
+          "gripper_source": "transition",
+          "feedback_stage": "reset"
+        },
+        {
+          "start": 451,
+          "stop": 727,
+          "gripper_source": "teacher",
+          "feedback_stage": "force_feedback"
+        },
+        {
+          "start": 727,
+          "stop": 1539,
+          "gripper_source": "teleop",
+          "feedback_stage": "inactive"
+        }
+      ],
+      "exit_force_track_frame_indices": [
+        727
+      ]
+    }
+  ],
+  "excluded_manifests": [
+    {
+      "manifest": "outputs/ip_crossover_round1_20261119/pilot5_01/meta/teacher_episodes/13ea9488-fec9-40d0-94cc-c9315adaff37.json",
+      "status": "error",
+      "declared_result": "unknown"
+    },
+    {
+      "manifest": "outputs/ip_crossover_round1_20261119/pilot5_03/meta/teacher_episodes/116b36ee-b2cc-4905-b8bb-df029b3f8762.json",
+      "status": "discarded",
+      "declared_result": "unknown"
+    },
+    {
+      "manifest": "outputs/ip_crossover_round1_20261119/pilot5_03/meta/teacher_episodes/23da5878-d703-4b5e-bfd1-4d3d1943d853.json",
+      "status": "discarded",
+      "declared_result": "unknown"
+    },
+    {
+      "manifest": "outputs/ip_crossover_round1_20261119/pilot5_03/meta/teacher_episodes/2b9b926a-98f1-4229-8d25-a677bbb6a135.json",
+      "status": "discarded",
+      "declared_result": "unknown"
+    },
+    {
+      "manifest": "outputs/ip_crossover_round1_20261119/T02/meta/teacher_episodes/8b557dac-b997-4660-b549-f8b45273f7d3.json",
+      "status": "error",
+      "declared_result": "unknown"
+    }
+  ]
+}
