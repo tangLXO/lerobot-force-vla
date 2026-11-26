@@ -15,8 +15,11 @@
 # limitations under the License.
 import logging
 import math
+from pathlib import Path
 from pprint import pformat
 
+import numpy as np
+import pyarrow.parquet as pq
 import torch
 
 from lerobot.configs import PreTrainedConfig
@@ -33,7 +36,9 @@ from lerobot.utils.constants import (
     REWARD,
 )
 from lerobot.utils.feature_utils import validate_sensor_feature_rename_map
+from lerobot.utils.utils import unflatten_dict
 
+from .compute_stats import aggregate_stats
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
@@ -41,6 +46,51 @@ from .sensor_window import SensorWindowDataset
 from .storage import DEFAULT_STORAGE_FORMAT, load_dataset_metadata
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices
+
+
+def selected_episode_stats(root: Path, episodes: list[int]) -> dict:
+    """Aggregate the stored v3 statistics of exactly the selected episodes."""
+    if not episodes:
+        raise ValueError("No episodes selected for statistics")
+    by_episode = {}
+    for path in sorted((root / "meta" / "episodes").rglob("*.parquet")):
+        columns = [key for key in pq.read_schema(path).names if key.startswith("stats/")]
+        table = pq.read_table(
+            path, columns=["episode_index", *columns], filters=[("episode_index", "in", episodes)]
+        )
+        for row in table.to_pylist():
+            index = row.pop("episode_index")
+            stats = {
+                key.removeprefix("stats/"): np.asarray(value)
+                for key, value in row.items()
+                if value is not None
+            }
+            if not stats or index in by_episode:
+                raise ValueError(f"Missing or duplicate statistics for episode {index}")
+            by_episode[index] = unflatten_dict(stats)
+    if by_episode.keys() != set(episodes):
+        raise ValueError("Selected episode statistics are incomplete")
+    return aggregate_stats(list(by_episode.values()))
+
+
+def _use_pi_teacher_training_stats(
+    cfg: TrainPipelineConfig, metadata: LeRobotDatasetMetadata, episodes: list[int] | None
+) -> bool:
+    """Replace whole-root stats when a π policy trains on a subset of Teacher episodes."""
+    if (
+        episodes is None
+        or cfg.trainable_config.type not in {"pi0", "pi05"}
+        or metadata.storage_format != DEFAULT_STORAGE_FORMAT
+        or len(episodes) == metadata.total_episodes
+    ):
+        return False
+    if (
+        "teacher.action_pre_safety" not in metadata.features
+        and not (metadata.root / "meta" / "teacher_capture.json").is_file()
+    ):
+        return False
+    metadata.stats = selected_episode_stats(metadata.root, episodes)
+    return True
 
 
 def resolve_delta_timestamps(
@@ -220,6 +270,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             f"{pformat(dataset.repo_id_to_index, indent=2)}"
         )
 
+    _use_pi_teacher_training_stats(cfg, dataset.meta, episodes)
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             if key in dataset.meta.depth_keys:
@@ -318,6 +369,9 @@ def make_train_eval_datasets(
         tolerance_s=cfg.tolerance_s,
         repo_type=cfg.dataset.repo_type,
     )
+
+    if _use_pi_teacher_training_stats(cfg, train_dataset.meta, train_episodes):
+        eval_dataset.meta.stats = train_dataset.meta.stats
 
     if cfg.dataset.sensor_windows:
         train_dataset = SensorWindowDataset(
