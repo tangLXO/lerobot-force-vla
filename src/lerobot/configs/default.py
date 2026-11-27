@@ -93,8 +93,21 @@ class DatasetConfig:
     eval_split: float = 0.0
     sensor_windows: dict[str, SensorWindowConfig] = field(default_factory=dict)
     sensor_window_cache_mb: float = 64
+    # Read complete B601 recordings listed in a Teacher index, relative to root.
+    teacher_pilot_index: str | None = None
+    held_out_run_uids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.held_out_run_uids and not self.teacher_pilot_index:
+            raise ValueError("held_out_run_uids requires teacher_pilot_index")
+        if self.teacher_pilot_index and (
+            self.streaming
+            or self.repo_type != "dataset"
+            or self.episodes is not None
+            or self.exclude_episodes
+            or self.eval_split
+        ):
+            raise ValueError("Use held_out_run_uids to split an indexed local Teacher dataset")
         if (
             isinstance(self.sensor_window_cache_mb, bool)
             or not isinstance(self.sensor_window_cache_mb, int | float)

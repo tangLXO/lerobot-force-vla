@@ -315,8 +315,8 @@ class TrainPipelineConfig(HubMixin):
             self.optimizer = active_cfg.get_optimizer_preset()
             self.scheduler = active_cfg.get_scheduler_preset()
 
-        if self.eval_steps > 0 and self.dataset.eval_split == 0.0:
-            raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 to hold out eval data.")
+        if self.eval_steps > 0 and self.dataset.eval_split == 0.0 and not self.dataset.held_out_run_uids:
+            raise ValueError("eval_steps > 0 requires dataset.eval_split > 0.0 or held_out_run_uids.")
 
         # Remote runs auto-generate the repo_id in submit_to_hf (the policy may only be
         # resolved here, from --policy.path), so don't demand it up front for them.

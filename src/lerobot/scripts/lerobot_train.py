@@ -355,8 +355,13 @@ def make_dataloaders(
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
-            task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
+        task_arr = None
+        if cfg.max_eval_samples > 0:
+            if hasattr(eval_dataset, "frame_task_indices"):
+                task_arr = eval_dataset.frame_task_indices()
+            elif hasattr(eval_dataset, "hf_dataset"):
+                task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
+        if task_arr is not None:
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
             selected: list[int] = []

@@ -13,10 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import logging
 import math
 from pathlib import Path
 from pprint import pformat
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -46,6 +49,9 @@ from .sensor_window import SensorWindowDataset
 from .storage import DEFAULT_STORAGE_FORMAT, load_dataset_metadata
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices
+
+if TYPE_CHECKING:
+    from .teacher_pilot import TeacherPilotDataset
 
 
 def selected_episode_stats(root: Path, episodes: list[int]) -> dict:
@@ -185,7 +191,15 @@ def _validate_sensor_window_storage(cfg, metadata):
         raise ValueError("Sensor windows require the default local Parquet storage format.")
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
+def _apply_imagenet_stats(metadata):
+    for key in metadata.camera_keys:
+        if key not in metadata.depth_keys:
+            camera_stats = metadata.stats.setdefault(key, {})
+            for stat, value in IMAGENET_STATS.items():
+                camera_stats[stat] = torch.tensor(value, dtype=torch.float32)
+
+
+def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset | TeacherPilotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -197,6 +211,10 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
     Returns:
         LeRobotDataset | MultiLeRobotDataset
     """
+    if cfg.dataset.teacher_pilot_index:
+        from .teacher_pilot import make_teacher_pilot_split
+
+        return make_teacher_pilot_split(cfg)[0]
     _validate_sensor_window_support(cfg)
 
     image_transforms = (
@@ -272,12 +290,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
 
     _use_pi_teacher_training_stats(cfg, dataset.meta, episodes)
     if cfg.dataset.use_imagenet_stats:
-        for key in dataset.meta.camera_keys:
-            if key in dataset.meta.depth_keys:
-                continue  # Exclude depth keys from ImageNet stats
-            dataset.meta.stats.setdefault(key, {})
-            for stats_type, stats in IMAGENET_STATS.items():
-                dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        _apply_imagenet_stats(dataset.meta)
 
     if cfg.dataset.sensor_windows:
         dataset = SensorWindowDataset(
@@ -288,12 +301,18 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
-) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
+) -> tuple[
+    LeRobotDataset | MultiLeRobotDataset | TeacherPilotDataset, LeRobotDataset | TeacherPilotDataset | None
+]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
+    if cfg.dataset.teacher_pilot_index:
+        from .teacher_pilot import make_teacher_pilot_split
+
+        return make_teacher_pilot_split(cfg)
     if cfg.dataset.eval_split == 0.0:
         return make_dataset(cfg), None
 
@@ -383,11 +402,6 @@ def make_train_eval_datasets(
 
     if cfg.dataset.use_imagenet_stats:
         for ds in (train_dataset, eval_dataset):
-            for key in ds.meta.camera_keys:
-                if key in ds.meta.depth_keys:
-                    continue
-                ds.meta.stats.setdefault(key, {})
-                for stats_type, stats in IMAGENET_STATS.items():
-                    ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+            _apply_imagenet_stats(ds.meta)
 
     return train_dataset, eval_dataset
